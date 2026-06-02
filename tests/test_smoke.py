@@ -835,6 +835,22 @@ def test_approval_prompt_brackets():
     check("prompt: mostra [y]es/[n]o/[a]lways letterali", "[y]es" in out and "[n]o" in out and "[a]lways" in out, out)
 
 
+def test_help_renders():
+    import io as _io
+
+    from rich.console import Console
+
+    from flair.cli import CLI
+    cli = CLI(cfg_for(Path(".")))
+    cli.console = Console(file=_io.StringIO(), width=100)
+    cli._print_help()
+    out = cli.console.file.getvalue()
+    for token in ("/code", "/do", "/provider", "/model", "/think-model", "/compact",
+                  "/save", "/load", "/sessions", "/reset", "/root", "exit"):
+        check(f"help: contiene {token}", token in out, out[:200])
+    check("help: argomenti opzionali [nome] mostrati", "[nome]" in out and "<task>" in out, out[:400])
+
+
 # ── 17. schemi tool senza drift ───────────────────────────────────────────────
 
 def test_tool_schemas():
@@ -874,6 +890,7 @@ def main():
     test_system_write_edit()
     test_cli_always_per_tool()
     test_approval_prompt_brackets()
+    test_help_renders()
     test_tool_schemas()
     print(f"\nTUTTI I {len(PASS)} TEST PASSATI ✅")
 

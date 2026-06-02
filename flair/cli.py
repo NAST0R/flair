@@ -1,36 +1,8 @@
 """CLI interattiva (e batch) per flair.
 
-Uso:
-    flair                                   # REPL: instrada da solo tra coding e generico
-    flair --provider openai                 # usa OpenAI invece di DeepSeek
-    flair --root /path/progetto             # radice di lavoro per l'agente coding
-    flair -p "apri youtube"                 # one-shot
-    flair --agent coding -p "spiega auth/"  # forza un agente
-    flair --think -p "rifattorizza X"       # primo passo col modello thinking
-    flair --yes                             # auto-approva i tool distruttivi
-    flair --no-stream                       # disabilita lo streaming
-    flair --log ./logs                      # scrive il log di sessione (JSONL)
-    flair --session lavoro                  # usa/crea la sessione "lavoro" (autosalvataggio)
-    flair --continue                        # riprende l'ultima sessione salvata
-    flair --version                         # stampa la versione
-
-Comandi nel REPL:
-    /code <task>          forza l'agente di coding
-    /do <task>            forza l'agente generico
-    /think <task>         esegue col modello thinking al primo passo
-    /agent                mostra l'agente corrente (sticky)
-    /provider [nome]      mostra, oppure cambia provider a runtime (deepseek|openai)
-    /model <nome>         cambia il modello veloce a runtime
-    /think-model <nome>   cambia il modello thinking a runtime
-    /compact              compatta subito il contesto dell'agente attivo
-    /cost                 riepilogo token/costo della sessione
-    /save [nome]          salva la sessione (default: nome corrente)
-    /load <nome>          riprende una sessione salvata
-    /sessions             elenca le sessioni salvate
-    /reset                azzera la conversazione di entrambi gli agenti
-    /root <path>          cambia la radice di lavoro (ricarica le istruzioni di progetto)
-    /help                 aiuto
-    exit | quit           esci
+`flair` apre il REPL (instrada da solo tra agente coding e generico); `flair -p "..."`
+esegue un singolo task ed esce. I flag di avvio sono documentati da `flair -h`; i
+comandi disponibili nel REPL da `/help`.
 """
 
 from __future__ import annotations
@@ -40,9 +12,11 @@ import difflib
 import sys
 from pathlib import Path
 
+from rich import box
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
+from rich.table import Table
 from rich.text import Text
 
 from . import __version__
@@ -315,6 +289,35 @@ class CLI:
 
     # ── REPL ──────────────────────────────────────────────────────────────────
 
+    def _print_help(self) -> None:
+        table = Table(box=box.SIMPLE_HEAD, show_header=True, header_style="bold cyan",
+                      padding=(0, 3, 0, 0), border_style="dim")
+        table.add_column("comando", style="bold", no_wrap=True)
+        table.add_column("cosa fa", style="dim")
+        for cmd, desc in (
+            ("/code <task>", "forza l'agente di coding"),
+            ("/do <task>", "forza l'agente generico"),
+            ("/think <task>", "primo passo col modello thinking"),
+            ("/agent", "mostra l'agente corrente (sticky)"),
+            ("/provider [nome]", "mostra o cambia provider (deepseek|openai)"),
+            ("/model <nome>", "cambia il modello veloce a runtime"),
+            ("/think-model <nome>", "cambia il modello thinking a runtime"),
+            ("/compact", "compatta subito il contesto dell'agente attivo"),
+            ("/cost", "riepilogo token/costo della sessione"),
+            ("/save [nome]", "salva la sessione (default: nome corrente)"),
+            ("/load <nome>", "riprende una sessione salvata"),
+            ("/sessions", "elenca le sessioni salvate"),
+            ("/reset", "azzera la conversazione di entrambi gli agenti"),
+            ("/root <path>", "cambia la radice di lavoro (ricarica le istruzioni)"),
+            ("/help", "questo aiuto"),
+            ("exit | quit", "esci"),
+        ):
+            table.add_row(Text(cmd), desc)
+        self.console.print(table)
+        self.console.print(
+            "[dim]Flag di avvio (CLI): «flair -h». Esempi: flair --think -p \"...\", "
+            "flair --session lavoro, flair --continue, flair --provider openai.[/dim]\n")
+
     def repl(self) -> None:
         pc = self.cfg.active
         log_note = f"\nlog: {self.logger.path}" if self.logger else ""
@@ -343,7 +346,7 @@ class CLI:
                 self.console.print("[dim]ciao![/dim]")
                 return
             if low == "/help":
-                self.console.print(Markdown(__doc__ or ""))
+                self._print_help()
                 continue
             if low == "/reset":
                 for a in self.agents.values():

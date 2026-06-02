@@ -14,7 +14,7 @@ import re
 import subprocess
 from pathlib import Path
 
-from ..core.tool import ToolContext, tool
+from ..core.tool import ToolContext, ToolError, tool
 from . import fs
 
 # ── read_file ────────────────────────────────────────────────────────────────
@@ -223,4 +223,62 @@ def run_command(ctx: ToolContext, command: str, timeout: int = 120) -> str:
     return fs._trunc(header + out.strip(), ctx.cfg.command_max_chars, hint="filtra o reindirizza l'output")
 
 
-TOOLS = [read_file, list_directory, glob, grep, edit_file, write_file, run_command]
+@tool(
+    "multi_edit",
+    ("Applica più sostituzioni a UN file in una sola chiamata, in ordine e in modo "
+     "atomico (se una fallisce, il file non viene toccato). Più efficiente di tante "
+     "edit_file separate. Ogni edit usa la stessa logica resiliente di edit_file."),
+    {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "description": "Path del file."},
+            "edits": {
+                "type": "array",
+                "description": "Lista di modifiche, applicate in sequenza.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "old_string": {"type": "string", "description": "Testo da sostituire."},
+                        "new_string": {"type": "string", "description": "Testo nuovo."},
+                        "replace_all": {"type": "boolean", "description": "Sostituire tutte le occorrenze (default false)."},
+                    },
+                    "required": ["old_string", "new_string"],
+                },
+            },
+        },
+        "required": ["path", "edits"],
+    },
+    destructive=True,
+)
+def multi_edit(ctx: ToolContext, path: str, edits: list) -> str:
+    p = fs.resolve(ctx.cfg.root, path)
+    if not p.exists():
+        return f"❌ Il file non esiste: {fs.display(ctx.cfg.root, p)} (usa write_file per crearlo)"
+    if p.is_dir():
+        return f"❌ È una directory: {fs.display(ctx.cfg.root, p)}"
+    if not isinstance(edits, list) or not edits:
+        return "❌ 'edits' deve essere una lista non vuota di modifiche."
+
+    text = p.read_text(encoding="utf-8", errors="replace")
+    working = text
+    notes = []
+    for i, e in enumerate(edits, 1):
+        if not isinstance(e, dict) or "old_string" not in e or "new_string" not in e:
+            return f"❌ Modifica #{i} non valida: servono 'old_string' e 'new_string'."
+        # apply_edit solleva ToolError su match non univoco → annulliamo tutto
+        # (il file non è ancora stato scritto: l'operazione resta atomica).
+        try:
+            working, strategy = fs.apply_edit(working, e["old_string"], e["new_string"], e.get("replace_all", False))
+        except ToolError as exc:
+            return f"❌ Modifica #{i} non applicata ({exc}) — nessuna modifica scritta sul file."
+        notes.append(strategy)
+
+    if working == text:
+        return f"⚠️ Nessuna modifica: il risultato è identico a {fs.display(ctx.cfg.root, p)}."
+    p.write_text(working, encoding="utf-8")
+    extra = [n for n in notes if n != "esatto"]
+    suffix = f" [match: {', '.join(extra)}]" if extra else ""
+    return f"✓ Applicate {len(edits)} modifiche a {fs.display(ctx.cfg.root, p)}{suffix}."
+
+
+TOOLS = [read_file, list_directory, glob, grep, edit_file, multi_edit, write_file, run_command]

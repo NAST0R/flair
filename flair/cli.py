@@ -10,18 +10,27 @@ Uso:
     flair --yes                             # auto-approva i tool distruttivi
     flair --no-stream                       # disabilita lo streaming
     flair --log ./logs                      # scrive il log di sessione (JSONL)
+    flair --session lavoro                  # usa/crea la sessione "lavoro" (autosalvataggio)
+    flair --continue                        # riprende l'ultima sessione salvata
+    flair --version                         # stampa la versione
 
 Comandi nel REPL:
-    /code <task>    forza l'agente di coding
-    /do <task>      forza l'agente generico
-    /think <task>   esegue col modello thinking al primo passo
-    /agent          mostra l'agente corrente (sticky)
-    /provider       mostra provider e modelli attivi
-    /cost           riepilogo token/costo della sessione
-    /reset          azzera la conversazione di entrambi gli agenti
-    /root <path>    cambia la radice di lavoro (ricarica le istruzioni di progetto)
-    /help           aiuto
-    exit | quit     esci
+    /code <task>          forza l'agente di coding
+    /do <task>            forza l'agente generico
+    /think <task>         esegue col modello thinking al primo passo
+    /agent                mostra l'agente corrente (sticky)
+    /provider [nome]      mostra, oppure cambia provider a runtime (deepseek|openai)
+    /model <nome>         cambia il modello veloce a runtime
+    /think-model <nome>   cambia il modello thinking a runtime
+    /compact              compatta subito il contesto dell'agente attivo
+    /cost                 riepilogo token/costo della sessione
+    /save [nome]          salva la sessione (default: nome corrente)
+    /load <nome>          riprende una sessione salvata
+    /sessions             elenca le sessioni salvate
+    /reset                azzera la conversazione di entrambi gli agenti
+    /root <path>          cambia la radice di lavoro (ricarica le istruzioni di progetto)
+    /help                 aiuto
+    exit | quit           esci
 """
 
 from __future__ import annotations
@@ -36,6 +45,7 @@ from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.text import Text
 
+from . import __version__
 from .agents import coding as coding_agent
 from .agents import general as general_agent
 from .config import Config, load_config
@@ -43,20 +53,25 @@ from .core import router
 from .core.tool import ToolError
 from .llm import Usage, create_provider
 from .session_log import SessionLogger, setup_file_logging
+from .session_store import SessionStore
 from .tools import fs
 
 _TOOL_ICON = {
     "read_file": "📄", "list_directory": "📁", "glob": "🔎", "grep": "🔎",
-    "edit_file": "✏️ ", "write_file": "📝", "run_command": "⚙️ ",
+    "edit_file": "✏️ ", "multi_edit": "✏️ ", "write_file": "📝", "run_command": "⚙️ ",
     "open_url": "🌐", "open_path": "📂", "open_application": "🚀",
     "search_files": "🔦", "system_info": "🖥️ ", "get_datetime": "🕒",
-    "clipboard_get": "📋", "clipboard_set": "📋", "web_search": "🌍",
+    "clipboard_get": "📋", "clipboard_set": "📋", "web_search": "🌍", "web_fetch": "🌍",
 }
 
 
 def _short(v, n: int = 70) -> str:
     s = str(v).replace("\n", "↵")
     return s if len(s) <= n else s[: n - 1] + "…"
+
+
+def _kfmt(n: int) -> str:
+    return f"{n / 1000:.0f}k" if n >= 1000 else str(n)
 
 
 class CLI:
@@ -68,6 +83,10 @@ class CLI:
         self._mid_line = False
         self._turn_tools: list[dict] = []
         self._always_allow: set[str] = set()
+        self._cost_warned = False
+
+        self.session = SessionStore(cfg.session_dir) if cfg.session_dir else SessionStore(Path.home() / ".flair" / "sessions")
+        self.session_name: str | None = None
 
         self.logger: SessionLogger | None = None
         if cfg.log_dir:
@@ -88,6 +107,30 @@ class CLI:
             on_compact=self._on_compact,
             approve=self._approve,
         )
+
+    # ── sessioni (persistenza) ────────────────────────────────────────────────
+
+    def _session_state(self) -> dict:
+        return {
+            "last_agent": self.last_agent,
+            "agents": {k: a.dump_state() for k, a in self.agents.items()},
+        }
+
+    def _save_session(self) -> None:
+        if self.session_name:
+            self.session.save(self.session_name, self._session_state())
+
+    def _load_session(self, name: str) -> bool:
+        state = self.session.load(name)
+        if not state:
+            return False
+        for key, agent in self.agents.items():
+            data = (state.get("agents") or {}).get(key)
+            if data:
+                agent.load_state(data)
+        self.last_agent = state.get("last_agent")
+        self.session_name = name
+        return True
 
     # ── callback UI ─────────────────────────────────────────────────────────
 
@@ -173,10 +216,13 @@ class CLI:
                 try:
                     new, _ = fs.apply_edit(old, args.get("old_string", ""), args.get("new_string", ""),
                                            args.get("replace_all", False))
-                except ToolError:
-                    new = old  # match incerto: la diff mostrerà solo i frammenti sotto
-                panel = self._diff_panel(name, fs.display(self.cfg.root, p), old, new)
-                return panel
+                except ToolError as exc:
+                    return Panel(
+                        Text(f"⚠ {exc}\nL'edit probabilmente fallirà (old_string non trovato o ambiguo).",
+                             style="yellow"),
+                        title=f"[yellow]{name}[/yellow] · {fs.display(self.cfg.root, p)}",
+                        border_style="yellow", padding=(0, 1))
+                return self._diff_panel(name, fs.display(self.cfg.root, p), old, new)
         except Exception:  # noqa: BLE001
             return None
         return None  # run_command e altri: nessuna diff
@@ -232,6 +278,7 @@ class CLI:
 
         self._print_turn(result.usage, result.steps, result.stopped_reason)
         self._print_session()
+        self._save_session()
 
     def _session_usage(self) -> Usage:
         total = Usage()
@@ -252,17 +299,34 @@ class CLI:
         self.console.print(f"[dim]  questo turno · step {steps} · {self._cost_line(usage)}{flag}[/dim]")
 
     def _print_session(self) -> None:
-        self.console.print(f"[dim]  sessione     · {self._cost_line(self._session_usage())}[/dim]\n")
+        self.console.print(f"[dim]  sessione     · {self._cost_line(self._session_usage())}[/dim]")
+        if self.last_agent:
+            tokens, frac = self.agents[self.last_agent].context_fill()
+            self.console.print(
+                f"[dim]  contesto     · {self.last_agent}: {round(frac * 100)}% "
+                f"({_kfmt(tokens)}/{_kfmt(self.cfg.context_window)})[/dim]")
+        self._maybe_cost_warn()
+        self.console.print()
+
+    def _maybe_cost_warn(self) -> None:
+        if self.cfg.cost_warn and not self._cost_warned:
+            cost = self.provider.estimate_cost(self._session_usage(), self.cfg)
+            if cost >= self.cfg.cost_warn:
+                self.console.print(
+                    f"[yellow]  ⚠ costo sessione ~${cost:.4f}: superata la soglia di "
+                    f"${self.cfg.cost_warn:.2f} (FLAIR_COST_WARN)[/yellow]")
+                self._cost_warned = True
 
     # ── REPL ──────────────────────────────────────────────────────────────────
 
     def repl(self) -> None:
         pc = self.cfg.active
         log_note = f"\nlog: {self.logger.path}" if self.logger else ""
+        sess_note = f" | sessione: {self.session_name}" if self.session_name else ""
         self.console.print(Panel(
             Text.from_markup(
-                "[bold cyan]flair 3.0[/bold cyan] [dim]— assistente AI (coding + generico)[/dim]\n"
-                f"[dim]provider: {self.cfg.provider} | modello: {pc.model} | thinking: {pc.think_model}\n"
+                f"[bold cyan]flair {__version__}[/bold cyan] [dim]— assistente AI (coding + generico)[/dim]\n"
+                f"[dim]provider: {self.cfg.provider} | modello: {pc.model} | thinking: {pc.think_model}{sess_note}\n"
                 f"root: {self.cfg.root}{log_note}[/dim]"
             ),
             border_style="cyan", padding=(1, 2),
@@ -297,9 +361,72 @@ class CLI:
             if low == "/agent":
                 self.console.print(f"[dim]agente corrente (sticky): {self.last_agent or 'nessuno'}[/dim]\n")
                 continue
-            if low == "/provider":
-                pc = self.cfg.active
-                self.console.print(f"[dim]provider: {self.cfg.provider} | modello: {pc.model} | thinking: {pc.think_model}[/dim]\n")
+            if low == "/sessions":
+                items = self.session.list()
+                if not items:
+                    self.console.print("[dim]nessuna sessione salvata.[/dim]\n")
+                else:
+                    body = "\n".join(f"  • {n}  [dim]{ts}[/dim]" for n, ts in items)
+                    self.console.print(f"[dim]sessioni salvate:[/dim]\n{body}\n")
+                continue
+            if low.startswith("/save"):
+                parts = line.split(maxsplit=1)
+                name = parts[1].strip() if len(parts) == 2 else (self.session_name or "default")
+                self.session_name = name
+                path = self.session.save(name, self._session_state())
+                msg = f"[green]sessione salvata: {name}[/green]" if path else "[red]salvataggio fallito (vedi log).[/red]"
+                self.console.print(msg + "\n")
+                continue
+            if low.startswith("/load"):
+                parts = line.split(maxsplit=1)
+                if len(parts) != 2:
+                    self.console.print("[dim]uso: /load <nome>[/dim]\n")
+                elif self._load_session(parts[1].strip()):
+                    self.console.print(f"[green]sessione ripresa: {self.session_name}[/green]\n")
+                else:
+                    self.console.print(f"[yellow]sessione '{parts[1].strip()}' non trovata.[/yellow]\n")
+                continue
+            if low == "/compact":
+                if self.last_agent:
+                    if not self.agents[self.last_agent].compact():
+                        self.console.print("[dim]niente da compattare.[/dim]\n")
+                else:
+                    self.console.print("[dim]nessuna conversazione attiva.[/dim]\n")
+                continue
+            if low.startswith("/provider"):
+                parts = line.split(maxsplit=1)
+                if len(parts) == 2:
+                    target = parts[1].strip().lower()
+                    if target not in ("deepseek", "openai"):
+                        self.console.print("[yellow]provider non valido (deepseek|openai).[/yellow]\n")
+                    else:
+                        self.cfg.provider = target
+                        self.cfg.refresh_pricing()
+                        self.provider = create_provider(self.cfg)
+                        for a in self.agents.values():
+                            a.provider = self.provider
+                        pc = self.cfg.active
+                        self.console.print(f"[yellow]provider → {target} | modello: {pc.model} | thinking: {pc.think_model}[/yellow]\n")
+                else:
+                    pc = self.cfg.active
+                    self.console.print(f"[dim]provider: {self.cfg.provider} | modello: {pc.model} | thinking: {pc.think_model}[/dim]\n")
+                continue
+            if low.startswith("/think-model"):
+                parts = line.split(maxsplit=1)
+                if len(parts) == 2:
+                    self.cfg.active.think_model = parts[1].strip()
+                    self.console.print(f"[yellow]modello thinking → {self.cfg.active.think_model}[/yellow]\n")
+                else:
+                    self.console.print("[dim]uso: /think-model <nome>[/dim]\n")
+                continue
+            if low.startswith("/model"):
+                parts = line.split(maxsplit=1)
+                if len(parts) == 2:
+                    self.cfg.active.model = parts[1].strip()
+                    self.cfg.refresh_pricing()
+                    self.console.print(f"[yellow]modello → {self.cfg.active.model}[/yellow]\n")
+                else:
+                    self.console.print("[dim]uso: /model <nome>[/dim]\n")
                 continue
             if low.startswith("/root"):
                 parts = line.split(maxsplit=1)
@@ -351,6 +478,7 @@ def _build_config(args) -> Config:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="flair", description="Assistente AI agentico (coding + generico) su DeepSeek/OpenAI.")
+    ap.add_argument("--version", action="version", version=f"flair {__version__}")
     ap.add_argument("-p", "--prompt", help="esegue un singolo task e esce")
     ap.add_argument("--provider", choices=["deepseek", "openai"], help="provider LLM")
     ap.add_argument("--agent", choices=["coding", "general", "auto"], default="auto", help="forza un agente (default: auto)")
@@ -361,6 +489,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--log", help="cartella in cui scrivere il log di sessione (JSONL)")
     ap.add_argument("--model", help="override del modello veloce")
     ap.add_argument("--think-model", dest="think_model", help="override del modello thinking")
+    ap.add_argument("--session", help="usa/crea una sessione con questo nome (autosalvataggio)")
+    ap.add_argument("--continue", dest="continue_", action="store_true", help="riprende l'ultima sessione salvata")
     args = ap.parse_args(argv)
 
     console = Console()
@@ -372,6 +502,21 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     cli = CLI(cfg)
+
+    # Ripresa sessione (prima di eseguire qualsiasi cosa).
+    if args.session:
+        cli.session_name = args.session
+        if cli._load_session(args.session):
+            console.print(f"[dim]sessione ripresa: {args.session}[/dim]")
+        else:
+            console.print(f"[dim]nuova sessione: {args.session}[/dim]")
+    elif args.continue_:
+        latest = cli.session.latest()
+        if latest and cli._load_session(latest):
+            console.print(f"[dim]ripresa ultima sessione: {latest}[/dim]")
+        else:
+            console.print("[dim]nessuna sessione da riprendere.[/dim]")
+
     if args.prompt:
         key = None if args.agent == "auto" else args.agent
         cli.run_task(args.prompt, agent_key=key, think=args.think)

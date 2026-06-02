@@ -132,6 +132,8 @@ class Config:
 
     # Osservabilità
     log_dir: Path | None = None
+    cost_warn: float = 0.0                  # avviso quando il costo sessione supera questa soglia (USD); 0 = off
+    session_dir: Path | None = None         # dove salvare/riprendere le sessioni
 
     # Sicurezza
     auto_approve: bool = False
@@ -150,10 +152,12 @@ class Config:
         return int(self.context_window * self.compact_threshold_ratio)
 
     def refresh_pricing(self) -> None:
-        """Riallinea i prezzi al modello attivo (a meno di override via env)."""
-        if os.getenv("FLAIR_PRICE_CACHE_HIT") or os.getenv("FLAIR_PRICE_CACHE_MISS") or os.getenv("FLAIR_PRICE_OUTPUT"):
-            return
-        self.price_cache_hit, self.price_cache_miss, self.price_output = resolve_pricing(self.provider, self.active.model)
+        """Riallinea i prezzi al modello attivo; gli override via env (anche di un
+        singolo campo) hanno la precedenza."""
+        hit, miss, out = resolve_pricing(self.provider, self.active.model)
+        self.price_cache_hit = _float("FLAIR_PRICE_CACHE_HIT", hit)
+        self.price_cache_miss = _float("FLAIR_PRICE_CACHE_MISS", miss)
+        self.price_output = _float("FLAIR_PRICE_OUTPUT", out)
 
     def validate(self) -> None:
         if self.provider not in ("deepseek", "openai"):
@@ -212,6 +216,8 @@ def load_config() -> Config:
         tavily_api_key=os.getenv("TAVILY_API_KEY") or None,
         web_max_results=_int("FLAIR_WEB_MAX", 5),
         log_dir=Path(log_dir).expanduser() if log_dir else None,
+        cost_warn=_float("FLAIR_COST_WARN", 0.0),
+        session_dir=Path(os.getenv("FLAIR_SESSION_DIR", str(Path.home() / ".flair" / "sessions"))).expanduser(),
         auto_approve=_bool("FLAIR_AUTO_APPROVE", False),
         price_cache_hit=_float("FLAIR_PRICE_CACHE_HIT", hit),
         price_cache_miss=_float("FLAIR_PRICE_CACHE_MISS", miss),

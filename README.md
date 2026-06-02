@@ -40,21 +40,22 @@ flair/
 │   ├── fs.py            Filesystem helpers + resilient edit matcher (apply_edit)
 │   ├── coding.py        Coding tools (sandboxed to the project root)
 │   ├── system.py        Cross-platform desktop tools (whole machine)
-│   └── web.py           Web search (Tavily / DuckDuckGo)
+│   └── web.py           Web search + page fetch (Tavily / ddgs / DuckDuckGo)
 ├── agents/
 │   ├── coding.py        Builds the coding agent (+ project instructions)
-│   └── general.py       Builds the general agent (+ web_search)
+│   └── general.py       Builds the general agent (+ web_search/web_fetch)
 ├── prompts/             System prompts (.md) + project-instructions loader
 ├── session_log.py       JSONL session log + file logging
-└── cli.py               CLI + REPL (rich): streaming, diff preview, cost
+├── session_store.py     Save/resume conversation state across runs
+└── cli.py               CLI + REPL (rich): streaming, diff preview, cost, sessions
 ```
 
 **One engine, two agents.** `core/agent.py` is generic: it takes a *toolset* and a *prompt*. The two agents differ only in those — no duplicated logic.
 
-- **Coding agent** — `read_file`, `list_directory`, `glob`, `grep`, `edit_file`, `write_file`, `run_command`. **Sandboxed** to the project root (`--root`): it cannot escape it.
-- **General agent** — `open_url`, `open_path`, `open_application`, `search_files`, `list_directory`, `read_file`, `run_command`, `system_info`, `get_datetime`, `clipboard_get/set`, `web_search`. Operates on the **whole machine** (that is its purpose: "open the browser", "find a song"). It can also **converse**: if no tool is needed, it just answers.
+- **Coding agent** — `read_file`, `list_directory`, `glob`, `grep`, `edit_file`, `multi_edit`, `write_file`, `run_command`. **Sandboxed** to the project root (`--root`): it cannot escape it.
+- **General agent** — `open_url`, `open_path`, `open_application`, `search_files`, `list_directory`, `read_file`, `run_command`, `system_info`, `get_datetime`, `clipboard_get/set`, `web_search`, `web_fetch`. Operates on the **whole machine** (that is its purpose: "open the browser", "find a song"). It can also **converse**: if no tool is needed, it just answers.
 
-**Safety.** Destructive tools (`edit_file`, `write_file`, `run_command`) ask for confirmation interactively, with a **diff preview**. `--yes` / `FLAIR_AUTO_APPROVE=true` disables it.
+**Safety.** Destructive tools (`edit_file`, `multi_edit`, `write_file`, `run_command`) ask for confirmation interactively, with a **diff preview**. `--yes` / `FLAIR_AUTO_APPROVE=true` disables it.
 
 **Two providers, one interface.** DeepSeek and OpenAI both speak the OpenAI protocol; the differences (token parameter, reasoning models without `temperature`, cache fields, CoT) are isolated in two minimal subclasses. Adding a third provider = one file.
 
@@ -126,8 +127,14 @@ REPL commands:
 | `/do <task>` | force the general agent |
 | `/think <task>` | use the thinking model on the first step |
 | `/agent` | show the current agent |
-| `/provider` | show the active provider and models |
+| `/provider [name]` | show, or switch provider at runtime (`deepseek`/`openai`) |
+| `/model <name>` | switch the fast model at runtime |
+| `/think-model <name>` | switch the thinking model at runtime |
+| `/compact` | compact the active agent's context now |
 | `/cost` | session token/cost summary |
+| `/save [name]` | save the session (defaults to the current name) |
+| `/load <name>` | resume a saved session |
+| `/sessions` | list saved sessions |
 | `/reset` | clear the conversation |
 | `/root <path>` | change the working root |
 | `exit` | quit |
@@ -142,6 +149,9 @@ flair --think -p "refactor the parsing module to reduce complexity"
 flair --yes -p "run the tests and fix the errors"        # no confirmations
 flair --no-stream -p "..."                                # disable streaming
 flair --log ./logs -p "..."                               # write the session log (JSONL)
+flair --session my-work                                   # use/create a session (auto-saved)
+flair --continue                                          # resume the last saved session
+flair --version                                           # print version
 ```
 
 You can always invoke it as `python -m flair ...` too.
@@ -152,19 +162,25 @@ You can always invoke it as `python -m flair ...` too.
 
 **Streaming.** The answer (and intermediate text) appears as it arrives. Disable it with `--no-stream` or `FLAIR_STREAM=false`.
 
-**Resilient `edit_file`.** Matching `old_string` is not purely literal: it cascades through *exact → outer whitespace ignored → line-ending tolerant → indentation tolerant* (re-indenting the new block to the correct level automatically). If the match is not unique it returns a clear error inviting a re-read of the file, instead of failing opaquely. When it uses a fallback it says so (`[match: indentation tolerant]`).
+**Session persistence.** Close Flair and pick up exactly where you left off. `--session <name>` uses (or creates) a named session that auto-saves after every turn; `--continue` resumes the most recent one. In the REPL, `/save`, `/load`, and `/sessions` manage them by hand. A session stores the full conversation of **both** agents plus cumulative usage, as JSON under `FLAIR_SESSION_DIR` (default `~/.flair/sessions`). Secrets are never saved — only chat messages.
+
+**Runtime switching.** Change provider or model mid-conversation without restarting: `/provider openai`, `/model <name>`, `/think-model <name>`. Histories are preserved; pricing re-aligns automatically.
+
+**Context indicator + manual compaction.** After each turn the status line shows how full the active agent's context is (e.g. `contesto · coding: 23% (28k/120k)`). `/compact` summarizes older messages on demand to reclaim space (it also happens automatically near the threshold).
+
+**Resilient `edit_file` / `multi_edit`.** Matching `old_string` is not purely literal: it cascades through *exact → outer whitespace ignored → line-ending tolerant → indentation tolerant* (re-indenting the new block to the correct level automatically). If the match is not unique it returns a clear error inviting a re-read of the file, instead of failing opaquely. When it uses a fallback it says so (`[match: indentation tolerant]`). `multi_edit` applies several edits to one file in a single, **atomic** call (if any edit fails, the file is left untouched) — fewer round-trips and tokens.
 
 **File creation.** `write_file` creates whole files and intermediate folders; `edit_file` makes targeted changes. The coding agent can therefore both **create** and **modify**.
 
-**Diff preview + "always allow".** Before every destructive operation (when confirmations are on) Flair shows a **colored diff** of what will change (for `edit_file`/`write_file`) or the command (`run_command`). At the `[y]es / [n]o / [a]lways` prompt, `a` remembers the operation for the session and stops asking.
+**Diff preview + "always allow".** Before every destructive operation (when confirmations are on) Flair shows a **colored diff** of what will change (for `edit_file`/`write_file`) or the command (`run_command`). At the `[y]es / [n]o / [a]lways` prompt, `a` remembers the operation for the session and stops asking. If an `edit_file` match would fail, the preview says so up front instead of showing an empty diff.
 
 **Project instructions.** If the root contains an `AGENTS.md` (or `FLAIR.md`, `CLAUDE.md`, `.flair.md`) file, its content is loaded into the coding agent's prompt: conventions, build/test commands, constraints. `/root` reloads it on the fly.
 
-**Web search (general agent).** The `web_search` tool works out of the box: the **`ddgs`** metasearch library is a bundled dependency, so key-free web search is available right after `pip install -e .` (it handles search engines' anti-bot protections — the most reliable key-free option). If `TAVILY_API_KEY` is set, Tavily is used first (most reliable overall). The tool also falls back to a best-effort DuckDuckGo scrape and the Instant Answer JSON API. Keyless engines can occasionally rate-limit automated requests; if a search returns empty, retry after a few seconds or set a Tavily key. On error it returns a clear message explaining the cause and the fix — never an exception.
+**Web search & fetch (general agent).** The `web_search` tool works out of the box: the **`ddgs`** metasearch library is a bundled dependency, so key-free web search is available right after `pip install -e .` (it handles search engines' anti-bot protections — the most reliable key-free option). If `TAVILY_API_KEY` is set, Tavily is used first (most reliable overall). The tool also falls back to a best-effort DuckDuckGo scrape and the Instant Answer JSON API. Keyless engines can occasionally rate-limit automated requests; if a search returns empty, retry after a few seconds or set a Tavily key. The companion `web_fetch` tool downloads a page and returns its readable text, so the agent can actually **read** a result, not just list it. On error both return a clear message — never an exception.
 
 **Session logging.** With `--log <folder>` (or `FLAIR_LOG_DIR`) every turn is written to `session-<timestamp>.jsonl` (task, response, tools used, usage) and internal events to `flair.log` — useful to analyze where tokens go.
 
-**Per-model cost estimate.** The displayed cost uses a per-model price table (DeepSeek/OpenAI), overridable via `FLAIR_PRICE_*`.
+**Per-model cost estimate + budget warning.** The displayed cost uses a per-model price table (DeepSeek/OpenAI), overridable via `FLAIR_PRICE_*`. Set `FLAIR_COST_WARN=<usd>` to get a one-time warning when a session's estimated cost crosses that threshold.
 
 ---
 
@@ -208,7 +224,7 @@ Then add it to the `TOOLS` list of the right module (`tools/coding.py`, `tools/s
 
 ## Tests
 
-Offline suite (no network, fake provider) with ~100 assertions covering: robust argument parsing, usage normalization for both providers, the **real provider request path** (parameters sent to the API: `max_tokens` vs `max_completion_tokens`, `temperature` omitted on reasoning models, retry on transient errors only), **streaming assembly**, **compaction** and overflow recovery, the resilient `edit_file` matcher, web search (parser + errors), the router, and **both** agents on the real tools.
+Offline suite (no network, fake provider) with ~135 assertions covering: robust argument parsing, usage normalization for both providers, the **real provider request path** (parameters sent to the API: `max_tokens` vs `max_completion_tokens`, `temperature` omitted on reasoning models, DeepSeek V4 thinking enabled via parameter, retry on transient errors only), **streaming assembly**, **compaction** and overflow recovery, the resilient `edit_file` matcher and **atomic `multi_edit`**, web **search** (multi-backend cascade + errors) and **fetch**, **session persistence** (save/resume round-trip, at both the store and CLI level), **runtime provider/model switching**, the context indicator, the router, and **both** agents on the real tools.
 
 ```bash
 python tests/test_smoke.py        # direct runner

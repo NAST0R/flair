@@ -93,7 +93,8 @@ class FakeProvider:
         self.seen = []
         self.calls = []  # kwargs di ogni chiamata
 
-    def complete(self, messages, tools=None, think=False, max_tokens=None, stream=False, on_delta=None):
+    def complete(self, messages, tools=None, think=False, max_tokens=None, stream=False,
+                 on_delta=None, on_reasoning=None):
         self.seen.append([dict(m) for m in messages])
         self.calls.append({"think": think, "max_tokens": max_tokens, "stream": stream})
         if self.i >= len(self.script):
@@ -102,6 +103,8 @@ class FakeProvider:
         self.i += 1
         if isinstance(r, BaseException):
             raise r
+        if stream and on_reasoning and r.reasoning:
+            on_reasoning(r.reasoning)  # come il provider reale: ragionamento prima del contenuto
         if stream and on_delta and r.content:
             for ch in r.content:  # simula lo streaming carattere per carattere
                 on_delta(ch)
@@ -592,7 +595,189 @@ def test_web_search():
     check("web fail: suggerisce ddgs", "pip install ddgs" in out, out)
 
 
-# ── 16. schemi tool senza drift ───────────────────────────────────────────────
+# ── 16. persistenza sessioni, nuovi tool, switch runtime (offline) ────────────
+
+def test_session_persistence():
+    from flair.session_store import SessionStore
+    root = Path("/tmp/flair_sess_test")
+    shutil.rmtree(root, ignore_errors=True)
+    cfg = cfg_for(root)
+    cfg.session_dir = root / "sessions"
+    prov = SimpleNamespace()
+    agent = coding_agent.build(cfg, prov)
+    agent.messages.append({"role": "user", "content": "ciao"})
+    agent.messages.append({"role": "assistant", "content": "ciao a te"})
+    agent.total_usage = Usage(prompt_tokens=100, completion_tokens=20, total_tokens=120,
+                              cache_hit_tokens=50, cache_miss_tokens=50, reasoning_tokens=5)
+
+    store = SessionStore(cfg.session_dir)
+    path = store.save("lavoro", {"last_agent": "coding", "agents": {"coding": agent.dump_state()}})
+    check("sessione: salvataggio crea file", path is not None and path.exists())
+    check("sessione: exists()", store.exists("lavoro"))
+    check("sessione: latest()", store.latest() == "lavoro")
+
+    agent2 = coding_agent.build(cfg, prov)
+    state = store.load("lavoro")
+    agent2.load_state(state["agents"]["coding"])
+    check("sessione: messaggi ripristinati",
+          [m.get("content") for m in agent2.messages[-2:]] == ["ciao", "ciao a te"])
+    check("sessione: uso ripristinato",
+          agent2.total_usage.total_tokens == 120 and agent2.total_usage.cache_hit_tokens == 50)
+    check("sessione: caricamento mancante → None", store.load("inesistente") is None)
+
+
+def test_cli_session_roundtrip():
+    from flair.cli import CLI
+    root = Path("/tmp/flair_cli_sess")
+    shutil.rmtree(root, ignore_errors=True)
+    cfg = cfg_for(root)
+    cfg.session_dir = root / "sessions"
+    cli = CLI(cfg)
+    cli.agents["general"].messages.append({"role": "user", "content": "ricordami"})
+    cli.last_agent = "general"
+    cli.session_name = "s1"
+    cli._save_session()
+
+    cli2 = CLI(cfg)
+    check("cli sessione: load ok", cli2._load_session("s1"))
+    check("cli sessione: messaggio presente",
+          any(m.get("content") == "ricordami" for m in cli2.agents["general"].messages))
+    check("cli sessione: last_agent ripreso", cli2.last_agent == "general")
+
+
+def test_multi_edit():
+    from flair.tools import coding as coding_tools
+    root = Path("/tmp/flair_me")
+    shutil.rmtree(root, ignore_errors=True)
+    root.mkdir(parents=True)
+    (root / "a.py").write_text("x = 1\ny = 2\nz = 3\n")
+    ctx = ToolContext(cfg=cfg_for(root))
+
+    out = coding_tools.multi_edit(ctx, path="a.py", edits=[
+        {"old_string": "x = 1", "new_string": "x = 10"},
+        {"old_string": "z = 3", "new_string": "z = 30"},
+    ])
+    check("multi_edit: due modifiche applicate", out.startswith("✓") and "2 modifiche" in out)
+    check("multi_edit: contenuto corretto", (root / "a.py").read_text() == "x = 10\ny = 2\nz = 30\n")
+
+    before = (root / "a.py").read_text()
+    out = coding_tools.multi_edit(ctx, path="a.py", edits=[
+        {"old_string": "x = 10", "new_string": "x = 99"},
+        {"old_string": "NON_ESISTE", "new_string": "!"},
+    ])
+    check("multi_edit: fallimento indica la modifica", out.startswith("❌ Modifica #2"))
+    check("multi_edit: atomico (nessuna scrittura su errore)", (root / "a.py").read_text() == before)
+
+
+def test_web_fetch():
+    import urllib.request
+
+    class FakeResp(io.BytesIO):
+        def __enter__(self): return self
+        def __exit__(self, *a): self.close()
+
+    ctx = ToolContext(cfg=cfg_for(Path(".")))
+    sample = b"<body><h1>Titolo</h1><p>Primo &amp; secondo.</p><script>bad()</script></body>"
+    orig = urllib.request.urlopen
+    urllib.request.urlopen = lambda *a, **k: FakeResp(sample)
+    try:
+        out = web_tools.web_fetch(ctx, url="example.com")
+    finally:
+        urllib.request.urlopen = orig
+    check("web_fetch: estrae testo", "Titolo" in out and "Primo & secondo." in out)
+    check("web_fetch: rimuove script", "bad()" not in out)
+
+    urllib.request.urlopen = lambda *a, **k: (_ for _ in ()).throw(OSError("giù"))
+    try:
+        out = web_tools.web_fetch(ctx, url="https://x")
+    finally:
+        urllib.request.urlopen = orig
+    check("web_fetch: errore pulito", out.startswith("❌ Impossibile scaricare"))
+
+
+def test_runtime_switch_and_context():
+    from flair.llm import create_provider
+    cfg = cfg_for(Path("."))
+    cfg.provider = "deepseek"
+    check("switch: factory deepseek", isinstance(create_provider(cfg), DeepSeekProvider) and cfg.active is cfg.deepseek)
+    cfg.provider = "openai"
+    check("switch: factory openai", isinstance(create_provider(cfg), OpenAIProvider) and cfg.active is cfg.openai)
+
+    prov = SimpleNamespace()
+    agent = coding_agent.build(cfg, prov)
+    agent.messages.append({"role": "user", "content": "x" * 4000})
+    tokens, frac = agent.context_fill()
+    check("contesto: tokens>0", tokens > 0)
+    check("contesto: frazione 0..1", 0.0 <= frac <= 1.0)
+
+
+def test_streaming_reasoning_order():
+    cfg = cfg_for(Path("."))
+    cfg.provider = "deepseek"
+    ds = DeepSeekProvider(cfg)
+
+    def rchunk(reasoning=None, content=None, tcs=None, usage=None):
+        delta = SimpleNamespace(content=content, reasoning_content=reasoning, tool_calls=tcs)
+        empty = content is None and reasoning is None and tcs is None and usage is not None
+        choices = [] if empty else [SimpleNamespace(delta=delta)]
+        return SimpleNamespace(choices=choices, usage=usage)
+
+    def tcd(idx, _id=None, name=None, args=None):
+        return SimpleNamespace(index=idx, id=_id, function=SimpleNamespace(name=name, arguments=args))
+
+    usage = SimpleNamespace(prompt_tokens=3, completion_tokens=4, total_tokens=7,
+                            prompt_cache_hit_tokens=0, prompt_cache_miss_tokens=3, completion_tokens_details=None)
+
+    # caso 1: ragionamento (arriva prima) → poi testo. on_reasoning DEVE precedere on_delta.
+    chunks = [rchunk(reasoning="penso… "), rchunk(reasoning="ancora"),
+              rchunk(content="Ecco "), rchunk(content="la risposta"), rchunk(usage=usage)]
+    rec = _Recorder()
+    rec.create = lambda **kw: iter(chunks)  # type: ignore
+    ds._client = SimpleNamespace(chat=SimpleNamespace(completions=rec))
+    events = []
+    resp = ds.complete([{"role": "user", "content": "x"}], stream=True,
+                       on_delta=lambda p: events.append(("delta", p)),
+                       on_reasoning=lambda r: events.append(("reason", r)))
+    check("stream: ragionamento PRIMA del contenuto", events[0] == ("reason", "penso… ancora"), str(events))
+    check("stream: poi il contenuto", events[1][0] == "delta" and resp.content == "Ecco la risposta", str(events))
+    check("stream: ragionamento emesso una sola volta", sum(1 for e in events if e[0] == "reason") == 1, str(events))
+
+    # caso 2: ragionamento + tool, nessun testo → ragionamento emesso comunque, prima del tool.
+    chunks2 = [rchunk(reasoning="rifletto sul tool"),
+               rchunk(tcs=[tcd(0, "c1", "read_file", '{"path":"a.py"}')]), rchunk(usage=usage)]
+    rec2 = _Recorder()
+    rec2.create = lambda **kw: iter(chunks2)  # type: ignore
+    ds._client = SimpleNamespace(chat=SimpleNamespace(completions=rec2))
+    ev2 = []
+    resp2 = ds.complete([{"role": "user", "content": "x"}], stream=True,
+                        on_delta=lambda p: ev2.append(("delta", p)),
+                        on_reasoning=lambda r: ev2.append(("reason", r)))
+    check("stream tool-only: ragionamento emesso", ("reason", "rifletto sul tool") in ev2)
+    check("stream tool-only: tool assemblato", bool(resp2.tool_calls) and resp2.tool_calls[0].name == "read_file")
+
+    # caso 3: provider OpenAI, campo `reasoning` (convenzione OpenAI/GPT-OSS) al posto di reasoning_content.
+    cfg.provider = "openai"
+    oa = OpenAIProvider(cfg)
+
+    def ochunk(reasoning=None, content=None, usage=None):
+        delta = SimpleNamespace(content=content, reasoning=reasoning, tool_calls=None)  # niente reasoning_content
+        empty = content is None and reasoning is None and usage is not None
+        return SimpleNamespace(choices=[] if empty else [SimpleNamespace(delta=delta)], usage=usage)
+
+    chunks3 = [ochunk(reasoning="penso (oa) "), ochunk(reasoning="ancora"),
+               ochunk(content="Risposta OA"), ochunk(usage=usage)]
+    rec3 = _Recorder()
+    rec3.create = lambda **kw: iter(chunks3)  # type: ignore
+    oa._client = SimpleNamespace(chat=SimpleNamespace(completions=rec3))
+    ev3 = []
+    resp3 = oa.complete([{"role": "user", "content": "x"}], stream=True,
+                        on_delta=lambda p: ev3.append(("delta", p)),
+                        on_reasoning=lambda r: ev3.append(("reason", r)))
+    check("stream OpenAI: campo `reasoning` PRIMA del contenuto", bool(ev3) and ev3[0] == ("reason", "penso (oa) ancora"), str(ev3))
+    check("stream OpenAI: reasoning nel resp", resp3.reasoning == "penso (oa) ancora" and resp3.content == "Risposta OA")
+
+
+# ── 17. schemi tool senza drift ───────────────────────────────────────────────
 
 def test_tool_schemas():
     from flair.core.tool import Toolset
@@ -622,6 +807,12 @@ def main():
     test_safe_split()
     test_overflow_retry()
     test_web_search()
+    test_session_persistence()
+    test_cli_session_roundtrip()
+    test_multi_edit()
+    test_web_fetch()
+    test_runtime_switch_and_context()
+    test_streaming_reasoning_order()
     test_tool_schemas()
     print(f"\nTUTTI I {len(PASS)} TEST PASSATI ✅")
 

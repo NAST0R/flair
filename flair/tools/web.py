@@ -204,4 +204,47 @@ def web_search(ctx: ToolContext, query: str, max_results: int | None = None) -> 
             f"bloccare le richieste automatiche (anti-bot)." + rimedio + dettagli)
 
 
-TOOLS = [web_search]
+_SCRIPT_STYLE = re.compile(r"<(script|style|noscript)\b[^>]*>.*?</\1>", re.IGNORECASE | re.DOTALL)
+_WS = re.compile(r"[ \t]+")
+_BLANKS = re.compile(r"\n\s*\n\s*\n+")
+
+
+def _html_to_text(page: str) -> str:
+    page = _SCRIPT_STYLE.sub(" ", page)
+    page = re.sub(r"<(br|/p|/div|/li|/h[1-6])\b[^>]*>", "\n", page, flags=re.IGNORECASE)
+    text = html.unescape(_TAGS.sub("", page))
+    text = _WS.sub(" ", text)
+    return _BLANKS.sub("\n\n", text).strip()
+
+
+@tool(
+    "web_fetch",
+    ("Scarica una pagina web e ne restituisce il testo leggibile (HTML rimosso). "
+     "Usalo dopo web_search per leggere il contenuto di un risultato, o su un URL noto."),
+    {
+        "type": "object",
+        "properties": {
+            "url": {"type": "string", "description": "L'URL da scaricare (http/https)."},
+            "max_chars": {"type": "integer", "description": "Lunghezza massima del testo (default: limite di lettura)."},
+        },
+        "required": ["url"],
+    },
+)
+def web_fetch(ctx: ToolContext, url: str, max_chars: int | None = None) -> str:
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+    limit = max_chars or ctx.cfg.read_file_max_chars
+    timeout = min(ctx.cfg.request_timeout, 25)
+    try:
+        page = _http(url, None, timeout)
+    except Exception as exc:  # noqa: BLE001
+        return f"❌ Impossibile scaricare {url}: {type(exc).__name__}: {exc}"
+    text = _html_to_text(page)
+    if not text:
+        return f"(nessun testo estraibile da {url})"
+    if len(text) > limit:
+        text = text[:limit] + f"\n…[troncato a {limit} caratteri]"
+    return f"Contenuto di {url}:\n\n{text}"
+
+
+TOOLS = [web_search, web_fetch]

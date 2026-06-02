@@ -100,6 +100,40 @@ class Agent:
         self._last_prompt_tokens = 0
         self._sent_upto = 1
 
+    # ── stato (persistenza sessioni) ──────────────────────────────────────────
+
+    _USAGE_FIELDS = ("prompt_tokens", "completion_tokens", "total_tokens",
+                     "cache_hit_tokens", "cache_miss_tokens", "reasoning_tokens")
+
+    def dump_state(self) -> dict:
+        """Stato serializzabile (JSON) della conversazione e dell'uso cumulativo."""
+        u = self.total_usage
+        return {
+            "messages": self.messages,
+            "usage": {k: getattr(u, k) for k in self._USAGE_FIELDS},
+        }
+
+    def load_state(self, state: dict) -> None:
+        msgs = state.get("messages")
+        if isinstance(msgs, list) and msgs:
+            self.messages = msgs
+        u = state.get("usage") or {}
+        self.total_usage = Usage(**{k: int(u.get(k, 0)) for k in self._USAGE_FIELDS})
+        self._last_prompt_tokens = 0
+        self._sent_upto = 1
+
+    # ── compaction / contesto ───────────────────────────────────────────────
+
+    def compact(self) -> bool:
+        """Compatta su richiesta esplicita (REPL /compact)."""
+        return self._compact()
+
+    def context_fill(self) -> tuple[int, float]:
+        """(token dell'ultimo contesto inviato, frazione della finestra) per la UI."""
+        tokens = self._ctx_estimate()
+        window = max(1, self.cfg.context_window)
+        return tokens, min(1.0, tokens / window)
+
     # ── esecuzione ──────────────────────────────────────────────────────────
 
     def run(self, task: str, think: bool = False) -> AgentResult:
@@ -113,7 +147,7 @@ class Agent:
             resp = self._complete(tools=schemas, think=think and step == 0)
             turn_usage = turn_usage + resp.usage
 
-            if resp.reasoning and self.on_reasoning:
+            if resp.reasoning and self.on_reasoning and not self._streaming():
                 self.on_reasoning(resp.reasoning)
 
             if not resp.has_tool_calls:
@@ -164,12 +198,14 @@ class Agent:
         return resp
 
     def _raw_complete(self, tools, think) -> LLMResponse:
+        streaming = self._streaming()
         return self.provider.complete(
             self.messages,
             tools=tools,
             think=think,
-            stream=self._streaming(),
-            on_delta=self.on_delta if self._streaming() else None,
+            stream=streaming,
+            on_delta=self.on_delta if streaming else None,
+            on_reasoning=self.on_reasoning if streaming else None,
         )
 
     # ── compaction ────────────────────────────────────────────────────────────

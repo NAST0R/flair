@@ -147,6 +147,16 @@ class LLMResponse:
 OnDelta = Callable[[str], None]
 
 
+def _reasoning_piece(obj) -> str:
+    """Testo di ragionamento da un delta/messaggio, accettando sia il campo di
+    DeepSeek (`reasoning_content`) sia quello dell'ecosistema OpenAI (`reasoning`).
+    Stringa vuota se assente o non testuale (es. oggetti strutturati)."""
+    val = getattr(obj, "reasoning_content", None)
+    if not isinstance(val, str) or not val:
+        val = getattr(obj, "reasoning", None)
+    return val if isinstance(val, str) else ""
+
+
 class LLMProvider(ABC):
     name: str = "base"
 
@@ -159,6 +169,7 @@ class LLMProvider(ABC):
         max_tokens: int | None = None,
         stream: bool = False,
         on_delta: OnDelta | None = None,
+        on_reasoning: OnDelta | None = None,
     ) -> LLMResponse:
         raise NotImplementedError
 
@@ -221,17 +232,23 @@ class OpenAICompatProvider(LLMProvider):
         max_tokens: int | None = None,
         stream: bool = False,
         on_delta: OnDelta | None = None,
+        on_reasoning: OnDelta | None = None,
     ) -> LLMResponse:
         params = self._build_params(messages, tools, think, max_tokens)
 
         if stream and on_delta is not None:
             try:
-                return self._complete_stream(params, on_delta)
+                return self._complete_stream(params, on_delta, on_reasoning)
             except _TRANSIENT as exc:
                 log.warning("Streaming fallito (%s) — fallback senza streaming", type(exc).__name__)
             # i non-transitori (es. BadRequest) escono e li gestisce il chiamante
 
-        return self._normalize(self._call_with_retry(params))
+        resp = self._normalize(self._call_with_retry(params))
+        # In modalità streaming caduta nel fallback: il ragionamento va comunque
+        # mostrato (lo emette il provider, non il loop dell'agente).
+        if stream and on_reasoning is not None and resp.reasoning:
+            on_reasoning(resp.reasoning)
+        return resp
 
     # ── interni ───────────────────────────────────────────────────────────
 
@@ -252,14 +269,22 @@ class OpenAICompatProvider(LLMProvider):
         assert last is not None
         raise last
 
-    def _complete_stream(self, params: dict, on_delta: OnDelta) -> LLMResponse:
+    def _complete_stream(self, params: dict, on_delta: OnDelta,
+                         on_reasoning: OnDelta | None = None) -> LLMResponse:
         params = {**params, "stream": True, "stream_options": {"include_usage": True}}
         stream = self._client.chat.completions.create(**params)
 
         content: list[str] = []
         reasoning: list[str] = []
+        reasoning_emitted = False
         acc: dict[int, dict] = {}
         usage_obj = None
+
+        def _flush_reasoning() -> None:
+            nonlocal reasoning_emitted
+            if reasoning and not reasoning_emitted and on_reasoning is not None:
+                on_reasoning("".join(reasoning))
+            reasoning_emitted = True
 
         for chunk in stream:
             if getattr(chunk, "usage", None):
@@ -267,14 +292,18 @@ class OpenAICompatProvider(LLMProvider):
             if not getattr(chunk, "choices", None):
                 continue
             delta = chunk.choices[0].delta
-            piece = getattr(delta, "content", None)
-            if piece:
-                content.append(piece)
-                on_delta(piece)
-            rc = getattr(delta, "reasoning_content", None)
+            rc = _reasoning_piece(delta)
             if rc:
                 reasoning.append(rc)
-            for tcd in (getattr(delta, "tool_calls", None) or []):
+            piece = getattr(delta, "content", None)
+            if piece:
+                _flush_reasoning()  # il ragionamento (arrivato prima) va mostrato prima della risposta
+                content.append(piece)
+                on_delta(piece)
+            tcs = getattr(delta, "tool_calls", None) or []
+            if tcs:
+                _flush_reasoning()  # anche se non c'è testo, mostra il ragionamento prima dei tool
+            for tcd in tcs:
                 slot = acc.setdefault(tcd.index, {"id": None, "name": None, "args": ""})
                 if getattr(tcd, "id", None):
                     slot["id"] = tcd.id
@@ -284,6 +313,8 @@ class OpenAICompatProvider(LLMProvider):
                         slot["name"] = fn.name
                     if getattr(fn, "arguments", None):
                         slot["args"] += fn.arguments
+
+        _flush_reasoning()  # ragionamento senza testo né tool: emettilo comunque a fine stream
 
         tool_calls = [
             ToolCall(id=s["id"] or f"call_{i}", name=s["name"], arguments=parse_tool_args(s["args"]))
@@ -302,7 +333,7 @@ class OpenAICompatProvider(LLMProvider):
             tool_calls.append(ToolCall(id=tc.id, name=fn.name, arguments=parse_tool_args(fn.arguments)))
         return LLMResponse(
             content=msg.content or "",
-            reasoning=getattr(msg, "reasoning_content", "") or "",
+            reasoning=_reasoning_piece(msg),
             tool_calls=tool_calls,
             usage=self._usage(resp.usage),
         )

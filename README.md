@@ -53,7 +53,7 @@ flair/
 **One engine, two agents.** `core/agent.py` is generic: it takes a *toolset* and a *prompt*. The two agents differ only in those — no duplicated logic.
 
 - **Coding agent** — `read_file`, `list_directory`, `glob`, `grep`, `edit_file`, `multi_edit`, `write_file`, `run_command`. **Sandboxed** to the project root (`--root`): it cannot escape it.
-- **General agent** — `open_url`, `open_path`, `open_application`, `search_files`, `list_directory`, `read_file`, `run_command`, `system_info`, `get_datetime`, `clipboard_get/set`, `web_search`, `web_fetch`. Operates on the **whole machine** (that is its purpose: "open the browser", "find a song"). It can also **converse**: if no tool is needed, it just answers.
+- **General agent** — `open_url`, `open_path`, `open_application`, `search_files`, `list_directory`, `read_file`, `write_file`, `edit_file`, `run_command`, `system_info`, `get_datetime`, `clipboard_get/set`, `web_search`, `web_fetch`. Operates on the **whole machine** (that is its purpose: "open the browser", "find a song", "write a report to disk"). It can also **converse**: if no tool is needed, it just answers.
 
 **Safety.** Destructive tools (`edit_file`, `multi_edit`, `write_file`, `run_command`) ask for confirmation interactively, with a **diff preview**. `--yes` / `FLAIR_AUTO_APPROVE=true` disables it.
 
@@ -172,7 +172,7 @@ You can always invoke it as `python -m flair ...` too.
 
 **File creation.** `write_file` creates whole files and intermediate folders; `edit_file` makes targeted changes. The coding agent can therefore both **create** and **modify**.
 
-**Diff preview + "always allow".** Before every destructive operation (when confirmations are on) Flair shows a **colored diff** of what will change (for `edit_file`/`write_file`) or the command (`run_command`). At the `[y]es / [n]o / [a]lways` prompt, `a` remembers the operation for the session and stops asking. If an `edit_file` match would fail, the preview says so up front instead of showing an empty diff.
+**Diff preview + "always allow".** Before every destructive operation (when confirmations are on) Flair shows a **colored diff** of what will change (for `edit_file`/`write_file`) or the command (`run_command`). At the `[y]es / [n]o / [a]lways` prompt, `a` stops asking **for that tool** for the rest of the session (so a long run of commands isn't interrupted at every step). If an `edit_file` match would fail, the preview says so up front instead of showing an empty diff.
 
 **Project instructions.** If the root contains an `AGENTS.md` (or `FLAIR.md`, `CLAUDE.md`, `.flair.md`) file, its content is loaded into the coding agent's prompt: conventions, build/test commands, constraints. `/root` reloads it on the fly.
 

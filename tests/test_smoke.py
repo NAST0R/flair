@@ -301,8 +301,6 @@ def test_approval_gate():
         LLMResponse(content="ok, annullato", usage=Usage(total_tokens=1)),
     ])
     agent = general_agent.build(cfg, fake, approve=lambda name, args: False)  # nega sempre
-    # write_file non è nei tool generici → usa coding per il gate
-    agent = coding_agent.build(cfg, fake, approve=lambda name, args: False)
     agent.run("scrivi")
     check("approval: edit distruttivo negato non scrive", (root / "f.py").read_text() == "a=1\n")
     tmsg = [m for m in agent.messages if m["role"] == "tool"][0]["content"]
@@ -777,6 +775,66 @@ def test_streaming_reasoning_order():
     check("stream OpenAI: reasoning nel resp", resp3.reasoning == "penso (oa) ancora" and resp3.content == "Risposta OA")
 
 
+def test_system_write_edit():
+    from flair.tools import system as st
+    root = Path("/tmp/flair_sys_we")
+    shutil.rmtree(root, ignore_errors=True)
+    root.mkdir(parents=True)
+    ctx = ToolContext(cfg=cfg_for(root))
+    target = root / "REPORT.md"
+
+    out = st.write_file(ctx, path=str(target), content="# Titolo\n\nCorpo.\n")
+    check("system write_file: crea", target.exists() and "Creato" in out)
+    check("system write_file: contenuto", target.read_text() == "# Titolo\n\nCorpo.\n")
+    out = st.write_file(ctx, path=str(target), content="nuovo")
+    check("system write_file: sovrascrive", "Sovrascritto" in out and target.read_text() == "nuovo")
+
+    nested = root / "a" / "b" / "c.txt"
+    st.write_file(ctx, path=str(nested), content="ok")
+    check("system write_file: crea cartelle mancanti", nested.exists())
+
+    target.write_text("alpha\nbeta\n")
+    out = st.edit_file(ctx, path=str(target), old_string="beta", new_string="gamma")
+    check("system edit_file: modifica", target.read_text() == "alpha\ngamma\n" and out.startswith("✓"))
+    out = st.edit_file(ctx, path=str(root / "nope.md"), old_string="x", new_string="y")
+    check("system edit_file: file inesistente", out.startswith("❌"))
+
+
+def test_cli_always_per_tool():
+    import io as _io
+
+    from rich.console import Console
+
+    from flair.cli import CLI
+    cfg = cfg_for(Path("."))
+    cfg.auto_approve = False
+    cli = CLI(cfg)
+    cli.console = Console(file=_io.StringIO())  # silenzia l'output del pannello
+    calls = {"n": 0}
+
+    def fake_input(_prompt):
+        calls["n"] += 1
+        return "a"  # always
+    cli.console.input = fake_input  # type: ignore
+
+    ok1 = cli._approve("run_command", {"command": "echo 1"})
+    ok2 = cli._approve("run_command", {"command": "echo 2"})  # comando diverso, stesso tool
+    check("always per-tool: prima approvata (chiede una volta)", ok1 is True and calls["n"] == 1)
+    check("always per-tool: 2ª auto-approvata SENZA richiesta", ok2 is True and calls["n"] == 1)
+    cli._approve("write_file", {"path": "x", "content": ""})  # tool diverso → richiede di nuovo
+    check("always per-tool: tool diverso richiede", calls["n"] == 2)
+
+
+def test_approval_prompt_brackets():
+    import io as _io
+
+    from rich.console import Console
+    c = Console(file=_io.StringIO())
+    c.print(r"procedo? \[y]es / \[n]o / \[a]lways")  # parentesi escape-ate
+    out = c.file.getvalue()
+    check("prompt: mostra [y]es/[n]o/[a]lways letterali", "[y]es" in out and "[n]o" in out and "[a]lways" in out, out)
+
+
 # ── 17. schemi tool senza drift ───────────────────────────────────────────────
 
 def test_tool_schemas():
@@ -813,6 +871,9 @@ def main():
     test_web_fetch()
     test_runtime_switch_and_context()
     test_streaming_reasoning_order()
+    test_system_write_edit()
+    test_cli_always_per_tool()
+    test_approval_prompt_brackets()
     test_tool_schemas()
     print(f"\nTUTTI I {len(PASS)} TEST PASSATI ✅")
 

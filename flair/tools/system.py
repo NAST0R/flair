@@ -221,6 +221,66 @@ def read_file(ctx: ToolContext, path: str, offset: int = 1, limit: int | None = 
     return fs.read_file_impl(None, path, offset, limit, ctx.cfg.read_file_max_chars)
 
 
+# ── write_file / edit_file (qualsiasi percorso del computer) ──────────────────
+
+@tool(
+    "write_file",
+    ("Crea o sovrascrive un file di testo qualsiasi del computer col contenuto fornito "
+     "(crea anche le cartelle mancanti). USA QUESTO per creare un file (es. un report), "
+     "non run_command: è diretto e affidabile, niente problemi di shell/escaping."),
+    {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "description": "Path del file (assoluto o ~)."},
+            "content": {"type": "string", "description": "Contenuto completo del file."},
+        },
+        "required": ["path", "content"],
+    },
+    destructive=True,
+)
+def write_file(ctx: ToolContext, path: str, content: str) -> str:
+    p = fs.resolve(None, path)
+    if p.is_dir():
+        return f"❌ È una directory: {p}"
+    existed = p.exists()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(content, encoding="utf-8")
+    verbo = "Sovrascritto" if existed else "Creato"
+    return f"✓ {verbo} {p} ({len(content)} caratteri)."
+
+
+@tool(
+    "edit_file",
+    ("Sostituisce una porzione esatta di testo in un file qualsiasi del computer "
+     "(match resiliente a spazi/indentazione). Per piccole modifiche mirate; per "
+     "creare o riscrivere un intero file usa write_file."),
+    {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "description": "Path del file (assoluto o ~)."},
+            "old_string": {"type": "string", "description": "Testo esatto da sostituire."},
+            "new_string": {"type": "string", "description": "Testo nuovo."},
+            "replace_all": {"type": "boolean", "description": "Sostituire tutte le occorrenze (default false)."},
+        },
+        "required": ["path", "old_string", "new_string"],
+    },
+    destructive=True,
+)
+def edit_file(ctx: ToolContext, path: str, old_string: str, new_string: str, replace_all: bool = False) -> str:
+    p = fs.resolve(None, path)
+    if not p.exists():
+        return f"❌ Il file non esiste: {p} (usa write_file per crearlo)"
+    if p.is_dir():
+        return f"❌ È una directory: {p}"
+    text = p.read_text(encoding="utf-8", errors="replace")
+    new_text, strategy = fs.apply_edit(text, old_string, new_string, replace_all)
+    if new_text == text:
+        return f"⚠️ Nessuna modifica: il risultato è identico a {p}."
+    p.write_text(new_text, encoding="utf-8")
+    note = "" if strategy == "esatto" else f" [match: {strategy}]"
+    return f"✓ Modificato {p}{note}."
+
+
 # ── run_command ──────────────────────────────────────────────────────────────
 
 @tool(
@@ -372,5 +432,6 @@ def clipboard_set(ctx: ToolContext, text: str) -> str:
 
 TOOLS = [
     open_url, open_path, open_application, search_files, list_directory,
-    read_file, run_command, system_info, get_datetime, clipboard_get, clipboard_set,
+    read_file, write_file, edit_file, run_command, system_info, get_datetime,
+    clipboard_get, clipboard_set,
 ]

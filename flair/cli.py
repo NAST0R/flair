@@ -176,15 +176,9 @@ class CLI:
 
     # ── approvazione + anteprima diff ─────────────────────────────────────────
 
-    @staticmethod
-    def _sig(name: str, args: dict) -> str:
-        key = args.get("command") or args.get("path") or args.get("name") or ""
-        return f"{name}::{key}"
-
     def _approve(self, name: str, args: dict) -> bool:
         self._newline_if_needed()
-        sig = self._sig(name, args)
-        if sig in self._always_allow:
+        if name in self._always_allow:   # "always" vale per l'intero tool, per la sessione
             return True
 
         preview = self._preview(name, args)
@@ -195,11 +189,13 @@ class CLI:
             self.console.print(f"  [yellow]⚠ conferma[/yellow] [bold]{name}[/bold] → {_short(target, 80)}")
 
         try:
-            ans = self.console.input("    procedo? [y]es / [n]o / [a]lways ").strip().lower()
+            # Le parentesi quadre sono escape-ate: Rich le interpreterebbe come markup.
+            ans = self.console.input(r"    procedo? \[y]es / \[n]o / \[a]lways ").strip().lower()
         except (EOFError, KeyboardInterrupt):
             return False
         if ans in ("a", "always", "sempre"):
-            self._always_allow.add(sig)
+            self._always_allow.add(name)
+            self.console.print(f"[dim]  ok: non chiederò più conferma per «{name}» in questa sessione.[/dim]")
             return True
         return ans in ("y", "yes", "s", "si", "sì")
 

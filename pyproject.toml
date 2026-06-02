@@ -1,0 +1,49 @@
+[project]
+name = "flair"
+version = "3.0.0"
+description = "Agentic AI assistant (advanced coding + general desktop automation) on DeepSeek and OpenAI."
+requires-python = ">=3.10"
+dependencies = [
+    "openai>=1.40.0",
+    "rich>=13.0.0",
+    "python-dotenv>=1.0.0",
+    "ddgs>=9.0",          # key-free web search for the general agent
+]
+
+[project.optional-dependencies]
+# Optional extras for the general agent (detailed RAM/CPU, portable clipboard).
+extras = ["psutil>=5.9.0", "pyperclip>=1.8.0"]
+# Development tools (test, lint, type-check).
+dev = ["pytest>=8.0", "ruff>=0.6", "mypy>=1.10"]
+
+[project.scripts]
+flair = "flair.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["flair", "flair.llm", "flair.core", "flair.tools", "flair.agents", "flair.prompts"]
+
+[tool.setuptools.package-data]
+"flair.prompts" = ["*.md"]
+"flair" = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["E501"]  # line length handled by the formatter
+
+[tool.mypy]
+python_version = "3.10"
+ignore_missing_imports = true   # openai/psutil/pyperclip not always typed
+warn_unused_ignores = false
+check_untyped_defs = true

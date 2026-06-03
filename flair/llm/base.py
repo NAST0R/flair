@@ -40,11 +40,21 @@ try:  # presente in openai>=1.x
 except Exception:  # pragma: no cover
     BadRequestError = Exception  # type: ignore
 
+# httpx è una dipendenza di openai. Durante l'iterazione di uno stream, l'SDK NON
+# riavvolge i timeout/errori di rete: esce il `httpx.ReadTimeout` (o altri
+# TransportError) grezzo. Vanno trattati come transitori, altrimenti uno stallo
+# di rete a metà stream sfugge al fallback e fa crashare il programma.
+try:
+    import httpx
+    _HTTPX_TRANSIENT: tuple[type[BaseException], ...] = (httpx.TransportError,)
+except Exception:  # pragma: no cover
+    _HTTPX_TRANSIENT = ()
+
 log = logging.getLogger(__name__)
 
 _MAX_RETRIES = 3
 _BACKOFF = (1.0, 2.0, 4.0)
-_TRANSIENT = (APITimeoutError, APIConnectionError, RateLimitError, InternalServerError)
+_TRANSIENT = (APITimeoutError, APIConnectionError, RateLimitError, InternalServerError, *_HTTPX_TRANSIENT)
 
 _OVERFLOW_RX = re.compile(
     r"context length|maximum context|context window|too many tokens|"

@@ -226,6 +226,21 @@ class CLI:
 
     # ── esecuzione ──────────────────────────────────────────────────────────
 
+    def _safe_run_task(self, task: str, agent_key: str | None = None, think: bool = False) -> None:
+        """Esegue un turno proteggendo la REPL. Ctrl-C interrompe il turno e riporta al
+        prompt; un errore (es. timeout di rete del modello esaurita la coda di retry)
+        viene segnalato senza far crashare flair. La conversazione resta utilizzabile."""
+        try:
+            self.run_task(task, agent_key=agent_key, think=think)
+        except KeyboardInterrupt:
+            self._newline_if_needed()
+            self.console.print("[yellow]⏹ Turno interrotto. Sei tornato al prompt.[/yellow]\n")
+        except Exception as exc:  # noqa: BLE001
+            self._newline_if_needed()
+            self.console.print(f"[red]⚠ Il turno è fallito: {type(exc).__name__}: {exc}[/red]")
+            self.console.print("[dim]Puoi riprovare. Se è un timeout di rete del modello, "
+                               "riprova tra poco o abbassa FLAIR_TIMEOUT.[/dim]\n")
+
     def run_task(self, task: str, agent_key: str | None = None, think: bool = False) -> None:
         if agent_key is None:
             agent_key = router.classify(task, self.provider, self.last_agent)
@@ -448,20 +463,20 @@ class CLI:
             if low.startswith("/code"):
                 task = line[len("/code"):].strip()
                 if task:
-                    self.run_task(task, agent_key="coding")
+                    self._safe_run_task(task, agent_key="coding")
                 continue
             if low.startswith("/do"):
                 task = line[len("/do"):].strip()
                 if task:
-                    self.run_task(task, agent_key="general")
+                    self._safe_run_task(task, agent_key="general")
                 continue
             if low.startswith("/think"):
                 task = line[len("/think"):].strip()
                 if task:
-                    self.run_task(task, think=True)
+                    self._safe_run_task(task, think=True)
                 continue
 
-            self.run_task(line)
+            self._safe_run_task(line)
 
 
 def _build_config(args) -> Config:

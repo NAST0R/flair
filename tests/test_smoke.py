@@ -881,6 +881,86 @@ def test_stop_flow():
     check("stop: l'interruzione diventa informazione", any("Interrotto dall'utente" in t for t in tmsgs))
 
 
+def test_keyboard_interrupt_during_model_call():
+    # Ctrl-C DURANTE la chiamata al modello (lo scenario dello stallo di rete): l'agente
+    # non deve crashare, deve chiudere il turno come "stopped" lasciando la conversazione
+    # valida. Nessun tool_call è stato emesso, quindi niente da "richiudere".
+    cfg = cfg_for(Path("."))
+    fake = FakeProvider([KeyboardInterrupt()])
+    agent = coding_agent.build(cfg, fake)
+    res = agent.run("fai un check")
+    check("ctrl-c (modello): stopped_reason = stopped", res.stopped_reason == "stopped", res.stopped_reason)
+    check("ctrl-c (modello): chiamata tentata", fake.i == 1, fake.i)
+    roles = [m["role"] for m in agent.messages]
+    check("ctrl-c (modello): nessun tool_call pendente", "tool" not in roles, roles)
+    check("ctrl-c (modello): ultimo messaggio è dell'utente", roles[-1] == "user", roles)
+
+
+def test_keyboard_interrupt_mid_tools():
+    # Ctrl-C MENTRE un tool è in approvazione/esecuzione: l'assistant con i tool_call è
+    # già in cronologia, quindi ogni tool_call DEVE ricevere una risposta 'tool', altrimenti
+    # la prossima chiamata API fallirebbe. La conversazione resta valida.
+    root = Path("/tmp/flair_kbi")
+    shutil.rmtree(root, ignore_errors=True)
+    root.mkdir(parents=True)
+    (root / "a.py").write_text("x\n")
+    cfg = cfg_for(root)
+    cfg.auto_approve = False
+    fake = FakeProvider([
+        LLMResponse(content="procedo", tool_calls=[
+            tc("write_file", path="a.py", content="uno"),
+            tc("write_file", path="b.py", content="due"),
+        ], usage=Usage(total_tokens=1)),
+        LLMResponse(content="non dovrei arrivare qui", usage=Usage(total_tokens=1)),
+    ])
+
+    def _ctrl_c(_name, _args):
+        raise KeyboardInterrupt
+    agent = coding_agent.build(cfg, fake, approve=_ctrl_c)
+    res = agent.run("scrivi due file")
+    check("ctrl-c (tool): stopped_reason = stopped", res.stopped_reason == "stopped", res.stopped_reason)
+    check("ctrl-c (tool): nessun file scritto", (root / "a.py").read_text() == "x\n" and not (root / "b.py").exists())
+    check("ctrl-c (tool): modello non richiamato dopo", fake.i == 1, fake.i)
+    asst = [m for m in agent.messages if m["role"] == "assistant" and m.get("tool_calls")][-1]
+    tool_ids = {c["id"] for c in asst["tool_calls"]}
+    answered = {m["tool_call_id"] for m in agent.messages if m["role"] == "tool"}
+    check("ctrl-c (tool): ogni tool_call risposta (conversazione valida)", tool_ids <= answered, f"{tool_ids} vs {answered}")
+    tmsgs = [m["content"] for m in agent.messages if m["role"] == "tool"]
+    check("ctrl-c (tool): interruzione registrata", any("Interrotto dall'utente" in t for t in tmsgs))
+
+
+def test_repl_survives_turn_error():
+    # La REPL non deve MAI crashare per un errore nel turno (es. timeout di rete del modello
+    # esaurita la coda di retry/fallback) né per Ctrl-C: _safe_run_task li assorbe.
+    import io as _io
+
+    from rich.console import Console
+
+    from flair.cli import CLI
+    cli = CLI(cfg_for(Path(".")))
+    cli.console = Console(file=_io.StringIO())
+
+    def _boom(*_a, **_k):
+        raise RuntimeError("read timeout simulato")
+    cli.run_task = _boom  # type: ignore
+    propagated = False
+    try:
+        cli._safe_run_task("ciao")
+    except Exception:
+        propagated = True
+    check("repl: errore nel turno non propaga", not propagated)
+
+    def _kb(*_a, **_k):
+        raise KeyboardInterrupt
+    cli.run_task = _kb  # type: ignore
+    propagated_kb = False
+    try:
+        cli._safe_run_task("ciao")
+    except BaseException:  # noqa: BLE001
+        propagated_kb = True
+    check("repl: Ctrl-C nel turno non propaga", not propagated_kb)
+
+
 def test_cli_approve_stop_and_yes():
     import io as _io
 
@@ -1063,6 +1143,9 @@ def main():
     test_approval_prompt_brackets()
     test_help_renders()
     test_stop_flow()
+    test_keyboard_interrupt_during_model_call()
+    test_keyboard_interrupt_mid_tools()
+    test_repl_survives_turn_error()
     test_cli_approve_stop_and_yes()
     test_shell_multiline_routing()
     test_shell_decoding_robust()

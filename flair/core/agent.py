@@ -141,56 +141,66 @@ class Agent:
 
     # ── esecuzione ──────────────────────────────────────────────────────────
 
+    def _answer_unanswered(self, resp: LLMResponse) -> None:
+        """Risponde "interrotto" a ogni tool_call della risposta ancora senza esito.
+        Ogni tool_call DEVE avere un messaggio 'tool', altrimenti la prossima chiamata
+        API fallisce: così la conversazione resta valida e l'agente sa dove si è fermato."""
+        answered = {m.get("tool_call_id") for m in self.messages if m.get("role") == "tool"}
+        for tc in resp.tool_calls:
+            if tc.id not in answered:
+                self.messages.append({"role": "tool", "tool_call_id": tc.id, "content": (
+                    f"⛔ Interrotto dall'utente: «{tc.name}» non è stato eseguito. "
+                    "Il controllo è tornato all'utente; attendi nuove istruzioni."
+                )})
+
     def run(self, task: str, think: bool = False) -> AgentResult:
         self.messages.append({"role": "user", "content": task})
         schemas = self.toolset.schemas()
         recent: dict[str, int] = {}
         step = 0
         turn_usage = Usage()
+        resp: LLMResponse | None = None
 
-        while step < self.cfg.max_steps:
-            resp = self._complete(tools=schemas, think=think and step == 0)
-            turn_usage = turn_usage + resp.usage
+        try:
+            while step < self.cfg.max_steps:
+                resp = self._complete(tools=schemas, think=think and step == 0)
+                turn_usage = turn_usage + resp.usage
 
-            if resp.reasoning and self.on_reasoning and not self._streaming():
-                self.on_reasoning(resp.reasoning)
+                if resp.reasoning and self.on_reasoning and not self._streaming():
+                    self.on_reasoning(resp.reasoning)
 
-            if not resp.has_tool_calls:
-                self.messages.append({"role": "assistant", "content": resp.content})
-                return AgentResult(resp.content, turn_usage, step, "done")
+                if not resp.has_tool_calls:
+                    self.messages.append({"role": "assistant", "content": resp.content})
+                    return AgentResult(resp.content, turn_usage, step, "done")
 
-            if resp.content and self.on_text and not self._streaming():
-                self.on_text(resp.content)
+                if resp.content and self.on_text and not self._streaming():
+                    self.on_text(resp.content)
 
-            step += 1
-            self.messages.append(self._assistant_msg(resp))
-            try:
-                for tc in resp.tool_calls:
-                    output, _ok = self._run_tool(tc, recent)
-                    self.messages.append({"role": "tool", "tool_call_id": tc.id, "content": output})
-            except StoppedByUser:
-                # Ogni tool_call della risposta DEVE avere un messaggio 'tool' di
-                # risposta, altrimenti la prossima chiamata API fallirebbe: marchiamo
-                # come "interrotta" la call fermata e tutte le successive non eseguite.
-                # Così la conversazione resta valida e l'agente sa dove si è fermato.
-                answered = {m.get("tool_call_id") for m in self.messages if m.get("role") == "tool"}
-                for tc in resp.tool_calls:
-                    if tc.id not in answered:
-                        self.messages.append({"role": "tool", "tool_call_id": tc.id, "content": (
-                            f"⛔ Interrotto dall'utente: «{tc.name}» non è stato eseguito. "
-                            "Il controllo è tornato all'utente; attendi nuove istruzioni."
-                        )})
-                return AgentResult("", turn_usage, step, "stopped")
+                step += 1
+                self.messages.append(self._assistant_msg(resp))
+                try:
+                    for tc in resp.tool_calls:
+                        output, _ok = self._run_tool(tc, recent)
+                        self.messages.append({"role": "tool", "tool_call_id": tc.id, "content": output})
+                except StoppedByUser:
+                    self._answer_unanswered(resp)
+                    return AgentResult("", turn_usage, step, "stopped")
 
-            if any(c >= 4 for c in recent.values()):
-                content, delta = self._force_final()
-                return AgentResult(content, turn_usage + delta, step, "loop")
-            if any(c == 3 for c in recent.values()):
-                self.messages.append({"role": "user", "content": (
-                    "Stai ripetendo la stessa chiamata senza progredire. Fermati e "
-                    "rispondi con quanto hai raccolto finora, indicando cosa non sei "
-                    "riuscito a determinare."
-                )})
+                if any(c >= 4 for c in recent.values()):
+                    content, delta = self._force_final()
+                    return AgentResult(content, turn_usage + delta, step, "loop")
+                if any(c == 3 for c in recent.values()):
+                    self.messages.append({"role": "user", "content": (
+                        "Stai ripetendo la stessa chiamata senza progredire. Fermati e "
+                        "rispondi con quanto hai raccolto finora, indicando cosa non sei "
+                        "riuscito a determinare."
+                    )})
+        except KeyboardInterrupt:
+            # Ctrl-C in qualsiasi punto (anche a metà di un tool): manteniamo valida la
+            # conversazione rispondendo agli eventuali tool_call ancora pendenti.
+            if resp is not None and resp.has_tool_calls:
+                self._answer_unanswered(resp)
+            return AgentResult("", turn_usage, step, "stopped")
 
         content, delta = self._force_final()
         return AgentResult(content, turn_usage + delta, step, "max_steps")

@@ -851,6 +851,64 @@ def test_help_renders():
     check("help: argomenti opzionali [nome] mostrati", "[nome]" in out and "<task>" in out, out[:400])
 
 
+def test_stop_flow():
+    root = Path("/tmp/flair_stop")
+    shutil.rmtree(root, ignore_errors=True)
+    root.mkdir(parents=True)
+    (root / "a.py").write_text("x\n")
+    cfg = cfg_for(root)
+    cfg.auto_approve = False
+    # un turno con DUE tool call distruttive; l'utente ferma alla prima
+    fake = FakeProvider([
+        LLMResponse(content="procedo", tool_calls=[
+            tc("write_file", path="a.py", content="uno"),
+            tc("write_file", path="b.py", content="due"),
+        ], usage=Usage(total_tokens=1)),
+        LLMResponse(content="non dovrei arrivare qui", usage=Usage(total_tokens=1)),
+    ])
+    agent = coding_agent.build(cfg, fake, approve=lambda name, args: "stop")
+    res = agent.run("scrivi due file")
+
+    check("stop: stopped_reason = stopped", res.stopped_reason == "stopped", res.stopped_reason)
+    check("stop: nessun file scritto", (root / "a.py").read_text() == "x\n" and not (root / "b.py").exists())
+    check("stop: il modello non è richiamato dopo lo stop", fake.i == 1, fake.i)
+    # ogni tool_call dell'assistente DEVE avere una risposta 'tool' (conversazione valida per l'API)
+    asst = [m for m in agent.messages if m["role"] == "assistant" and m.get("tool_calls")][-1]
+    tool_ids = {c["id"] for c in asst["tool_calls"]}
+    answered = {m["tool_call_id"] for m in agent.messages if m["role"] == "tool"}
+    check("stop: ogni tool_call risposta (conversazione valida)", tool_ids <= answered, f"{tool_ids} vs {answered}")
+    tmsgs = [m["content"] for m in agent.messages if m["role"] == "tool"]
+    check("stop: l'interruzione diventa informazione", any("Interrotto dall'utente" in t for t in tmsgs))
+
+
+def test_cli_approve_stop_and_yes():
+    import io as _io
+
+    from rich.console import Console
+
+    from flair.cli import CLI
+    cfg = cfg_for(Path("."))
+    cfg.auto_approve = False
+    cli = CLI(cfg)
+    cli.console = Console(file=_io.StringIO())
+
+    cli.console.input = lambda _p: "s"        # type: ignore
+    check("approve: 's' = stop", cli._approve("run_command", {"command": "x"}) == "stop")
+    cli.console.input = lambda _p: "stop"     # type: ignore
+    check("approve: 'stop' = stop", cli._approve("run_command", {"command": "x"}) == "stop")
+    cli.console.input = lambda _p: "si"       # type: ignore
+    check("approve: 'si' = sì (yes)", cli._approve("run_command", {"command": "x"}) is True)
+    cli.console.input = lambda _p: "sì"       # type: ignore
+    check("approve: 'sì' = yes", cli._approve("run_command", {"command": "x"}) is True)
+    cli.console.input = lambda _p: "n"        # type: ignore
+    check("approve: 'n' = no", cli._approve("run_command", {"command": "x"}) is False)
+
+    def _boom(_p):
+        raise KeyboardInterrupt
+    cli.console.input = _boom                 # type: ignore
+    check("approve: Ctrl-C = stop", cli._approve("run_command", {"command": "x"}) == "stop")
+
+
 # ── 17. schemi tool senza drift ───────────────────────────────────────────────
 
 def test_tool_schemas():
@@ -891,6 +949,8 @@ def main():
     test_cli_always_per_tool()
     test_approval_prompt_brackets()
     test_help_renders()
+    test_stop_flow()
+    test_cli_approve_stop_and_yes()
     test_tool_schemas()
     print(f"\nTUTTI I {len(PASS)} TEST PASSATI ✅")
 

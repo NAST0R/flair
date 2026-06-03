@@ -172,7 +172,7 @@ You can always invoke it as `python -m flair ...` too.
 
 **File creation.** `write_file` creates whole files and intermediate folders; `edit_file` makes targeted changes. The coding agent can therefore both **create** and **modify**.
 
-**Diff preview + "always allow".** Before every destructive operation (when confirmations are on) Flair shows a **colored diff** of what will change (for `edit_file`/`write_file`) or the command (`run_command`). At the `[y]es / [n]o / [a]lways` prompt, `a` stops asking **for that tool** for the rest of the session (so a long run of commands isn't interrupted at every step). If an `edit_file` match would fail, the preview says so up front instead of showing an empty diff.
+**Diff preview + "always allow".** Before every destructive operation (when confirmations are on) Flair shows a **colored diff** of what will change (for `edit_file`/`write_file`) or the command (`run_command`). At the `[y]es / [n]o / [a]lways / [s]top` prompt, `a` stops asking **for that tool** for the rest of the session (so a long run of commands isn't interrupted at every step), and `s` (or `Ctrl-C`) **stops the whole agentic flow** and returns control to you — the interruption is recorded in the conversation, so the agent knows exactly where it was stopped and can pick up from there on your next message. If an `edit_file` match would fail, the preview says so up front instead of showing an empty diff.
 
 **Project instructions.** If the root contains an `AGENTS.md` (or `FLAIR.md`, `CLAUDE.md`, `.flair.md`) file, its content is loaded into the coding agent's prompt: conventions, build/test commands, constraints. `/root` reloads it on the fly.
 

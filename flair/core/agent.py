@@ -38,7 +38,12 @@ OnReasoning = Callable[[str], None]
 OnText = Callable[[str], None]
 OnDelta = Callable[[str], None]
 OnCompact = Callable[[int, int], None]
-Approve = Callable[[str, dict], bool]
+Approve = Callable[[str, dict], bool | str]  # True = procedi, False = nega, "stop" = ferma il flusso
+
+
+class StoppedByUser(Exception):
+    """Sollevata quando l'utente sceglie 'stop' al prompt di conferma: il flusso
+    agentico si ferma subito e il controllo torna all'utente."""
 
 _COMPACT_PROMPT = (
     "Sei un compressore di contesto per un assistente AI. Riassumi la conversazione "
@@ -55,7 +60,7 @@ class AgentResult:
     content: str
     usage: Usage = field(default_factory=Usage)
     steps: int = 0
-    stopped_reason: str = "done"   # done | max_steps | loop
+    stopped_reason: str = "done"   # done | max_steps | loop | stopped
 
 
 class Agent:
@@ -159,9 +164,23 @@ class Agent:
 
             step += 1
             self.messages.append(self._assistant_msg(resp))
-            for tc in resp.tool_calls:
-                output, _ok = self._run_tool(tc, recent)
-                self.messages.append({"role": "tool", "tool_call_id": tc.id, "content": output})
+            try:
+                for tc in resp.tool_calls:
+                    output, _ok = self._run_tool(tc, recent)
+                    self.messages.append({"role": "tool", "tool_call_id": tc.id, "content": output})
+            except StoppedByUser:
+                # Ogni tool_call della risposta DEVE avere un messaggio 'tool' di
+                # risposta, altrimenti la prossima chiamata API fallirebbe: marchiamo
+                # come "interrotta" la call fermata e tutte le successive non eseguite.
+                # Così la conversazione resta valida e l'agente sa dove si è fermato.
+                answered = {m.get("tool_call_id") for m in self.messages if m.get("role") == "tool"}
+                for tc in resp.tool_calls:
+                    if tc.id not in answered:
+                        self.messages.append({"role": "tool", "tool_call_id": tc.id, "content": (
+                            f"⛔ Interrotto dall'utente: «{tc.name}» non è stato eseguito. "
+                            "Il controllo è tornato all'utente; attendi nuove istruzioni."
+                        )})
+                return AgentResult("", turn_usage, step, "stopped")
 
             if any(c >= 4 for c in recent.values()):
                 content, delta = self._force_final()
@@ -327,7 +346,12 @@ class Agent:
         recent[sig] = recent.get(sig, 0) + 1
 
         if t.destructive and not self.cfg.auto_approve and self.approve:
-            if not self.approve(name, args):
+            decision = self.approve(name, args)
+            if decision == "stop":
+                if self.on_result:
+                    self.on_result(name, "⛔ interrotto dall'utente", False)
+                raise StoppedByUser(name)
+            if not decision:
                 out = f"⚠️ Operazione '{name}' annullata dall'utente."
                 if self.on_result:
                     self.on_result(name, out, False)

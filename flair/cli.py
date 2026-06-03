@@ -150,7 +150,7 @@ class CLI:
 
     # ── approvazione + anteprima diff ─────────────────────────────────────────
 
-    def _approve(self, name: str, args: dict) -> bool:
+    def _approve(self, name: str, args: dict) -> bool | str:
         self._newline_if_needed()
         if name in self._always_allow:   # "always" vale per l'intero tool, per la sessione
             return True
@@ -164,14 +164,18 @@ class CLI:
 
         try:
             # Le parentesi quadre sono escape-ate: Rich le interpreterebbe come markup.
-            ans = self.console.input(r"    procedo? \[y]es / \[n]o / \[a]lways ").strip().lower()
+            ans = self.console.input(r"    procedo? \[y]es / \[n]o / \[a]lways / \[s]top ").strip().lower()
         except (EOFError, KeyboardInterrupt):
-            return False
+            self.console.print()
+            return "stop"   # Ctrl-C/EOF al prompt = ferma il flusso
+        if ans in ("s", "stop"):
+            return "stop"
         if ans in ("a", "always", "sempre"):
             self._always_allow.add(name)
             self.console.print(f"[dim]  ok: non chiederò più conferma per «{name}» in questa sessione.[/dim]")
             return True
-        return ans in ("y", "yes", "s", "si", "sì")
+        # NB: 's' è riservato a stop; per il sì in italiano si usa 'si'/'sì'.
+        return ans in ("y", "yes", "si", "sì")
 
     def _preview(self, name: str, args: dict):
         """Anteprima dell'effetto per i tool distruttivi (diff per edit/write)."""
@@ -237,11 +241,15 @@ class CLI:
             self.console.print()
         else:
             result = agent.run(task, think=think)
-            self.console.print(Panel(
-                Markdown(result.content or "(vuoto)"),
-                title=f"[bold cyan]flair · {agent_key}[/bold cyan]",
-                border_style="cyan", padding=(1, 2),
-            ))
+            if result.stopped_reason != "stopped":
+                self.console.print(Panel(
+                    Markdown(result.content or "(vuoto)"),
+                    title=f"[bold cyan]flair · {agent_key}[/bold cyan]",
+                    border_style="cyan", padding=(1, 2),
+                ))
+
+        if result.stopped_reason == "stopped":
+            self.console.print("[yellow]⏹ Flusso interrotto: hai ripreso il controllo. Dimmi come procedere.[/yellow]\n")
 
         if self.logger:
             self.logger.log_turn(agent_key, task, result, self._turn_tools)
@@ -265,7 +273,8 @@ class CLI:
                 f"| cache hit {cache_pct}% | ~${cost:.4f}")
 
     def _print_turn(self, usage: Usage, steps: int, reason: str) -> None:
-        flag = "" if reason == "done" else f" | [yellow]stop: {reason}[/yellow]"
+        labels = {"max_steps": "max step", "loop": "loop rilevato", "stopped": "interrotto"}
+        flag = f" | [yellow]{labels[reason]}[/yellow]" if reason in labels else ""
         self.console.print(f"[dim]  questo turno · step {steps} · {self._cost_line(usage)}{flag}[/dim]")
 
     def _print_session(self) -> None:

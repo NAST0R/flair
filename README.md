@@ -53,9 +53,11 @@ flair/
 **One engine, two agents.** `core/agent.py` is generic: it takes a *toolset* and a *prompt*. The two agents differ only in those — no duplicated logic.
 
 - **Coding agent** — `read_file`, `list_directory`, `glob`, `grep`, `edit_file`, `multi_edit`, `write_file`, `run_command`. **Sandboxed** to the project root (`--root`): it cannot escape it.
-- **General agent** — `open_url`, `open_path`, `open_application`, `search_files`, `list_directory`, `read_file`, `write_file`, `edit_file`, `run_command`, `system_info`, `get_datetime`, `clipboard_get/set`, `web_search`, `web_fetch`. Operates on the **whole machine** (that is its purpose: "open the browser", "find a song", "write a report to disk"). It can also **converse**: if no tool is needed, it just answers.
+- **General agent** — `open_url`, `open_path`, `open_application`, `search_files`, `list_directory`, `read_file`, `write_file`, `edit_file`, `run_command`, `run_powershell`, `system_info`, `get_datetime`, `clipboard_get/set`, `web_search`, `web_fetch`. Operates on the **whole machine** (that is its purpose: "open the browser", "find a song", "write a report to disk"). It can also **converse**: if no tool is needed, it just answers.
 
-**Safety.** Destructive tools (`edit_file`, `multi_edit`, `write_file`, `run_command`) ask for confirmation interactively, with a **diff preview**. `--yes` / `FLAIR_AUTO_APPROVE=true` disables it.
+For complex/multi-line PowerShell on Windows, the agent uses `run_powershell`: the script is written to a temporary file, executed with `-File`, and the temp file is **always removed** (success, error, or timeout) — no escaping headaches, no leftovers. Multi-line commands sent through `run_command` are routed the same way internally, instead of through cmd.exe (which breaks on embedded newlines).
+
+**Safety.** Destructive tools (`edit_file`, `multi_edit`, `write_file`, `run_command`, `run_powershell`) ask for confirmation interactively, with a **diff preview**. `--yes` / `FLAIR_AUTO_APPROVE=true` disables it.
 
 **Two providers, one interface.** DeepSeek and OpenAI both speak the OpenAI protocol; the differences (token parameter, reasoning models without `temperature`, cache fields, CoT) are isolated in two minimal subclasses. Adding a third provider = one file.
 

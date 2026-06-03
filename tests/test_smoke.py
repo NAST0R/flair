@@ -909,6 +909,119 @@ def test_cli_approve_stop_and_yes():
     check("approve: Ctrl-C = stop", cli._approve("run_command", {"command": "x"}) == "stop")
 
 
+def test_shell_multiline_routing():
+    from flair.tools import shell
+
+    # riga singola → sempre None (si usa la shell normale)
+    check("shell: riga singola non instradata", shell.powershell_script_for("echo ciao", True) is None)
+    # multi-riga ma NON Windows → None (sh gestisce il multi-riga)
+    check("shell: multi-riga non-Windows usa la shell", shell.powershell_script_for("a\nb", False) is None)
+    # multi-riga su Windows, wrapper powershell → estrae il corpo dello script
+    cmd = 'powershell -NoProfile -Command "Add-Type @\'\nusing System;\n\'@\nWrite-Host hi"'
+    body = shell.powershell_script_for(cmd, True)
+    check("shell: wrapper powershell → corpo estratto",
+          body is not None and body.startswith("Add-Type") and "powershell" not in body, repr(body))
+    # multi-riga su Windows senza wrapper → si esegue l'intero comando come script
+    bare = "Add-Type @'\nusing System;\n'@\nWrite-Host hi"
+    check("shell: multi-riga senza wrapper → script intero", shell.powershell_script_for(bare, True) == bare)
+    # pwsh -c maiuscole/minuscole e .exe
+    check("shell: pwsh -c riconosciuto",
+          shell.powershell_script_for('pwsh.exe -c "Get-Date\nGet-Host"', True) == "Get-Date\nGet-Host")
+
+
+def test_shell_decoding_robust():
+    from flair.tools import shell
+    # output con byte non-UTF8: senza errors="replace" run() alzerebbe UnicodeDecodeError
+    cmd = r'''python3 -c 'import sys; sys.stdout.buffer.write(b"\xff\xfe ok")' '''
+    proc = shell.run_shell(cmd.strip(), timeout=10)
+    check("shell: output non decodificabile non rompe",
+          proc.returncode == 0 and isinstance(proc.stdout, str) and "ok" in proc.stdout, repr(proc.stdout))
+
+
+def test_search_files_coercion():
+    from flair.tools import system as st
+    root = Path("/tmp/flair_search")
+    shutil.rmtree(root, ignore_errors=True)
+    root.mkdir(parents=True)
+    (root / "song.mp3").write_text("x")
+    (root / "note.txt").write_text("y")
+    ctx = ToolContext(cfg=cfg_for(root))
+    # extensions e locations come STRINGA (errore comune del modello) → trattati come liste
+    out = st.search_files(ctx, query="", extensions="mp3", locations=str(root))
+    check("search_files: extensions/locations stringa coerced", "song.mp3" in out and "note.txt" not in out, out)
+    # le liste regolari continuano a funzionare
+    out2 = st.search_files(ctx, query="", extensions=["txt"], locations=[str(root)])
+    check("search_files: liste regolari ok", "note.txt" in out2 and "song.mp3" not in out2, out2)
+
+
+def test_bool_coercion():
+    from flair.core.tool import ToolError
+    from flair.tools.fs import apply_edit, as_bool
+
+    check("as_bool: 'false' → False", as_bool("false") is False and as_bool("0") is False and as_bool("no") is False)
+    check("as_bool: 'true' → True", as_bool("true") is True and as_bool("1") is True and as_bool("sì") is True)
+    check("as_bool: bool/None invariati", as_bool(True) is True and as_bool(False) is False and as_bool(None) is False)
+    check("as_bool: stringa vuota → False", as_bool("") is False)
+
+    # replace_all="false" (stringa) NON deve diventare truthy: con 2 match → ambiguo → ToolError
+    raised = False
+    try:
+        apply_edit("a a a", "a", "b", "false")
+    except ToolError:
+        raised = True
+    check("bool: replace_all='false' trattato come False (match ambiguo)", raised)
+    # replace_all="true" (stringa) → sostituisce tutto
+    out, _strat = apply_edit("a a a", "a", "b", "true")
+    check("bool: replace_all='true' sostituisce tutto", out == "b b b", out)
+
+
+def test_powershell_temp_cleanup():
+    import os
+    import subprocess as _sp
+
+    from flair.tools import shell
+    real_run = shell.subprocess.run
+    cap: dict = {}
+
+    # 1) Successo: il file esiste DURANTE l'esecuzione e sparisce DOPO.
+    def fake_ok(args, **kw):
+        path = args[-1]
+        cap["path"] = path
+        cap["existed_during"] = os.path.exists(path)
+        cap["content"] = open(path, encoding="utf-8-sig").read()
+        return _sp.CompletedProcess(args, 0, stdout="ciao", stderr="")
+    shell.subprocess.run = fake_ok
+    try:
+        proc = shell.run_powershell_script("Write-Output 'x'", timeout=5)
+    finally:
+        shell.subprocess.run = real_run
+    check("ps cleanup: file presente durante l'esecuzione", cap["existed_during"] is True)
+    check("ps cleanup: script scritto nel .ps1", "Write-Output" in cap["content"])
+    check("ps cleanup: file CANCELLATO dopo (successo)", not os.path.exists(cap["path"]))
+    check("ps cleanup: output catturato", proc.stdout == "ciao")
+
+    # 2) Timeout: il file deve sparire COMUNQUE (uscita per eccezione).
+    def fake_timeout(args, **kw):
+        cap["path_to"] = args[-1]
+        cap["existed_to"] = os.path.exists(args[-1])
+        raise _sp.TimeoutExpired(args, kw.get("timeout", 0))
+    shell.subprocess.run = fake_timeout
+    raised = False
+    try:
+        shell.run_powershell_script("Start-Sleep 999", timeout=1)
+    except _sp.TimeoutExpired:
+        raised = True
+    finally:
+        shell.subprocess.run = real_run
+    check("ps cleanup: TimeoutExpired propagato", raised and cap["existed_to"] is True)
+    check("ps cleanup: file CANCELLATO anche dopo timeout", not os.path.exists(cap["path_to"]))
+
+    # 3) PowerShell assente (sandbox): il tool risponde con errore pulito, niente crash.
+    from flair.tools import system as st
+    out = st.run_powershell(ToolContext(cfg=cfg_for(Path("."))), script="Write-Output hi", timeout=5)
+    check("ps cleanup: errore pulito se PowerShell assente", out.startswith("❌"), out)
+
+
 # ── 17. schemi tool senza drift ───────────────────────────────────────────────
 
 def test_tool_schemas():
@@ -951,6 +1064,11 @@ def main():
     test_help_renders()
     test_stop_flow()
     test_cli_approve_stop_and_yes()
+    test_shell_multiline_routing()
+    test_shell_decoding_robust()
+    test_search_files_coercion()
+    test_bool_coercion()
+    test_powershell_temp_cleanup()
     test_tool_schemas()
     print(f"\nTUTTI I {len(PASS)} TEST PASSATI ✅")
 

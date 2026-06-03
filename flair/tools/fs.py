@@ -110,6 +110,18 @@ def _unique_window(text_lines: list[str], old_lines: list[str], key) -> int | No
     return None
 
 
+def as_bool(v: object) -> bool:
+    """Coerce un valore in bool, gestendo le stringhe ("true"/"false"/"1"/"0", ecc.)
+    che il modello a volte invia al posto di un booleano JSON. Senza questo,
+    replace_all="false" sarebbe *truthy* → True, invertendo silenziosamente il
+    comportamento atteso."""
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, str):
+        return v.strip().lower() in {"1", "true", "yes", "si", "sì", "y", "vero", "on"}
+    return bool(v)
+
+
 def apply_edit(text: str, old: str, new: str, replace_all: bool = False) -> tuple[str, str]:
     """Applica una sostituzione `old`→`new` con fallback tolleranti agli spazi.
 
@@ -117,6 +129,7 @@ def apply_edit(text: str, old: str, new: str, replace_all: bool = False) -> tupl
     univoco. Strategie, in ordine di preferenza: esatto, spazi esterni, fine-riga,
     indentazione.
     """
+    replace_all = as_bool(replace_all)   # il modello può inviare "true"/"false" come stringa
     if not old:
         raise ToolError("old_string vuoto: specifica il testo da sostituire.")
 

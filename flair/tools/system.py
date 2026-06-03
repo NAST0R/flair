@@ -18,13 +18,14 @@ from datetime import datetime
 from pathlib import Path
 
 from ..core.tool import ToolContext, tool
-from . import fs
+from . import fs, shell
 
 _OS = platform.system()  # 'Windows' | 'Darwin' | 'Linux'
 
 
 def _run_quiet(args: list[str], text_input: str | None = None, timeout: int = 15) -> subprocess.CompletedProcess:
-    return subprocess.run(args, capture_output=True, text=True, input=text_input, timeout=timeout)
+    return subprocess.run(args, capture_output=True, text=True, errors="replace",
+                          input=text_input, timeout=timeout)
 
 
 def _user_dirs() -> list[Path]:
@@ -148,6 +149,12 @@ def open_application(ctx: ToolContext, name: str) -> str:
     },
 )
 def search_files(ctx: ToolContext, query: str = "", extensions: list[str] | None = None, locations: list[str] | None = None) -> str:
+    # Il modello a volte passa una stringa al posto di una lista (es. extensions="mp3"):
+    # senza questo, "mp3" verrebbe iterato carattere per carattere → zero risultati silenziosi.
+    if isinstance(extensions, str):
+        extensions = [extensions]
+    if isinstance(locations, str):
+        locations = [locations]
     q = (query or "").lower()
     exts = {e.lower() if e.startswith(".") else "." + e.lower() for e in (extensions or [])}
     roots = [Path(p).expanduser() for p in locations] if locations else _user_dirs()
@@ -298,13 +305,45 @@ def edit_file(ctx: ToolContext, path: str, old_string: str, new_string: str, rep
 )
 def run_command(ctx: ToolContext, command: str, timeout: int = 60) -> str:
     try:
-        proc = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=timeout)
+        proc = shell.run_shell(command, timeout)
     except subprocess.TimeoutExpired:
         return f"❌ Comando andato in timeout dopo {timeout}s: {command}"
     except Exception as exc:  # noqa: BLE001
         return f"❌ Errore eseguendo il comando: {exc}"
     out = (proc.stdout or "") + (("\n[stderr]\n" + proc.stderr) if proc.stderr else "")
     return fs._trunc(f"$ {command}\n(exit code {proc.returncode})\n" + out.strip(),
+                     ctx.cfg.command_max_chars, hint="filtra l'output")
+
+
+# ── run_powershell (script su file temporaneo, pulizia garantita) ─────────────
+
+@tool(
+    "run_powershell",
+    ("Esegue uno script PowerShell, anche su PIÙ RIGHE (here-string, Add-Type, più "
+     "istruzioni). flair lo scrive in un file temporaneo, lo esegue e lo CANCELLA sempre "
+     "(anche in caso di errore o timeout). USA QUESTO per PowerShell complesso invece di "
+     "passarlo inline a run_command: così eviti i problemi di escaping e di a-capo."),
+    {
+        "type": "object",
+        "properties": {
+            "script": {"type": "string", "description": "Lo script PowerShell (PowerShell normale, senza escaping da shell)."},
+            "timeout": {"type": "integer", "description": "Timeout in secondi. Default 60."},
+        },
+        "required": ["script"],
+    },
+    destructive=True,
+)
+def run_powershell(ctx: ToolContext, script: str, timeout: int = 60) -> str:
+    try:
+        proc = shell.run_powershell_script(script, timeout)
+    except subprocess.TimeoutExpired:
+        return f"❌ Script PowerShell andato in timeout dopo {timeout}s."
+    except FileNotFoundError:
+        return "❌ PowerShell non trovato su questo sistema."
+    except Exception as exc:  # noqa: BLE001
+        return f"❌ Errore eseguendo lo script PowerShell: {exc}"
+    out = (proc.stdout or "") + (("\n[stderr]\n" + proc.stderr) if proc.stderr else "")
+    return fs._trunc(f"(exit code {proc.returncode})\n" + out.strip(),
                      ctx.cfg.command_max_chars, hint="filtra l'output")
 
 
@@ -432,6 +471,6 @@ def clipboard_set(ctx: ToolContext, text: str) -> str:
 
 TOOLS = [
     open_url, open_path, open_application, search_files, list_directory,
-    read_file, write_file, edit_file, run_command, system_info, get_datetime,
-    clipboard_get, clipboard_set,
+    read_file, write_file, edit_file, run_command, run_powershell, system_info,
+    get_datetime, clipboard_get, clipboard_set,
 ]

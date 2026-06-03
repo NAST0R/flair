@@ -15,7 +15,7 @@ import subprocess
 from pathlib import Path
 
 from ..core.tool import ToolContext, ToolError, tool
-from . import fs
+from . import fs, shell
 
 # ── read_file ────────────────────────────────────────────────────────────────
 
@@ -101,6 +101,7 @@ def glob(ctx: ToolContext, pattern: str, path: str = ".") -> str:
 )
 def grep(ctx: ToolContext, pattern: str, path: str = ".", glob_filter: str = "", ignore_case: bool = False) -> str:
     base = fs.resolve(ctx.cfg.root, path)
+    ignore_case = fs.as_bool(ignore_case)   # il modello può inviare "true"/"false" come stringa
     try:
         rx = re.compile(pattern, re.IGNORECASE if ignore_case else 0)
     except re.error as exc:
@@ -212,8 +213,7 @@ def write_file(ctx: ToolContext, path: str, content: str) -> str:
 )
 def run_command(ctx: ToolContext, command: str, timeout: int = 120) -> str:
     try:
-        proc = subprocess.run(command, shell=True, cwd=str(ctx.cfg.root),
-                              capture_output=True, text=True, timeout=timeout)
+        proc = shell.run_shell(command, timeout, cwd=str(ctx.cfg.root))
     except subprocess.TimeoutExpired:
         return f"❌ Comando andato in timeout dopo {timeout}s: {command}"
     except Exception as exc:  # noqa: BLE001

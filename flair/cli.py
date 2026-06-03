@@ -33,6 +33,7 @@ from .tools import fs
 _TOOL_ICON = {
     "read_file": "📄", "list_directory": "📁", "glob": "🔎", "grep": "🔎",
     "edit_file": "✏️ ", "multi_edit": "✏️ ", "write_file": "📝", "run_command": "⚙️ ",
+    "run_powershell": "⚙️ ",
     "open_url": "🌐", "open_path": "📂", "open_application": "🚀",
     "search_files": "🔦", "system_info": "🖥️ ", "get_datetime": "🕒",
     "clipboard_get": "📋", "clipboard_set": "📋", "web_search": "🌍", "web_fetch": "🌍",
@@ -159,7 +160,7 @@ class CLI:
         if preview is not None:
             self.console.print(preview)
         else:
-            target = args.get("command") or args.get("path") or args.get("name") or ""
+            target = args.get("command") or args.get("path") or args.get("name") or args.get("script") or ""
             self.console.print(f"  [yellow]⚠ conferma[/yellow] [bold]{name}[/bold] → {_short(target, 80)}")
 
         try:

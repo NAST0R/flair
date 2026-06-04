@@ -9,12 +9,13 @@ from ..tools import system as system_tools
 from ..tools import web as web_tools
 
 
-def build(cfg, provider, **callbacks) -> Agent:
+def build(cfg, provider, conversation=None, **callbacks) -> Agent:
     return Agent(
         name="general",
         cfg=cfg,
         provider=provider,
         toolset=Toolset(system_tools.TOOLS + web_tools.TOOLS),
         system_prompt=prompts.load("general"),
+        conversation=conversation,
         **callbacks,
     )

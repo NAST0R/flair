@@ -51,7 +51,9 @@ _COMPACT_PROMPT = (
     "lavoro senza aver letto l'originale. Mantieni: l'obiettivo/richiesta, i file "
     "esaminati con i contenuti e le firme rilevanti, le modifiche già applicate, le "
     "decisioni prese, gli errori incontrati, e lo stato attuale con i prossimi passi. "
-    "Sii completo sui fatti tecnici ma conciso. Non inventare nulla."
+    "Se la conversazione contiene GIÀ un riassunto precedente, incorporane tutte le "
+    "informazioni nel nuovo riassunto senza perderle. Sii completo sui fatti tecnici "
+    "ma conciso. Non inventare nulla."
 )
 
 
@@ -63,6 +65,48 @@ class AgentResult:
     stopped_reason: str = "done"   # done | max_steps | loop | stopped
 
 
+_USAGE_FIELDS = ("prompt_tokens", "completion_tokens", "total_tokens",
+                 "cache_hit_tokens", "cache_miss_tokens", "reasoning_tokens")
+
+
+@dataclass
+class Conversation:
+    """Memoria CONDIVISA dai due agenti: una sola conversazione, così passare da
+    coding a general (o viceversa) NON perde il contesto né forza l'utente a
+    ripetersi. Il system prompt NON sta qui — ogni agente antepone il proprio alla
+    chiamata, mantenendo focalizzazione e (per coding) confinamento.
+
+    Tiene anche il tracking esatto del contesto (token dell'ultima chiamata + indice
+    di quanto era già stato inviato) e l'uso cumulativo della sessione, perché sono
+    proprietà della conversazione, non del singolo agente.
+    """
+    messages: list[dict] = field(default_factory=list)
+    last_prompt_tokens: int = 0   # dimensione esatta dell'ultimo contesto inviato
+    sent_upto: int = 0            # indice di `messages` fin dove era già stato inviato
+    total_usage: Usage = field(default_factory=Usage)
+
+    def reset(self) -> None:
+        self.messages = []
+        self.last_prompt_tokens = 0
+        self.sent_upto = 0
+        self.total_usage = Usage()
+
+    def dump(self) -> dict:
+        """Stato serializzabile (JSON) della conversazione e dell'uso cumulativo."""
+        u = self.total_usage
+        return {"messages": self.messages,
+                "usage": {k: getattr(u, k) for k in _USAGE_FIELDS}}
+
+    def load(self, state: dict) -> None:
+        msgs = state.get("messages")
+        if isinstance(msgs, list):
+            self.messages = list(msgs)
+        u = state.get("usage") or {}
+        self.total_usage = Usage(**{k: int(u.get(k, 0)) for k in _USAGE_FIELDS})
+        self.last_prompt_tokens = 0
+        self.sent_upto = 0
+
+
 class Agent:
     def __init__(
         self,
@@ -71,6 +115,7 @@ class Agent:
         provider: LLMProvider,
         toolset: Toolset,
         system_prompt: str,
+        conversation: Conversation | None = None,
         on_tool: OnTool | None = None,
         on_result: OnResult | None = None,
         on_reasoning: OnReasoning | None = None,
@@ -94,38 +139,18 @@ class Agent:
         self.on_compact = on_compact
         self.approve = approve
 
-        self.messages: list[dict] = [{"role": "system", "content": system_prompt}]
-        self.total_usage = Usage()
-        self._last_prompt_tokens = 0   # dimensione esatta dell'ultimo contesto inviato
-        self._sent_upto = 1            # indice fin dove i messaggi erano già stati inviati
+        # La memoria è condivisa: chi passa la stessa Conversation ai due agenti li fa
+        # ragionare sulla stessa storia. Il system prompt è anteposto alla chiamata.
+        self.convo = conversation if conversation is not None else Conversation()
+
+    @property
+    def messages(self) -> list[dict]:
+        """La conversazione COSÌ COME viene inviata al modello: system prompt (di
+        QUESTO agente) + storia condivisa. Vista di sola lettura."""
+        return [{"role": "system", "content": self.system_prompt}, *self.convo.messages]
 
     def reset(self) -> None:
-        self.messages = [{"role": "system", "content": self.system_prompt}]
-        self.total_usage = Usage()
-        self._last_prompt_tokens = 0
-        self._sent_upto = 1
-
-    # ── stato (persistenza sessioni) ──────────────────────────────────────────
-
-    _USAGE_FIELDS = ("prompt_tokens", "completion_tokens", "total_tokens",
-                     "cache_hit_tokens", "cache_miss_tokens", "reasoning_tokens")
-
-    def dump_state(self) -> dict:
-        """Stato serializzabile (JSON) della conversazione e dell'uso cumulativo."""
-        u = self.total_usage
-        return {
-            "messages": self.messages,
-            "usage": {k: getattr(u, k) for k in self._USAGE_FIELDS},
-        }
-
-    def load_state(self, state: dict) -> None:
-        msgs = state.get("messages")
-        if isinstance(msgs, list) and msgs:
-            self.messages = msgs
-        u = state.get("usage") or {}
-        self.total_usage = Usage(**{k: int(u.get(k, 0)) for k in self._USAGE_FIELDS})
-        self._last_prompt_tokens = 0
-        self._sent_upto = 1
+        self.convo.reset()
 
     # ── compaction / contesto ───────────────────────────────────────────────
 
@@ -145,16 +170,16 @@ class Agent:
         """Risponde "interrotto" a ogni tool_call della risposta ancora senza esito.
         Ogni tool_call DEVE avere un messaggio 'tool', altrimenti la prossima chiamata
         API fallisce: così la conversazione resta valida e l'agente sa dove si è fermato."""
-        answered = {m.get("tool_call_id") for m in self.messages if m.get("role") == "tool"}
+        answered = {m.get("tool_call_id") for m in self.convo.messages if m.get("role") == "tool"}
         for tc in resp.tool_calls:
             if tc.id not in answered:
-                self.messages.append({"role": "tool", "tool_call_id": tc.id, "content": (
+                self.convo.messages.append({"role": "tool", "tool_call_id": tc.id, "content": (
                     f"⛔ Interrotto dall'utente: «{tc.name}» non è stato eseguito. "
                     "Il controllo è tornato all'utente; attendi nuove istruzioni."
                 )})
 
     def run(self, task: str, think: bool = False) -> AgentResult:
-        self.messages.append({"role": "user", "content": task})
+        self.convo.messages.append({"role": "user", "content": task})
         schemas = self.toolset.schemas()
         recent: dict[str, int] = {}
         step = 0
@@ -170,18 +195,18 @@ class Agent:
                     self.on_reasoning(resp.reasoning)
 
                 if not resp.has_tool_calls:
-                    self.messages.append({"role": "assistant", "content": resp.content})
+                    self.convo.messages.append({"role": "assistant", "content": resp.content})
                     return AgentResult(resp.content, turn_usage, step, "done")
 
                 if resp.content and self.on_text and not self._streaming():
                     self.on_text(resp.content)
 
                 step += 1
-                self.messages.append(self._assistant_msg(resp))
+                self.convo.messages.append(self._assistant_msg(resp))
                 try:
                     for tc in resp.tool_calls:
                         output, _ok = self._run_tool(tc, recent)
-                        self.messages.append({"role": "tool", "tool_call_id": tc.id, "content": output})
+                        self.convo.messages.append({"role": "tool", "tool_call_id": tc.id, "content": output})
                 except StoppedByUser:
                     self._answer_unanswered(resp)
                     return AgentResult("", turn_usage, step, "stopped")
@@ -190,7 +215,7 @@ class Agent:
                     content, delta = self._force_final()
                     return AgentResult(content, turn_usage + delta, step, "loop")
                 if any(c == 3 for c in recent.values()):
-                    self.messages.append({"role": "user", "content": (
+                    self.convo.messages.append({"role": "user", "content": (
                         "Stai ripetendo la stessa chiamata senza progredire. Fermati e "
                         "rispondi con quanto hai raccolto finora, indicando cosa non sei "
                         "riuscito a determinare."
@@ -220,10 +245,10 @@ class Agent:
                 resp = self._raw_complete(tools, think)
             else:
                 raise
-        self.total_usage = self.total_usage + resp.usage
+        self.convo.total_usage = self.convo.total_usage + resp.usage
         if resp.usage.prompt_tokens:
-            self._last_prompt_tokens = resp.usage.prompt_tokens
-        self._sent_upto = len(self.messages)
+            self.convo.last_prompt_tokens = resp.usage.prompt_tokens
+        self.convo.sent_upto = len(self.convo.messages)
         return resp
 
     def _raw_complete(self, tools, think) -> LLMResponse:
@@ -250,24 +275,25 @@ class Agent:
         return chars // 4
 
     def _ctx_estimate(self) -> int:
-        return self._last_prompt_tokens + self._estimate_tokens(self.messages[self._sent_upto:])
+        return self.convo.last_prompt_tokens + self._estimate_tokens(self.convo.messages[self.convo.sent_upto:])
 
     def _maybe_compact(self) -> None:
         if self._ctx_estimate() > self.cfg.compact_threshold:
             self._compact()
 
     def _safe_split(self, keep_recent: int) -> int:
-        """Indice da cui inizia la coda da preservare; mai su un messaggio 'tool'
-        orfano (romperebbe il pairing tool_call/tool richiesto dall'API)."""
-        split = max(1, len(self.messages) - keep_recent)
-        while split < len(self.messages) and self.messages[split]["role"] == "tool":
+        """Indice (nella storia condivisa) da cui inizia la coda da preservare; mai su
+        un messaggio 'tool' orfano (romperebbe il pairing tool_call/tool dell'API)."""
+        msgs = self.convo.messages
+        split = max(0, len(msgs) - keep_recent)
+        while split < len(msgs) and msgs[split]["role"] == "tool":
             split += 1
         return split
 
     def _compact(self, aggressive: bool = False) -> bool:
         keep = 2 if aggressive else self.cfg.compact_keep_recent
         split = self._safe_split(keep)
-        to_summarize = self.messages[1:split]
+        to_summarize = self.convo.messages[:split]
         if len(to_summarize) < 2:
             return False  # niente di sostanziale da comprimere
 
@@ -277,17 +303,18 @@ class Agent:
             log.warning("Compaction fallita (%s): mantengo il contesto invariato.", exc)
             return False
 
-        before = len(self.messages)
-        tail = self.messages[split:]
-        self.messages = (
-            [self.messages[0]]
-            + [{"role": "user", "content": "[Riassunto del lavoro svolto finora]\n\n" + summary}]
+        before = len(self.convo.messages)
+        tail = self.convo.messages[split:]
+        # Il system prompt non è nella storia (lo antepone ogni agente): qui sostituiamo
+        # solo la parte vecchia con UN messaggio di riassunto. La testa resta stabile.
+        self.convo.messages = (
+            [{"role": "user", "content": "[Riassunto del lavoro svolto finora]\n\n" + summary}]
             + tail
         )
-        self._last_prompt_tokens = 0
-        self._sent_upto = 1
+        self.convo.last_prompt_tokens = 0
+        self.convo.sent_upto = 0
         if self.on_compact:
-            self.on_compact(before, len(self.messages))
+            self.on_compact(before, len(self.convo.messages))
         return True
 
     def _summarize(self, msgs: list[dict]) -> str:
@@ -299,7 +326,7 @@ class Agent:
             think=False,
             max_tokens=self.cfg.compact_summary_max_tokens,
         )
-        self.total_usage = self.total_usage + resp.usage
+        self.convo.total_usage = self.convo.total_usage + resp.usage
         return resp.content or "(riassunto non disponibile)"
 
     @staticmethod
@@ -383,13 +410,13 @@ class Agent:
         return out, ok
 
     def _force_final(self) -> tuple[str, Usage]:
-        self.messages.append({"role": "user", "content": (
+        self.convo.messages.append({"role": "user", "content": (
             "Concludi ora: scrivi la risposta finale basandoti solo su ciò che hai "
             "effettivamente fatto/letto. Niente altre tool call."
         )})
         try:
             resp = self._complete(tools=None, think=False)
-            self.messages.append({"role": "assistant", "content": resp.content})
+            self.convo.messages.append({"role": "assistant", "content": resp.content})
             return resp.content or "(nessuna risposta prodotta)", resp.usage
         except Exception as exc:  # noqa: BLE001
             return f"Interrotto. Errore nella sintesi finale: {exc}", Usage()

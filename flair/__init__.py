@@ -6,8 +6,8 @@ router minimale.
 """
 
 from .config import Config, load_config
-from .core import Agent, AgentResult, Tool, Toolset
+from .core import Agent, AgentResult, Conversation, Tool, Toolset
 from .llm import create_provider
 
 __version__ = "3.0.0"
-__all__ = ["Config", "load_config", "create_provider", "Agent", "AgentResult", "Toolset", "Tool", "__version__"]
+__all__ = ["Config", "load_config", "create_provider", "Agent", "AgentResult", "Conversation", "Toolset", "Tool", "__version__"]

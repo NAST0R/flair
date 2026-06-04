@@ -24,6 +24,7 @@ from .agents import coding as coding_agent
 from .agents import general as general_agent
 from .config import Config, load_config
 from .core import router
+from .core.agent import Conversation
 from .core.tool import ToolError
 from .llm import Usage, create_provider
 from .session_log import SessionLogger, setup_file_logging
@@ -68,9 +69,12 @@ class CLI:
             setup_file_logging(cfg.log_dir)
             self.logger = SessionLogger(cfg.log_dir)
 
+        # Memoria CONDIVISA: i due agenti ragionano sulla stessa conversazione, così
+        # un cambio di agente (anche se il router sbaglia) non perde il contesto.
+        self.convo = Conversation()
         self.agents = {
-            "coding": coding_agent.build(cfg, self.provider, **self._callbacks()),
-            "general": general_agent.build(cfg, self.provider, **self._callbacks()),
+            "coding": coding_agent.build(cfg, self.provider, conversation=self.convo, **self._callbacks()),
+            "general": general_agent.build(cfg, self.provider, conversation=self.convo, **self._callbacks()),
         }
 
     def _callbacks(self) -> dict:
@@ -88,7 +92,7 @@ class CLI:
     def _session_state(self) -> dict:
         return {
             "last_agent": self.last_agent,
-            "agents": {k: a.dump_state() for k, a in self.agents.items()},
+            "conversation": self.convo.dump(),
         }
 
     def _save_session(self) -> None:
@@ -99,10 +103,15 @@ class CLI:
         state = self.session.load(name)
         if not state:
             return False
-        for key, agent in self.agents.items():
-            data = (state.get("agents") or {}).get(key)
-            if data:
-                agent.load_state(data)
+        convo_state = state.get("conversation")
+        if convo_state is None:
+            # Retro-compatibilità: i salvataggi vecchi tenevano una storia per agente.
+            # Recuperiamo quella più sostanziosa come conversazione condivisa.
+            agents = state.get("agents") or {}
+            best = max((a for a in agents.values()),
+                       key=lambda a: len(a.get("messages") or []), default=None)
+            convo_state = best or {}
+        self.convo.load(convo_state)
         self.last_agent = state.get("last_agent")
         self.session_name = name
         return True
@@ -291,10 +300,7 @@ class CLI:
         self._save_session()
 
     def _session_usage(self) -> Usage:
-        total = Usage()
-        for a in self.agents.values():
-            total = total + a.total_usage
-        return total
+        return self.convo.total_usage
 
     def _cost_line(self, usage: Usage) -> str:
         cost = self.provider.estimate_cost(usage, self.cfg)
@@ -412,10 +418,9 @@ class CLI:
                 self._print_tools()
                 continue
             if low == "/reset":
-                for a in self.agents.values():
-                    a.reset()
+                self.convo.reset()
                 self.last_agent = None
-                self.console.print("[yellow]conversazioni azzerate.[/yellow]\n")
+                self.console.print("[yellow]conversazione azzerata.[/yellow]\n")
                 continue
             if low == "/cost":
                 self.console.print(f"[dim]  sessione · {self._cost_line(self._session_usage())}[/dim]\n")
@@ -495,7 +500,7 @@ class CLI:
                 if len(parts) == 2:
                     self.cfg.root = Path(parts[1]).expanduser().resolve()
                     # ricostruisce il coding agent per ricaricare le istruzioni di progetto
-                    self.agents["coding"] = coding_agent.build(self.cfg, self.provider, **self._callbacks())
+                    self.agents["coding"] = coding_agent.build(self.cfg, self.provider, conversation=self.convo, **self._callbacks())
                     self.console.print(f"[yellow]root → {self.cfg.root}[/yellow]\n")
                 continue
             if low.startswith("/code"):

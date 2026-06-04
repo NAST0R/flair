@@ -23,6 +23,7 @@ from flair.agents import coding as coding_agent
 from flair.agents import general as general_agent
 from flair.config import load_config
 from flair.core import router
+from flair.core.agent import Conversation
 from flair.core.tool import ToolContext, ToolError
 from flair.llm import LLMResponse, ToolCall, Usage, is_context_overflow, parse_tool_args
 from flair.llm.base import OpenAICompatProvider
@@ -486,8 +487,8 @@ def test_compaction():
 def test_safe_split():
     cfg = cfg_for(Path("."))
     agent = general_agent.build(cfg, FakeProvider([]))
-    agent.messages = [
-        {"role": "system", "content": "s"},
+    # La storia condivisa NON contiene il system prompt (lo antepone l'agente).
+    agent.convo.messages = [
         {"role": "user", "content": "u1"},
         {"role": "assistant", "content": "", "tool_calls": [{"id": "a", "type": "function", "function": {"name": "x", "arguments": "{}"}}]},
         {"role": "tool", "tool_call_id": "a", "content": "r1"},
@@ -496,7 +497,7 @@ def test_safe_split():
     ]
     for keep in range(0, 7):
         split = agent._safe_split(keep)
-        ok = split >= len(agent.messages) or agent.messages[split]["role"] != "tool"
+        ok = split >= len(agent.convo.messages) or agent.convo.messages[split]["role"] != "tool"
         check(f"safe_split: keep={keep} non su tool", ok, f"split={split}")
 
 
@@ -513,7 +514,7 @@ def test_overflow_retry():
     ])
     agent = general_agent.build(cfg, fake)
     # conversazione pregressa così che la compaction abbia qualcosa da comprimere
-    agent.messages += [
+    agent.convo.messages += [
         {"role": "user", "content": "prima"},
         {"role": "assistant", "content": "", "tool_calls": [{"id": "x", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}]},
         {"role": "tool", "tool_call_id": "x", "content": "contenuto vecchio molto lungo " * 5},
@@ -603,24 +604,24 @@ def test_session_persistence():
     cfg.session_dir = root / "sessions"
     prov = SimpleNamespace()
     agent = coding_agent.build(cfg, prov)
-    agent.messages.append({"role": "user", "content": "ciao"})
-    agent.messages.append({"role": "assistant", "content": "ciao a te"})
-    agent.total_usage = Usage(prompt_tokens=100, completion_tokens=20, total_tokens=120,
-                              cache_hit_tokens=50, cache_miss_tokens=50, reasoning_tokens=5)
+    agent.convo.messages.append({"role": "user", "content": "ciao"})
+    agent.convo.messages.append({"role": "assistant", "content": "ciao a te"})
+    agent.convo.total_usage = Usage(prompt_tokens=100, completion_tokens=20, total_tokens=120,
+                                    cache_hit_tokens=50, cache_miss_tokens=50, reasoning_tokens=5)
 
     store = SessionStore(cfg.session_dir)
-    path = store.save("lavoro", {"last_agent": "coding", "agents": {"coding": agent.dump_state()}})
+    path = store.save("lavoro", {"last_agent": "coding", "conversation": agent.convo.dump()})
     check("sessione: salvataggio crea file", path is not None and path.exists())
     check("sessione: exists()", store.exists("lavoro"))
     check("sessione: latest()", store.latest() == "lavoro")
 
     agent2 = coding_agent.build(cfg, prov)
     state = store.load("lavoro")
-    agent2.load_state(state["agents"]["coding"])
+    agent2.convo.load(state["conversation"])
     check("sessione: messaggi ripristinati",
           [m.get("content") for m in agent2.messages[-2:]] == ["ciao", "ciao a te"])
     check("sessione: uso ripristinato",
-          agent2.total_usage.total_tokens == 120 and agent2.total_usage.cache_hit_tokens == 50)
+          agent2.convo.total_usage.total_tokens == 120 and agent2.convo.total_usage.cache_hit_tokens == 50)
     check("sessione: caricamento mancante → None", store.load("inesistente") is None)
 
 
@@ -631,7 +632,7 @@ def test_cli_session_roundtrip():
     cfg = cfg_for(root)
     cfg.session_dir = root / "sessions"
     cli = CLI(cfg)
-    cli.agents["general"].messages.append({"role": "user", "content": "ricordami"})
+    cli.convo.messages.append({"role": "user", "content": "ricordami"})
     cli.last_agent = "general"
     cli.session_name = "s1"
     cli._save_session()
@@ -639,7 +640,7 @@ def test_cli_session_roundtrip():
     cli2 = CLI(cfg)
     check("cli sessione: load ok", cli2._load_session("s1"))
     check("cli sessione: messaggio presente",
-          any(m.get("content") == "ricordami" for m in cli2.agents["general"].messages))
+          any(m.get("content") == "ricordami" for m in cli2.convo.messages))
     check("cli sessione: last_agent ripreso", cli2.last_agent == "general")
 
 
@@ -703,7 +704,7 @@ def test_runtime_switch_and_context():
 
     prov = SimpleNamespace()
     agent = coding_agent.build(cfg, prov)
-    agent.messages.append({"role": "user", "content": "x" * 4000})
+    agent.convo.messages.append({"role": "user", "content": "x" * 4000})
     tokens, frac = agent.context_fill()
     check("contesto: tokens>0", tokens > 0)
     check("contesto: frazione 0..1", 0.0 <= frac <= 1.0)
@@ -1240,6 +1241,117 @@ def test_tool_schemas():
                   "name" in fn and "description" in fn and "parameters" in fn and ts.get(fn["name"]) is not None)
 
 
+# ── Memoria condivisa tra i due agenti ────────────────────────────────────────
+
+def test_shared_memory():
+    cfg = cfg_for(Path("."))
+    convo = Conversation()
+    coding = coding_agent.build(
+        cfg, FakeProvider([LLMResponse(content="fatto", usage=Usage(total_tokens=3))]),
+        conversation=convo)
+    general = general_agent.build(
+        cfg, FakeProvider([LLMResponse(content="ok", usage=Usage(total_tokens=3))]),
+        conversation=convo)
+
+    # un turno svolto sul coding deve essere visibile al general: stessa memoria
+    coding.run("ricorda: il progetto si chiama Zeta")
+    check("memoria condivisa: stesso oggetto Conversation", general.convo is coding.convo)
+    check("memoria condivisa: general vede il turno di coding",
+          any("Zeta" in (m.get("content") or "") for m in general.convo.messages))
+
+    # ogni agente antepone il PROPRIO system prompt, ma la coda è identica
+    check("memoria condivisa: system prompt per-agente",
+          coding.messages[0]["role"] == "system"
+          and coding.messages[0]["content"] != general.messages[0]["content"])
+    check("memoria condivisa: coda identica", coding.messages[1:] == general.messages[1:])
+
+    # reset da un agente azzera la conversazione condivisa
+    general.reset()
+    check("memoria condivisa: reset comune", coding.convo.messages == [])
+
+
+# ── Router via LLM (decisione primaria) + fallback euristico ──────────────────
+
+def test_router_llm():
+    # L'LLM è il decisore: vince anche quando l'euristica direbbe altro.
+    p_cod = FakeProvider([LLMResponse(content="coding", usage=Usage(total_tokens=1))])
+    check("router LLM: sceglie coding", router.classify("apri il browser", p_cod, last_agent="general") == "coding")
+    check("router LLM: una sola chiamata economica",
+          len(p_cod.calls) == 1 and p_cod.calls[0]["max_tokens"] == 2 and p_cod.calls[0]["think"] is False)
+
+    p_gen = FakeProvider([LLMResponse(content="general", usage=Usage(total_tokens=1))])
+    check("router LLM: sceglie general", router.classify("rifattorizza main.py", p_gen) == "general")
+
+    # Risposta inattesa dell'LLM → ripiega sull'euristica (non sull'azzardo).
+    p_junk = FakeProvider([LLMResponse(content="boh", usage=Usage(total_tokens=1))])
+    check("router LLM: risposta inattesa → euristica",
+          router.classify("rifattorizza la funzione in main.py", p_junk) == "coding")
+
+    # Provider che esplode (offline) → fallback euristico, nessun crash.
+    class _Boom:
+        def complete(self, *a, **k):
+            raise RuntimeError("offline")
+    check("router LLM: errore di rete → euristica",
+          router.classify("aprimi youtube nel browser", _Boom()) == "general")
+
+
+# ── Compaction: pairing tool_call/tool sempre valido (anche su due passaggi) ──
+
+def _conversation_valid(msgs) -> bool:
+    """Approssima i vincoli dell'API: ogni messaggio 'tool' deve rispondere a una
+    tool_call dichiarata dall'assistant immediatamente precedente."""
+    open_ids: set = set()
+    for m in msgs:
+        role = m["role"]
+        if role == "assistant":
+            open_ids = {tc["id"] for tc in (m.get("tool_calls") or [])}
+        elif role == "tool":
+            if m.get("tool_call_id") not in open_ids:
+                return False
+            open_ids.discard(m["tool_call_id"])
+        else:  # system / user
+            open_ids = set()
+    return True
+
+
+def test_compaction_valid_pairing():
+    cfg = cfg_for(Path("."))
+    fake = FakeProvider([
+        LLMResponse(content="RIASSUNTO-1", usage=Usage(total_tokens=5)),
+        LLMResponse(content="RIASSUNTO-2", usage=Usage(total_tokens=5)),
+    ])
+    agent = coding_agent.build(cfg, fake)
+    agent.convo.messages = [
+        {"role": "user", "content": "task"},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "a", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "a", "content": "r1"},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "b", "type": "function", "function": {"name": "grep", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "b", "content": "r2"},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "c", "type": "function", "function": {"name": "glob", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "c", "content": "r3"},
+        {"role": "assistant", "content": "quasi finito"},
+    ]
+    # keep=2: lo split naive (indice 6) cadrebbe su un 'tool'; _safe_split lo scavalca.
+    ok = agent._compact(aggressive=True)
+    check("compaction valida: ha compattato", ok)
+    check("compaction valida: riassunto in testa",
+          agent.convo.messages[0]["content"].startswith("[Riassunto"))
+    check("compaction valida: nessun 'tool' orfano in testa", agent.convo.messages[0]["role"] != "tool")
+    check("compaction valida: conversazione API-valida (1)", _conversation_valid(agent.messages))
+
+    # Seconda compattazione di fila: deve restare valida e reinserire un riassunto.
+    agent.convo.messages += [
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "d", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "d", "content": "r4"},
+        {"role": "assistant", "content": "fine"},
+    ]
+    ok2 = agent._compact(aggressive=True)
+    check("compaction valida: seconda compattazione", ok2)
+    check("compaction valida: conversazione API-valida (2)", _conversation_valid(agent.messages))
+    check("compaction valida: riassunto presente",
+          any("[Riassunto" in (m.get("content") or "") for m in agent.convo.messages))
+
+
 def main():
     test_arg_parse()
     test_usage_normalization()
@@ -1253,10 +1365,13 @@ def main():
     test_approval_gate()
     test_compaction()
     test_safe_split()
+    test_compaction_valid_pairing()
     test_overflow_retry()
     test_web_search()
     test_session_persistence()
     test_cli_session_roundtrip()
+    test_shared_memory()
+    test_router_llm()
     test_multi_edit()
     test_web_fetch()
     test_runtime_switch_and_context()

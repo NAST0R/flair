@@ -9,7 +9,7 @@ from ..tools import coding as coding_tools
 from ..tools import web as web_tools
 
 
-def build(cfg, provider, **callbacks) -> Agent:
+def build(cfg, provider, conversation=None, **callbacks) -> Agent:
     system_prompt = prompts.load("coding") + prompts.project_instructions(cfg.root)
     return Agent(
         name="coding",
@@ -19,5 +19,6 @@ def build(cfg, provider, **callbacks) -> Agent:
         # informazioni reperibili online (doc di librerie, API, messaggi d'errore).
         toolset=Toolset(coding_tools.TOOLS + web_tools.TOOLS),
         system_prompt=system_prompt,
+        conversation=conversation,
         **callbacks,
     )

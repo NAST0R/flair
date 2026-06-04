@@ -6,6 +6,7 @@ from .. import prompts
 from ..core.agent import Agent
 from ..core.tool import Toolset
 from ..tools import coding as coding_tools
+from ..tools import web as web_tools
 
 
 def build(cfg, provider, **callbacks) -> Agent:
@@ -14,7 +15,9 @@ def build(cfg, provider, **callbacks) -> Agent:
         name="coding",
         cfg=cfg,
         provider=provider,
-        toolset=Toolset(coding_tools.TOOLS),
+        # Tool del progetto + ricerca web (sola lettura): utile quando servono
+        # informazioni reperibili online (doc di librerie, API, messaggi d'errore).
+        toolset=Toolset(coding_tools.TOOLS + web_tools.TOOLS),
         system_prompt=system_prompt,
         **callbacks,
     )

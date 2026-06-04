@@ -961,6 +961,129 @@ def test_repl_survives_turn_error():
     check("repl: Ctrl-C nel turno non propaga", not propagated_kb)
 
 
+def test_streaming_fallback_no_duplication():
+    # A1: uno stallo di rete a metà stream non deve sdoppiare l'output.
+    import httpx
+
+    cfg = cfg_for(Path("."))
+    cfg.provider = "deepseek"
+
+    def chunk(content):
+        delta = SimpleNamespace(content=content, reasoning_content=None, tool_calls=None)
+        return SimpleNamespace(choices=[SimpleNamespace(delta=delta)], usage=None)
+
+    # Caso 1: stallo PRIMA di emettere contenuto → fallback non-streaming pulito.
+    ds = DeepSeekProvider(cfg)
+
+    def gen_no_content():
+        if False:        # rende la funzione un generatore senza codice irraggiungibile
+            yield
+        raise httpx.ReadTimeout("stallo")
+
+    def create_a(**kw):
+        if kw.get("stream"):
+            return gen_no_content()
+        return _fake_response(content="risposta completa")
+    ds._client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create_a)))
+    got_a: list[str] = []
+    resp_a = ds.complete([{"role": "user", "content": "x"}], stream=True, on_delta=got_a.append)
+    check("A1: stallo pre-contenuto → fallback non-streaming", resp_a.content == "risposta completa", resp_a.content)
+    check("A1: nulla emesso a video nel caso pulito", got_a == [], got_a)
+
+    # Caso 2: stallo DOPO aver emesso testo → niente fallback, propaga (no sdoppiamento).
+    ds2 = DeepSeekProvider(cfg)
+
+    def gen_with_content():
+        yield chunk("parz")
+        raise httpx.ReadTimeout("stallo")
+
+    def create_b(**kw):
+        if kw.get("stream"):
+            return gen_with_content()
+        return _fake_response(content="NON dovrei rigenerare")
+    ds2._client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create_b)))
+    got_b: list[str] = []
+    raised = False
+    try:
+        ds2.complete([{"role": "user", "content": "x"}], stream=True, on_delta=got_b.append)
+    except httpx.ReadTimeout:
+        raised = True
+    check("A1: contenuto già emesso → propaga errore originale", raised)
+    check("A1: nessuna rigenerazione (no output sdoppiato)", "".join(got_b) == "parz", "".join(got_b))
+
+
+def test_cost_estimate_cache():
+    # A2: un prompt interamente in cache non deve essere addebitato due volte.
+    cfg = cfg_for(Path("."))
+    cfg.price_cache_hit, cfg.price_cache_miss, cfg.price_output = 1.0, 10.0, 20.0  # USD/1M
+    ds = DeepSeekProvider(cfg)
+
+    # Tutto in cache (miss riportato = 0): costo solo a prezzo hit.
+    full_hit = Usage(prompt_tokens=1_000_000, completion_tokens=0, total_tokens=1_000_000,
+                     cache_hit_tokens=1_000_000, cache_miss_tokens=0)
+    check("A2: full cache hit non raddoppia", abs(ds.estimate_cost(full_hit, cfg) - 1.0) < 1e-9,
+          ds.estimate_cost(full_hit, cfg))
+
+    # Suddivisione normale.
+    mixed = Usage(prompt_tokens=1_000_000, completion_tokens=0, total_tokens=1_000_000,
+                  cache_hit_tokens=800_000, cache_miss_tokens=200_000)
+    check("A2: hit+miss sommati correttamente", abs(ds.estimate_cost(mixed, cfg) - (0.8 + 2.0)) < 1e-9,
+          ds.estimate_cost(mixed, cfg))
+
+    # Provider che NON riporta la cache (entrambi 0): ricade su prompt_tokens a prezzo miss.
+    nocache = Usage(prompt_tokens=1_000_000, completion_tokens=0, total_tokens=1_000_000,
+                    cache_hit_tokens=0, cache_miss_tokens=0)
+    check("A2: senza dati cache → tutto a prezzo miss", abs(ds.estimate_cost(nocache, cfg) - 10.0) < 1e-9,
+          ds.estimate_cost(nocache, cfg))
+
+
+def test_run_once_exit_codes():
+    # A3: la modalità one-shot non crasha; ritorna un exit code pulito.
+    import io as _io
+
+    from rich.console import Console
+
+    from flair.cli import CLI
+    cli = CLI(cfg_for(Path(".")))
+    cli.console = Console(file=_io.StringIO())
+
+    cli.run_task = lambda *a, **k: None          # type: ignore  # successo
+    check("A3: run_once ok → 0", cli.run_once("ciao") == 0)
+
+    def _boom(*_a, **_k):
+        raise RuntimeError("timeout simulato")
+    cli.run_task = _boom                          # type: ignore
+    check("A3: run_once errore → 1", cli.run_once("ciao") == 1)
+
+    def _kb(*_a, **_k):
+        raise KeyboardInterrupt
+    cli.run_task = _kb                            # type: ignore
+    check("A3: run_once Ctrl-C → 130", cli.run_once("ciao") == 130)
+
+
+def test_tools_command():
+    # D1: /tools elenca i tool dell'agente attivo senza errori.
+    import io as _io
+
+    from rich.console import Console
+
+    from flair.cli import CLI
+    cli = CLI(cfg_for(Path(".")))
+    cli.console = Console(file=_io.StringIO())
+
+    names = [n for n, _ in cli.agents["general"].toolset.catalog()]
+    check("D1: catalog espone i nomi dei tool", "search_files" in names and "web_search" in names, names)
+    coding_names = [n for n, _ in cli.agents["coding"].toolset.catalog()]
+    check("D1: catalog coding ha codice + web, non i tool desktop",
+          "grep" in coding_names and "web_search" in coding_names and "search_files" not in coding_names,
+          coding_names)
+
+    cli.last_agent = "coding"
+    cli._print_tools()  # non deve sollevare
+    out = cli.console.file.getvalue()
+    check("D1: _print_tools mostra un tool del coding", "grep" in out, out[:200])
+
+
 def test_cli_approve_stop_and_yes():
     import io as _io
 
@@ -1146,6 +1269,10 @@ def main():
     test_keyboard_interrupt_during_model_call()
     test_keyboard_interrupt_mid_tools()
     test_repl_survives_turn_error()
+    test_streaming_fallback_no_duplication()
+    test_cost_estimate_cache()
+    test_run_once_exit_codes()
+    test_tools_command()
     test_cli_approve_stop_and_yes()
     test_shell_multiline_routing()
     test_shell_decoding_robust()

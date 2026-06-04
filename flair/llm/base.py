@@ -184,12 +184,29 @@ class LLMProvider(ABC):
         raise NotImplementedError
 
     def estimate_cost(self, usage: Usage, cfg) -> float:
-        miss = usage.cache_miss_tokens or usage.prompt_tokens
+        # Se il provider riporta la suddivisione cache (anche con miss=0 perché tutto
+        # in cache), usa il miss reale; solo quando NESSUN campo è riportato ricadi su
+        # prompt_tokens — altrimenti un prompt interamente in cache verrebbe addebitato
+        # due volte (a prezzo hit E a prezzo miss).
+        reported = usage.cache_hit_tokens or usage.cache_miss_tokens
+        miss = usage.cache_miss_tokens if reported else usage.prompt_tokens
         return (
             usage.cache_hit_tokens / 1_000_000 * cfg.price_cache_hit
             + miss / 1_000_000 * cfg.price_cache_miss
             + usage.completion_tokens / 1_000_000 * cfg.price_output
         )
+
+
+class _StreamInterrupted(Exception):
+    """Errore transitorio durante lo streaming. Porta l'informazione se del
+    contenuto era GIÀ stato emesso via on_delta: in tal caso un fallback
+    rigenererebbe la risposta da capo (output sdoppiato a video), quindi va
+    propagato l'errore originale invece di ricadere sul non-streaming."""
+
+    def __init__(self, emitted: bool, original: BaseException) -> None:
+        super().__init__(str(original))
+        self.emitted = emitted
+        self.original = original
 
 
 class OpenAICompatProvider(LLMProvider):
@@ -249,9 +266,14 @@ class OpenAICompatProvider(LLMProvider):
         if stream and on_delta is not None:
             try:
                 return self._complete_stream(params, on_delta, on_reasoning)
-            except _TRANSIENT as exc:
-                log.warning("Streaming fallito (%s) — fallback senza streaming", type(exc).__name__)
-            # i non-transitori (es. BadRequest) escono e li gestisce il chiamante
+            except _StreamInterrupted as si:
+                if si.emitted:
+                    # Contenuto già a video: un fallback rigenererebbe da capo →
+                    # output sdoppiato. Propaga l'originale (il chiamante lo segnala).
+                    raise si.original from None
+                log.warning("Streaming fallito (%s) prima di emettere contenuto — fallback senza streaming",
+                            type(si.original).__name__)
+            # i non-transitori (es. BadRequest) escono da _complete_stream non incapsulati
 
         resp = self._normalize(self._call_with_retry(params))
         # In modalità streaming caduta nel fallback: il ragionamento va comunque
@@ -282,7 +304,6 @@ class OpenAICompatProvider(LLMProvider):
     def _complete_stream(self, params: dict, on_delta: OnDelta,
                          on_reasoning: OnDelta | None = None) -> LLMResponse:
         params = {**params, "stream": True, "stream_options": {"include_usage": True}}
-        stream = self._client.chat.completions.create(**params)
 
         content: list[str] = []
         reasoning: list[str] = []
@@ -296,33 +317,39 @@ class OpenAICompatProvider(LLMProvider):
                 on_reasoning("".join(reasoning))
             reasoning_emitted = True
 
-        for chunk in stream:
-            if getattr(chunk, "usage", None):
-                usage_obj = chunk.usage
-            if not getattr(chunk, "choices", None):
-                continue
-            delta = chunk.choices[0].delta
-            rc = _reasoning_piece(delta)
-            if rc:
-                reasoning.append(rc)
-            piece = getattr(delta, "content", None)
-            if piece:
-                _flush_reasoning()  # il ragionamento (arrivato prima) va mostrato prima della risposta
-                content.append(piece)
-                on_delta(piece)
-            tcs = getattr(delta, "tool_calls", None) or []
-            if tcs:
-                _flush_reasoning()  # anche se non c'è testo, mostra il ragionamento prima dei tool
-            for tcd in tcs:
-                slot = acc.setdefault(tcd.index, {"id": None, "name": None, "args": ""})
-                if getattr(tcd, "id", None):
-                    slot["id"] = tcd.id
-                fn = getattr(tcd, "function", None)
-                if fn:
-                    if getattr(fn, "name", None):
-                        slot["name"] = fn.name
-                    if getattr(fn, "arguments", None):
-                        slot["args"] += fn.arguments
+        try:
+            stream = self._client.chat.completions.create(**params)
+            for chunk in stream:
+                if getattr(chunk, "usage", None):
+                    usage_obj = chunk.usage
+                if not getattr(chunk, "choices", None):
+                    continue
+                delta = chunk.choices[0].delta
+                rc = _reasoning_piece(delta)
+                if rc:
+                    reasoning.append(rc)
+                piece = getattr(delta, "content", None)
+                if piece:
+                    _flush_reasoning()  # il ragionamento (arrivato prima) va mostrato prima della risposta
+                    content.append(piece)
+                    on_delta(piece)
+                tcs = getattr(delta, "tool_calls", None) or []
+                if tcs:
+                    _flush_reasoning()  # anche se non c'è testo, mostra il ragionamento prima dei tool
+                for tcd in tcs:
+                    slot = acc.setdefault(tcd.index, {"id": None, "name": None, "args": ""})
+                    if getattr(tcd, "id", None):
+                        slot["id"] = tcd.id
+                    fn = getattr(tcd, "function", None)
+                    if fn:
+                        if getattr(fn, "name", None):
+                            slot["name"] = fn.name
+                        if getattr(fn, "arguments", None):
+                            slot["args"] += fn.arguments
+        except _TRANSIENT as exc:
+            # Timeout/errore di rete durante lo streaming: segnaliamo al chiamante se
+            # avevamo già emesso contenuto (→ niente fallback, sarebbe sdoppiato).
+            raise _StreamInterrupted(bool(content), exc) from exc
 
         _flush_reasoning()  # ragionamento senza testo né tool: emettilo comunque a fine stream
 

@@ -241,6 +241,22 @@ class CLI:
             self.console.print("[dim]Puoi riprovare. Se è un timeout di rete del modello, "
                                "riprova tra poco o abbassa FLAIR_TIMEOUT.[/dim]\n")
 
+    def run_once(self, task: str, agent_key: str | None = None, think: bool = False) -> int:
+        """Esegue un singolo task (modalità `-p`) e ritorna un exit code: 0 ok,
+        1 errore, 130 interruzione. Non fa crashare il processo su timeout/errori
+        di rete del modello (stessa protezione della REPL, ma con exit code per gli script)."""
+        try:
+            self.run_task(task, agent_key=agent_key, think=think)
+            return 0
+        except KeyboardInterrupt:
+            self._newline_if_needed()
+            self.console.print("[yellow]⏹ Interrotto.[/yellow]")
+            return 130
+        except Exception as exc:  # noqa: BLE001
+            self._newline_if_needed()
+            self.console.print(f"[red]⚠ Errore: {type(exc).__name__}: {exc}[/red]")
+            return 1
+
     def run_task(self, task: str, agent_key: str | None = None, think: bool = False) -> None:
         if agent_key is None:
             agent_key = router.classify(task, self.provider, self.last_agent)
@@ -324,6 +340,7 @@ class CLI:
             ("/do <task>", "forza l'agente generico"),
             ("/think <task>", "primo passo col modello thinking"),
             ("/agent", "mostra l'agente corrente (sticky)"),
+            ("/tools", "elenca i tool dell'agente attivo"),
             ("/provider [nome]", "mostra o cambia provider (deepseek|openai)"),
             ("/model <nome>", "cambia il modello veloce a runtime"),
             ("/think-model <nome>", "cambia il modello thinking a runtime"),
@@ -342,6 +359,24 @@ class CLI:
         self.console.print(
             "[dim]Flag di avvio (CLI): «flair -h». Esempi: flair --think -p \"...\", "
             "flair --session lavoro, flair --continue, flair --provider openai.[/dim]\n")
+
+    def _print_tools(self) -> None:
+        key = self.last_agent or "general"
+        table = Table(box=box.SIMPLE_HEAD, show_header=True, header_style="bold cyan",
+                      padding=(0, 3, 0, 0), border_style="dim")
+        table.add_column("tool", style="bold", no_wrap=True)
+        table.add_column("cosa fa", style="dim")
+        for name, desc in self.agents[key].toolset.catalog():
+            icon = _TOOL_ICON.get(name, "🔧")
+            line = " ".join(desc.split())                  # normalizza gli spazi
+            if len(line) > 100:
+                line = line[:99] + "…"
+            table.add_row(Text(f"{icon} {name}"), line)
+        self.console.print(table)
+        self.console.print(
+            f"[dim]Tool dell'agente «{key}»"
+            f"{' (sticky)' if self.last_agent else ' (default; nessun turno ancora)'}. "
+            "Cambia agente con /code, /do.[/dim]\n")
 
     def repl(self) -> None:
         pc = self.cfg.active
@@ -372,6 +407,9 @@ class CLI:
                 return
             if low == "/help":
                 self._print_help()
+                continue
+            if low == "/tools":
+                self._print_tools()
                 continue
             if low == "/reset":
                 for a in self.agents.values():
@@ -543,8 +581,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.prompt:
         key = None if args.agent == "auto" else args.agent
-        cli.run_task(args.prompt, agent_key=key, think=args.think)
-        return 0
+        return cli.run_once(args.prompt, agent_key=key, think=args.think)
     cli.repl()
     return 0
 

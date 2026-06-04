@@ -42,7 +42,7 @@ flair/
 │   ├── system.py        Cross-platform desktop tools (whole machine)
 │   └── web.py           Web search + page fetch (Tavily / ddgs / DuckDuckGo)
 ├── agents/
-│   ├── coding.py        Builds the coding agent (+ project instructions)
+│   ├── coding.py        Builds the coding agent (+ project instructions, web tools)
 │   └── general.py       Builds the general agent (+ web_search/web_fetch)
 ├── prompts/             System prompts (.md) + project-instructions loader
 ├── session_log.py       JSONL session log + file logging
@@ -52,7 +52,7 @@ flair/
 
 **One engine, two agents.** `core/agent.py` is generic: it takes a *toolset* and a *prompt*. The two agents differ only in those — no duplicated logic.
 
-- **Coding agent** — `read_file`, `list_directory`, `glob`, `grep`, `edit_file`, `multi_edit`, `write_file`, `run_command`. **Sandboxed** to the project root (`--root`): it cannot escape it.
+- **Coding agent** — `read_file`, `list_directory`, `glob`, `grep`, `edit_file`, `multi_edit`, `write_file`, `run_command`, plus read-only `web_search` / `web_fetch` for information that lives online (library docs, API signatures, error messages). File tools are **sandboxed** to the project root (`--root`): it cannot escape it.
 - **General agent** — `open_url`, `open_path`, `open_application`, `search_files`, `list_directory`, `read_file`, `write_file`, `edit_file`, `run_command`, `run_powershell`, `system_info`, `get_datetime`, `clipboard_get/set`, `web_search`, `web_fetch`. Operates on the **whole machine** (that is its purpose: "open the browser", "find a song", "write a report to disk"). It can also **converse**: if no tool is needed, it just answers.
 
 For complex/multi-line PowerShell on Windows, the agent uses `run_powershell`: the script is written to a temporary file, executed with `-File`, and the temp file is **always removed** (success, error, or timeout) — no escaping headaches, no leftovers. Multi-line commands sent through `run_command` are routed the same way internally, instead of through cmd.exe (which breaks on embedded newlines).
@@ -178,7 +178,7 @@ You can always invoke it as `python -m flair ...` too.
 
 **Project instructions.** If the root contains an `AGENTS.md` (or `FLAIR.md`, `CLAUDE.md`, `.flair.md`) file, its content is loaded into the coding agent's prompt: conventions, build/test commands, constraints. `/root` reloads it on the fly.
 
-**Web search & fetch (general agent).** The `web_search` tool works out of the box: the **`ddgs`** metasearch library is a bundled dependency, so key-free web search is available right after `pip install -e .` (it handles search engines' anti-bot protections — the most reliable key-free option). If `TAVILY_API_KEY` is set, Tavily is used first (most reliable overall). The tool also falls back to a best-effort DuckDuckGo scrape and the Instant Answer JSON API. Keyless engines can occasionally rate-limit automated requests; if a search returns empty, retry after a few seconds or set a Tavily key. The companion `web_fetch` tool downloads a page and returns its readable text, so the agent can actually **read** a result, not just list it. On error both return a clear message — never an exception.
+**Web search & fetch (both agents).** The `web_search` tool works out of the box: the **`ddgs`** metasearch library is a bundled dependency, so key-free web search is available right after `pip install -e .` (it handles search engines' anti-bot protections — the most reliable key-free option). If `TAVILY_API_KEY` is set, Tavily is used first (most reliable overall). The tool also falls back to a best-effort DuckDuckGo scrape and the Instant Answer JSON API. Keyless engines can occasionally rate-limit automated requests; if a search returns empty, retry after a few seconds or set a Tavily key. The companion `web_fetch` tool downloads a page and returns its readable text, so the agent can actually **read** a result, not just list it. The general agent uses these for everyday lookups; the coding agent uses them to fill gaps it cannot infer from the project's files (treating the codebase as the source of truth). On error both return a clear message — never an exception.
 
 **Session logging.** With `--log <folder>` (or `FLAIR_LOG_DIR`) every turn is written to `session-<timestamp>.jsonl` (task, response, tools used, usage) and internal events to `flair.log` — useful to analyze where tokens go.
 

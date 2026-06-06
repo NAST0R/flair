@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import difflib
+import os
 import sys
 from pathlib import Path
 
@@ -54,6 +55,10 @@ class CLI:
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
         self.console = Console()
+        # Allinea subito la directory di processo a cfg.root: la root vale così anche
+        # per l'agente general (vedi _chdir_root). Allo startup root == cwd se non è
+        # stata passata, quindi di norma è un no-op.
+        self._chdir_root()
         self.provider = create_provider(cfg)
         self.last_agent: str | None = None
         self._mid_line = False
@@ -86,6 +91,24 @@ class CLI:
             on_compact=self._on_compact,
             approve=self._approve,
         )
+
+    def _chdir_root(self) -> None:
+        """Allinea la directory di processo a cfg.root. La modalità coding usa già
+        cwd=root nei comandi; questo allineamento estende la stessa cartella di lavoro
+        anche all'agente general (che resta SENZA confinamento, ma eredita la cwd):
+        così «crea un report nella cartella attuale» è coerente con la root impostata."""
+        try:
+            os.chdir(self.cfg.root)
+        except OSError as exc:
+            self.console.print(f"[yellow]⚠ non riesco a spostarmi in {self.cfg.root}: {exc}[/yellow]")
+
+    def _apply_root(self, new_root: Path) -> None:
+        """Cambia la root a runtime (comando /root): aggiorna cfg.root, allinea la
+        directory di processo e ricostruisce il coding agent per ricaricare le
+        istruzioni di progetto, preservando la memoria condivisa."""
+        self.cfg.root = new_root
+        self._chdir_root()
+        self.agents["coding"] = coding_agent.build(self.cfg, self.provider, conversation=self.convo, **self._callbacks())
 
     # ── sessioni (persistenza) ────────────────────────────────────────────────
 
@@ -193,7 +216,10 @@ class CLI:
             if name == "write_file":
                 p = fs.resolve(self.cfg.root, args.get("path", ""))
                 old = p.read_text(encoding="utf-8", errors="replace") if p.exists() else ""
-                return self._diff_panel(name, fs.display(self.cfg.root, p), old, args.get("content", ""))
+                content = args.get("content", "")
+                # In append l'effetto è old + content: mostra solo le aggiunte.
+                new = old + content if fs.as_bool(args.get("append", False)) else content
+                return self._diff_panel(name, fs.display(self.cfg.root, p), old, new)
             if name == "edit_file":
                 p = fs.resolve(self.cfg.root, args.get("path", ""))
                 old = p.read_text(encoding="utf-8", errors="replace") if p.exists() else ""
@@ -291,6 +317,17 @@ class CLI:
 
         if result.stopped_reason == "stopped":
             self.console.print("[yellow]⏹ Flusso interrotto: hai ripreso il controllo. Dimmi come procedere.[/yellow]\n")
+        if result.truncated:
+            if (result.content or "").strip():
+                self.console.print("[yellow]⚠ Risposta troncata: raggiunto il limite di token in output. "
+                                   "Chiedi di continuare, o aumenta FLAIR_MAX_TOKENS.[/yellow]")
+            else:
+                # Tutto il budget è finito nel ragionamento, prima di produrre una risposta:
+                # "continuare" non aiuta (il ragionamento non si riporta). Indica il fix vero.
+                self.console.print("[yellow]⚠ Nessuna risposta: il budget di output (FLAIR_MAX_TOKENS) "
+                                   "si è esaurito durante il ragionamento. Con un modello 'thinking' "
+                                   "serve molto più di 8000: alza FLAIR_MAX_TOKENS, oppure usa il modello "
+                                   "veloce (senza --think) per il lavoro coi tool.[/yellow]")
 
         if self.logger:
             self.logger.log_turn(agent_key, task, result, self._turn_tools)
@@ -355,8 +392,8 @@ class CLI:
             ("/save [nome]", "salva la sessione (default: nome corrente)"),
             ("/load <nome>", "riprende una sessione salvata"),
             ("/sessions", "elenca le sessioni salvate"),
-            ("/reset", "azzera la conversazione di entrambi gli agenti"),
-            ("/root <path>", "cambia la radice di lavoro (ricarica le istruzioni)"),
+            ("/reset", "azzera la conversazione condivisa"),
+            ("/root <path>", "cambia la cartella di lavoro (coding + general; ricarica le istruzioni)"),
             ("/help", "questo aiuto"),
             ("exit | quit", "esci"),
         ):
@@ -498,10 +535,14 @@ class CLI:
             if low.startswith("/root"):
                 parts = line.split(maxsplit=1)
                 if len(parts) == 2:
-                    self.cfg.root = Path(parts[1]).expanduser().resolve()
-                    # ricostruisce il coding agent per ricaricare le istruzioni di progetto
-                    self.agents["coding"] = coding_agent.build(self.cfg, self.provider, conversation=self.convo, **self._callbacks())
-                    self.console.print(f"[yellow]root → {self.cfg.root}[/yellow]\n")
+                    new_root = Path(parts[1]).expanduser().resolve()
+                    if not new_root.is_dir():
+                        self.console.print(f"[yellow]cartella inesistente: {new_root}[/yellow]\n")
+                    else:
+                        self._apply_root(new_root)
+                        self.console.print(
+                            f"[yellow]root → {self.cfg.root} "
+                            "(cartella di lavoro per coding e general)[/yellow]\n")
                 continue
             if low.startswith("/code"):
                 task = line[len("/code"):].strip()
@@ -534,7 +575,7 @@ def _build_config(args) -> Config:
     if args.no_stream:
         cfg.stream = False
     if args.log:
-        cfg.log_dir = Path(args.log).expanduser()
+        cfg.log_dir = Path(args.log).expanduser().resolve()
     if args.model:
         cfg.active.model = args.model
         cfg.refresh_pricing()

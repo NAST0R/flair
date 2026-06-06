@@ -1,8 +1,8 @@
 """Persistenza delle sessioni: salva e riprende lo stato della conversazione.
 
-Una sessione è un file JSON `<nome>.json` nella cartella sessioni. Contiene lo
-stato di entrambi gli agenti (messaggi + uso cumulativo) e l'ultimo agente
-attivo, così da poter chiudere flair e riprendere esattamente da dove si era.
+Una sessione è un file JSON `<nome>.json` nella cartella sessioni. Contiene la
+conversazione condivisa dai due agenti (messaggi + uso cumulativo) e l'ultimo
+agente attivo, così da poter chiudere flair e riprendere da dove si era.
 
 Tutto best-effort: un errore di salvataggio viene segnalato ma non interrompe
 mai il lavoro. I segreti non vengono salvati (solo i messaggi della chat).

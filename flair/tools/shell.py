@@ -23,6 +23,8 @@ import re
 import subprocess
 import tempfile
 
+from . import fs
+
 _OS = platform.system()  # 'Windows' | 'Darwin' | 'Linux'
 _PS_EXE = "powershell" if _OS == "Windows" else "pwsh"
 
@@ -75,3 +77,26 @@ def run_shell(command: str, timeout: int, cwd: str | None = None) -> subprocess.
         return run_powershell_script(script, timeout, cwd)
     return subprocess.run(command, shell=True, capture_output=True, text=True,
                           errors="replace", timeout=timeout, cwd=cwd)
+
+
+def format_command_output(proc: subprocess.CompletedProcess, command: str | None,
+                          max_chars: int, hint: str = "") -> str:
+    """Compone l'output di un processo (stdout + eventuale stderr + exit code) e lo
+    tronca. Se ``command`` è dato, antepone la riga ``$ command``. Unico punto per
+    questa formattazione, condiviso da run_command (coding e generico) e PowerShell."""
+    out = (proc.stdout or "") + (("\n[stderr]\n" + proc.stderr) if proc.stderr else "")
+    header = (f"$ {command}\n" if command else "") + f"(exit code {proc.returncode})\n"
+    return fs._trunc(header + out.strip(), max_chars, hint=hint)
+
+
+def run_command_impl(command: str, timeout: int, cwd: str | None, max_chars: int) -> str:
+    """Esegue un comando di shell e ne restituisce l'output formattato/troncato.
+    Condivisa dai due agenti: cambia solo ``cwd`` (coding → radice del progetto;
+    generico → directory di processo)."""
+    try:
+        proc = run_shell(command, timeout, cwd=cwd)
+    except subprocess.TimeoutExpired:
+        return f"❌ Comando andato in timeout dopo {timeout}s: {command}"
+    except Exception as exc:  # noqa: BLE001
+        return f"❌ Errore eseguendo il comando: {exc}"
+    return format_command_output(proc, command, max_chars, hint="filtra o reindirizza l'output")

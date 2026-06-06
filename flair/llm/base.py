@@ -148,6 +148,7 @@ class LLMResponse:
     reasoning: str = ""          # CoT del reasoning model — NON re-inviare
     tool_calls: list[ToolCall] = field(default_factory=list)
     usage: Usage = field(default_factory=Usage)
+    finish_reason: str | None = None   # "stop" | "length" | "tool_calls" | ...
 
     @property
     def has_tool_calls(self) -> bool:
@@ -310,6 +311,7 @@ class OpenAICompatProvider(LLMProvider):
         reasoning_emitted = False
         acc: dict[int, dict] = {}
         usage_obj = None
+        finish_reason: str | None = None
 
         def _flush_reasoning() -> None:
             nonlocal reasoning_emitted
@@ -324,6 +326,8 @@ class OpenAICompatProvider(LLMProvider):
                     usage_obj = chunk.usage
                 if not getattr(chunk, "choices", None):
                     continue
+                if getattr(chunk.choices[0], "finish_reason", None):
+                    finish_reason = chunk.choices[0].finish_reason
                 delta = chunk.choices[0].delta
                 rc = _reasoning_piece(delta)
                 if rc:
@@ -358,10 +362,12 @@ class OpenAICompatProvider(LLMProvider):
             for i, s in sorted(acc.items()) if s["name"]
         ]
         return LLMResponse(content="".join(content), reasoning="".join(reasoning),
-                           tool_calls=tool_calls, usage=self._usage(usage_obj))
+                           tool_calls=tool_calls, usage=self._usage(usage_obj),
+                           finish_reason=finish_reason)
 
     def _normalize(self, resp) -> LLMResponse:
-        msg = resp.choices[0].message
+        choice = resp.choices[0]
+        msg = choice.message
         tool_calls: list[ToolCall] = []
         for tc in (msg.tool_calls or []):
             fn = getattr(tc, "function", None)
@@ -373,6 +379,7 @@ class OpenAICompatProvider(LLMProvider):
             reasoning=_reasoning_piece(msg),
             tool_calls=tool_calls,
             usage=self._usage(resp.usage),
+            finish_reason=getattr(choice, "finish_reason", None),
         )
 
     @staticmethod

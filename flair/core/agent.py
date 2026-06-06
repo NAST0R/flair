@@ -63,6 +63,7 @@ class AgentResult:
     usage: Usage = field(default_factory=Usage)
     steps: int = 0
     stopped_reason: str = "done"   # done | max_steps | loop | stopped
+    truncated: bool = False        # True se la risposta finale è stata tagliata dal limite di output
 
 
 _USAGE_FIELDS = ("prompt_tokens", "completion_tokens", "total_tokens",
@@ -195,8 +196,21 @@ class Agent:
                     self.on_reasoning(resp.reasoning)
 
                 if not resp.has_tool_calls:
-                    self.convo.messages.append({"role": "assistant", "content": resp.content})
-                    return AgentResult(resp.content, turn_usage, step, "done")
+                    truncated = resp.finish_reason == "length"
+                    has_content = bool((resp.content or "").strip())
+                    # Marcatore di continuazione SOLO se c'è del contenuto da proseguire.
+                    # Se il troncamento è avvenuto nel ragionamento (contenuto vuoto), il
+                    # marcatore non servirebbe (il reasoning non si riporta tra i turni) e
+                    # anzi, accumulandosi, confonderebbe il modello: meglio non aggiungerlo.
+                    stored = resp.content
+                    if truncated and has_content:
+                        stored = (stored or "") + (
+                            "\n\n[⚠ Output interrotto qui dal limite di lunghezza, non per scelta. "
+                            "Se l'utente chiede di continuare, RIPRENDI esattamente da questo punto, "
+                            "senza ricominciare né ripetere ciò che è già scritto sopra.]"
+                        )
+                    self.convo.messages.append({"role": "assistant", "content": stored})
+                    return AgentResult(resp.content, turn_usage, step, "done", truncated=truncated)
 
                 if resp.content and self.on_text and not self._streaming():
                     self.on_text(resp.content)
@@ -371,6 +385,23 @@ class Agent:
         name, args = tc.name, tc.arguments
         if self.on_tool:
             self.on_tool(name, args)
+
+        # Argomenti non interpretabili: parse_tool_args ripiega su {"_raw": ...} quando
+        # il JSON degli argomenti è malformato o, molto più spesso, TRONCATO perché
+        # l'output ha superato il limite di token (tipico scrivendo un file grande in
+        # una sola chiamata). Diamo al modello un messaggio azionabile, prima del gate
+        # di approvazione, così smette di ripetere la stessa chiamata destinata a fallire.
+        if "_raw" in args:
+            out = (
+                f"❌ Non sono riuscito a interpretare gli argomenti di «{name}»: probabilmente "
+                "sono stati troncati perché l'output era troppo lungo (di solito quando si "
+                "scrive un file molto grande in una sola chiamata). Riprova con un contenuto "
+                "più conciso, oppure scrivi il file in più parti: prima write_file con la "
+                "prima parte, poi le successive con write_file e append=true."
+            )
+            if self.on_result:
+                self.on_result(name, out, False)
+            return out, False
 
         t = self.toolset.get(name)
         if t is None:

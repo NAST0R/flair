@@ -234,26 +234,21 @@ def read_file(ctx: ToolContext, path: str, offset: int = 1, limit: int | None = 
     "write_file",
     ("Crea o sovrascrive un file di testo qualsiasi del computer col contenuto fornito "
      "(crea anche le cartelle mancanti). USA QUESTO per creare un file (es. un report), "
-     "non run_command: è diretto e affidabile, niente problemi di shell/escaping."),
+     "non run_command: è diretto e affidabile, niente problemi di shell/escaping. Per "
+     "file molto grandi, scrivi la prima parte e aggiungi il resto con append=true."),
     {
         "type": "object",
         "properties": {
             "path": {"type": "string", "description": "Path del file (assoluto o ~)."},
             "content": {"type": "string", "description": "Contenuto completo del file."},
+            "append": {"type": "boolean", "description": "Aggiunge in coda invece di sovrascrivere (per scrivere un file grande in più parti). Default false."},
         },
         "required": ["path", "content"],
     },
     destructive=True,
 )
-def write_file(ctx: ToolContext, path: str, content: str) -> str:
-    p = fs.resolve(None, path)
-    if p.is_dir():
-        return f"❌ È una directory: {p}"
-    existed = p.exists()
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(content, encoding="utf-8")
-    verbo = "Sovrascritto" if existed else "Creato"
-    return f"✓ {verbo} {p} ({len(content)} caratteri)."
+def write_file(ctx: ToolContext, path: str, content: str, append: bool = False) -> str:
+    return fs.write_file_impl(None, path, content, append)
 
 
 @tool(
@@ -274,18 +269,7 @@ def write_file(ctx: ToolContext, path: str, content: str) -> str:
     destructive=True,
 )
 def edit_file(ctx: ToolContext, path: str, old_string: str, new_string: str, replace_all: bool = False) -> str:
-    p = fs.resolve(None, path)
-    if not p.exists():
-        return f"❌ Il file non esiste: {p} (usa write_file per crearlo)"
-    if p.is_dir():
-        return f"❌ È una directory: {p}"
-    text = p.read_text(encoding="utf-8", errors="replace")
-    new_text, strategy = fs.apply_edit(text, old_string, new_string, replace_all)
-    if new_text == text:
-        return f"⚠️ Nessuna modifica: il risultato è identico a {p}."
-    p.write_text(new_text, encoding="utf-8")
-    note = "" if strategy == "esatto" else f" [match: {strategy}]"
-    return f"✓ Modificato {p}{note}."
+    return fs.edit_file_impl(None, path, old_string, new_string, replace_all)
 
 
 # ── run_command ──────────────────────────────────────────────────────────────
@@ -304,15 +288,7 @@ def edit_file(ctx: ToolContext, path: str, old_string: str, new_string: str, rep
     destructive=True,
 )
 def run_command(ctx: ToolContext, command: str, timeout: int = 60) -> str:
-    try:
-        proc = shell.run_shell(command, timeout)
-    except subprocess.TimeoutExpired:
-        return f"❌ Comando andato in timeout dopo {timeout}s: {command}"
-    except Exception as exc:  # noqa: BLE001
-        return f"❌ Errore eseguendo il comando: {exc}"
-    out = (proc.stdout or "") + (("\n[stderr]\n" + proc.stderr) if proc.stderr else "")
-    return fs._trunc(f"$ {command}\n(exit code {proc.returncode})\n" + out.strip(),
-                     ctx.cfg.command_max_chars, hint="filtra l'output")
+    return shell.run_command_impl(command, timeout, cwd=None, max_chars=ctx.cfg.command_max_chars)
 
 
 # ── run_powershell (script su file temporaneo, pulizia garantita) ─────────────
@@ -342,9 +318,7 @@ def run_powershell(ctx: ToolContext, script: str, timeout: int = 60) -> str:
         return "❌ PowerShell non trovato su questo sistema."
     except Exception as exc:  # noqa: BLE001
         return f"❌ Errore eseguendo lo script PowerShell: {exc}"
-    out = (proc.stdout or "") + (("\n[stderr]\n" + proc.stderr) if proc.stderr else "")
-    return fs._trunc(f"(exit code {proc.returncode})\n" + out.strip(),
-                     ctx.cfg.command_max_chars, hint="filtra l'output")
+    return shell.format_command_output(proc, None, ctx.cfg.command_max_chars, hint="filtra l'output")
 
 
 # ── system_info ──────────────────────────────────────────────────────────────

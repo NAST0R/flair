@@ -11,7 +11,6 @@ from __future__ import annotations
 import fnmatch
 import os
 import re
-import subprocess
 from pathlib import Path
 
 from ..core.tool import ToolContext, ToolError, tool
@@ -66,6 +65,8 @@ def list_directory(ctx: ToolContext, path: str = ".") -> str:
 )
 def glob(ctx: ToolContext, pattern: str, path: str = ".") -> str:
     base = fs.resolve(ctx.cfg.root, path)
+    if not base.exists():
+        return f"❌ Il path non esiste: {fs.display(ctx.cfg.root, base)}"
     matches: list[str] = []
     for root_dir, dirs, files in os.walk(base):
         dirs[:] = [d for d in dirs if d not in fs.NOISE_DIRS]
@@ -101,30 +102,40 @@ def glob(ctx: ToolContext, pattern: str, path: str = ".") -> str:
 )
 def grep(ctx: ToolContext, pattern: str, path: str = ".", glob_filter: str = "", ignore_case: bool = False) -> str:
     base = fs.resolve(ctx.cfg.root, path)
+    if not base.exists():
+        return f"❌ Il path non esiste: {fs.display(ctx.cfg.root, base)}"
     ignore_case = fs.as_bool(ignore_case)   # il modello può inviare "true"/"false" come stringa
     try:
         rx = re.compile(pattern, re.IGNORECASE if ignore_case else 0)
     except re.error as exc:
         return f"❌ Regex non valida: {exc}"
 
+    def _files():
+        # Se 'path' è già un file, cerca in QUEL file (intuitivo: "grep in questo
+        # file"); altrimenti percorri la cartella saltando le dir di rumore.
+        if base.is_file():
+            yield base
+            return
+        for root_dir, dirs, files in os.walk(base):
+            dirs[:] = [d for d in dirs if d not in fs.NOISE_DIRS]
+            for f in files:
+                if glob_filter and not fnmatch.fnmatch(f, glob_filter):
+                    continue
+                yield Path(root_dir) / f
+
     results: list[str] = []
-    for root_dir, dirs, files in os.walk(base):
-        dirs[:] = [d for d in dirs if d not in fs.NOISE_DIRS]
-        for f in files:
-            if glob_filter and not fnmatch.fnmatch(f, glob_filter):
-                continue
-            full = Path(root_dir) / f
-            if full.suffix.lower() in fs._BINARY_EXT:
-                continue
-            try:
-                with full.open(encoding="utf-8", errors="replace") as fh:
-                    for n, line in enumerate(fh, 1):
-                        if rx.search(line):
-                            results.append(f"{fs.display(ctx.cfg.root, full)}:{n}: {line.rstrip()}")
-                            if len(results) >= 400:
-                                break
-            except OSError:
-                continue
+    for full in _files():
+        if full.suffix.lower() in fs._BINARY_EXT:
+            continue
+        try:
+            with full.open(encoding="utf-8", errors="replace") as fh:
+                for n, line in enumerate(fh, 1):
+                    if rx.search(line):
+                        results.append(f"{fs.display(ctx.cfg.root, full)}:{n}: {line.rstrip()}")
+                        if len(results) >= 400:
+                            break
+        except OSError:
+            continue
         if len(results) >= 400:
             break
 
@@ -154,45 +165,29 @@ def grep(ctx: ToolContext, pattern: str, path: str = ".", glob_filter: str = "",
     destructive=True,
 )
 def edit_file(ctx: ToolContext, path: str, old_string: str, new_string: str, replace_all: bool = False) -> str:
-    p = fs.resolve(ctx.cfg.root, path)
-    if not p.exists():
-        return f"❌ Il file non esiste: {fs.display(ctx.cfg.root, p)} (usa write_file per crearlo)"
-    if p.is_dir():
-        return f"❌ È una directory: {fs.display(ctx.cfg.root, p)}"
-
-    text = p.read_text(encoding="utf-8", errors="replace")
-    # apply_edit solleva ToolError (gestita a monte come messaggio pulito) se il
-    # match non è univoco; altrimenti applica anche con tolleranza sugli spazi.
-    new_text, strategy = fs.apply_edit(text, old_string, new_string, replace_all)
-    if new_text == text:
-        return f"⚠️ Nessuna modifica: il nuovo testo è identico a quello presente in {fs.display(ctx.cfg.root, p)}."
-    p.write_text(new_text, encoding="utf-8")
-    note = "" if strategy == "esatto" else f" [match: {strategy}]"
-    return f"✓ Modificato {fs.display(ctx.cfg.root, p)}{note}."
+    return fs.edit_file_impl(ctx.cfg.root, path, old_string, new_string, replace_all)
 
 
 # ── write_file ───────────────────────────────────────────────────────────────
 
 @tool(
     "write_file",
-    "Crea o sovrascrive un intero file del progetto (crea le cartelle intermedie). Per modifiche puntuali usare edit_file.",
+    ("Crea o sovrascrive un intero file del progetto (crea le cartelle intermedie). Per "
+     "modifiche puntuali usare edit_file. Per file molto grandi, scrivi la prima parte e "
+     "poi aggiungi il resto con append=true (eviti di superare il limite di token)."),
     {
         "type": "object",
         "properties": {
             "path": {"type": "string", "description": "Path del file."},
             "content": {"type": "string", "description": "Contenuto completo del file."},
+            "append": {"type": "boolean", "description": "Aggiunge in coda invece di sovrascrivere (per scrivere un file grande in più parti). Default false."},
         },
         "required": ["path", "content"],
     },
     destructive=True,
 )
-def write_file(ctx: ToolContext, path: str, content: str) -> str:
-    p = fs.resolve(ctx.cfg.root, path)
-    existed = p.exists()
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(content, encoding="utf-8")
-    verb = "Sovrascritto" if existed else "Creato"
-    return f"✓ {verb} {fs.display(ctx.cfg.root, p)} ({len(content)} caratteri)."
+def write_file(ctx: ToolContext, path: str, content: str, append: bool = False) -> str:
+    return fs.write_file_impl(ctx.cfg.root, path, content, append)
 
 
 # ── run_command ──────────────────────────────────────────────────────────────
@@ -212,15 +207,7 @@ def write_file(ctx: ToolContext, path: str, content: str) -> str:
     destructive=True,
 )
 def run_command(ctx: ToolContext, command: str, timeout: int = 120) -> str:
-    try:
-        proc = shell.run_shell(command, timeout, cwd=str(ctx.cfg.root))
-    except subprocess.TimeoutExpired:
-        return f"❌ Comando andato in timeout dopo {timeout}s: {command}"
-    except Exception as exc:  # noqa: BLE001
-        return f"❌ Errore eseguendo il comando: {exc}"
-    out = (proc.stdout or "") + (("\n[stderr]\n" + proc.stderr) if proc.stderr else "")
-    header = f"$ {command}\n(exit code {proc.returncode})\n"
-    return fs._trunc(header + out.strip(), ctx.cfg.command_max_chars, hint="filtra o reindirizza l'output")
+    return shell.run_command_impl(command, timeout, cwd=str(ctx.cfg.root), max_chars=ctx.cfg.command_max_chars)
 
 
 @tool(

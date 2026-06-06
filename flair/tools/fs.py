@@ -238,3 +238,41 @@ def list_dir_impl(root: Path | None, path: str, max_entries: int) -> str:
     if len(entries) > len(shown):
         out += f"\n...[altre {len(entries) - len(shown)} voci]"
     return out
+
+
+def write_file_impl(root: Path | None, path: str, content: str, append: bool = False) -> str:
+    """Crea o sovrascrive un file di testo. Usata da entrambi gli agenti: cambia
+    solo il `root` (coding → confinato; generico → None, tutta la macchina).
+    Con `append=True` aggiunge in coda invece di sovrascrivere: serve a scrivere
+    file grandi in più parti, restando sotto il limite di token per chiamata."""
+    p = resolve(root, path)
+    if p.is_dir():
+        return f"❌ È una directory: {display(root, p)}"
+    existed = p.exists()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    if append and existed:
+        with p.open("a", encoding="utf-8") as fh:
+            fh.write(content)
+        return f"✓ Aggiunto in coda a {display(root, p)} ({len(content)} caratteri)."
+    p.write_text(content, encoding="utf-8")
+    verb = "Sovrascritto" if existed else "Creato"
+    return f"✓ {verb} {display(root, p)} ({len(content)} caratteri)."
+
+
+def edit_file_impl(root: Path | None, path: str, old_string: str, new_string: str,
+                   replace_all: bool = False) -> str:
+    """Sostituzione esatta (match resiliente via apply_edit). Condivisa dai due
+    agenti: cambia solo il `root`. apply_edit solleva ToolError sui match ambigui,
+    gestita a monte come messaggio pulito."""
+    p = resolve(root, path)
+    if not p.exists():
+        return f"❌ Il file non esiste: {display(root, p)} (usa write_file per crearlo)"
+    if p.is_dir():
+        return f"❌ È una directory: {display(root, p)}"
+    text = p.read_text(encoding="utf-8", errors="replace")
+    new_text, strategy = apply_edit(text, old_string, new_string, replace_all)
+    if new_text == text:
+        return f"⚠️ Nessuna modifica: il risultato è identico a {display(root, p)}."
+    p.write_text(new_text, encoding="utf-8")
+    note = "" if strategy == "esatto" else f" [match: {strategy}]"
+    return f"✓ Modificato {display(root, p)}{note}."

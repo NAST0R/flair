@@ -196,6 +196,17 @@ def test_router():
     # 'trova' da solo non deve rubare una ricerca di codice.
     check("router: 'trova' non ruba il coding",
           router.classify("trova tutti gli usi della classe Parser", None, last_agent="coding") == "coding")
+    # Costruire software (anche un progetto NUOVO o in una sottocartella) = coding,
+    # nonostante parole come 'sito'/'app' che da sole sembrerebbero generiche.
+    check("router: 'programma un sito' = coding",
+          router.classify("programmi un sito web retro nella cartella corrente, sottocartella retrosite", None) == "coding")
+    check("router: 'crea uno script' = coding",
+          router.classify("creami uno script python che ordina i file", None) == "coding")
+    check("router: \"sviluppa un'app\" = coding",
+          router.classify("sviluppa un'app per la lista della spesa", None) == "coding")
+    # Ma 'aprire'/'far partire' un sito o un'app resta general (niente falsi positivi).
+    check("router: 'apri il sito' = general", router.classify("apri il sito della BBC", None) == "general")
+    check("router: 'fai partire la app' = general", router.classify("fai partire la app di posta", None) == "general")
 
 
 # ── 5. agente CODING end-to-end ───────────────────────────────────────────────
@@ -1352,6 +1363,227 @@ def test_compaction_valid_pairing():
           any("[Riassunto" in (m.get("content") or "") for m in agent.convo.messages))
 
 
+# ── Robustezza dei tool: path mancanti, grep su file, kwarg sconosciuti ───────
+
+def test_tool_robustness():
+    import tempfile
+
+    from flair.tools import coding
+
+    root = Path(tempfile.mkdtemp(prefix="flair_toolrob_"))
+    (root / "alpha.py").write_text("def foo():\n    return 1\n\nclass Bar:\n    pass\n", encoding="utf-8")
+    (root / "sub").mkdir()
+    (root / "sub" / "beta.txt").write_text("hello foo world\n", encoding="utf-8")
+    cfg = cfg_for(root)
+    ctx = ToolContext(cfg=cfg)
+
+    # 1) Path inesistente → errore chiaro (non un "nessuna corrispondenza" fuorviante).
+    r = coding.grep(ctx, pattern="foo", path="non_esiste")
+    check("grep: path inesistente → ❌", r.startswith("❌") and "non esiste" in r, r)
+    g = coding.glob(ctx, pattern="*.py", path="non_esiste")
+    check("glob: path inesistente → ❌", g.startswith("❌"), g)
+
+    # 2) grep puntato su un FILE → cerca in quel file (prima tornava vuoto in silenzio).
+    r2 = coding.grep(ctx, pattern="class Bar", path="alpha.py")
+    check("grep: su un singolo file trova le corrispondenze",
+          "alpha.py" in r2 and "Nessuna" not in r2 and not r2.startswith("❌"), r2)
+
+    # Caso normale invariato: ricorsivo su cartella, attraversa le sottocartelle.
+    r3 = coding.grep(ctx, pattern="foo")
+    check("grep: ricorsivo su cartella (invariato)", "alpha.py" in r3 and "beta.txt" in r3, r3)
+
+    # 3) Argomento sconosciuto: il tool gira lo stesso, con nota; nessuna eccezione.
+    r4 = coding.read_file(ctx, path="alpha.py", raw=True)
+    check("dispatch: kwarg sconosciuto ignorato con nota",
+          r4.startswith("ℹ️ Argomenti ignorati") and "raw" in r4.splitlines()[0], r4.splitlines()[0])
+    r5 = coding.read_file(ctx, path="alpha.py", limit=1)
+    check("dispatch: kwarg validi → nessuna nota", not r5.startswith("ℹ️"), r5.splitlines()[0])
+
+    # Un argomento OBBLIGATORIO mancante resta un errore: i refusi seri restano visibili.
+    raised = False
+    try:
+        coding.grep(ctx, path="alpha.py")  # manca 'pattern'
+    except TypeError:
+        raised = True
+    check("dispatch: obbligatorio mancante → TypeError", raised)
+
+    # DRY: write_file condiviso → anche coding ora ha il guard sulle directory.
+    rd = coding.write_file(ctx, path="sub", content="x")
+    check("DRY: coding write_file su directory → ❌", rd.startswith("❌") and "directory" in rd, rd)
+
+    # DRY: run_command condiviso → output formattato (echo della riga + exit code).
+    from flair.tools import shell
+    rc = shell.run_command_impl("echo flairtest", 15, cwd=str(root), max_chars=8000)
+    check("DRY: run_command_impl esegue e formatta",
+          "flairtest" in rc and "exit code 0" in rc and rc.startswith("$ echo flairtest"), rc)
+
+    shutil.rmtree(root, ignore_errors=True)
+
+
+# ── /root allinea la directory di processo (vale anche per general) ───────────
+
+def test_root_chdir():
+    import os
+    import tempfile
+
+    from flair.cli import CLI
+
+    old_cwd = os.getcwd()
+    target = Path(tempfile.mkdtemp(prefix="flair_root_")).resolve()
+    try:
+        cfg = cfg_for(Path(".").resolve())
+        cfg.session_dir = target / "sessions"   # assoluta e isolata
+        cli = CLI(cfg)
+        before_convo = cli.convo
+        cli.convo.messages.append({"role": "user", "content": "memoria"})
+
+        cli._apply_root(target)
+        check("root: la CWD del processo segue la root", Path(os.getcwd()).resolve() == target, os.getcwd())
+        check("root: cfg.root aggiornata", cli.cfg.root == target)
+        check("root: coding ricostruito ma memoria condivisa preservata",
+              cli.agents["coding"].convo is before_convo
+              and any(m.get("content") == "memoria" for m in cli.agents["coding"].convo.messages))
+    finally:
+        os.chdir(old_cwd)
+        shutil.rmtree(target, ignore_errors=True)
+
+
+# ── Affidabilità invocazione tool: coercizione tipi, troncamento, append ──────
+
+def test_arg_coercion():
+    import tempfile
+
+    from flair.core.tool import _coerce
+    from flair.tools import coding
+
+    # Coercer: stringhe → tipo dichiarato, valori validi intatti, string non toccata.
+    check("coerce: int da stringa", _coerce("2", "integer") == 2 and _coerce(2, "integer") == 2)
+    check("coerce: int non-numerico resta", _coerce("abc", "integer") == "abc")
+    check("coerce: bool da stringa", _coerce("true", "boolean") is True and _coerce("false", "boolean") is False)
+    check("coerce: array da singolo", _coerce("mp3", "array") == ["mp3"])
+    check("coerce: array da JSON", _coerce('["a","b"]', "array") == ["a", "b"])
+    check("coerce: string non toccata", _coerce("x", "string") == "x")
+
+    # Al confine del tool: offset/limit/ignore_case come STRINGHE ora funzionano
+    # (prima → TypeError → ❌). File noto in cartella temporanea (CWD-indipendente).
+    root = Path(tempfile.mkdtemp(prefix="flair_coerce_")).resolve()
+    try:
+        cfg = cfg_for(root)
+        ctx = ToolContext(cfg=cfg)
+        (root / "f.txt").write_text("riga1\nriga2\nriga3\n", encoding="utf-8")
+        out = coding.read_file(ctx, path="f.txt", offset="2", limit="1")
+        check("coerce: read_file offset/limit stringa",
+              not out.startswith("❌") and "riga2" in out and "righe 2-2" in out, out.splitlines()[0])
+        (root / "code.py").write_text("def GREP_ME():\n    pass\n", encoding="utf-8")
+        g = coding.grep(ctx, pattern="grep_me", path="code.py", ignore_case="true")
+        check("coerce: grep ignore_case stringa", not g.startswith("❌") and "Nessuna" not in g, g[:60])
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_truncated_args_guidance():
+    import tempfile
+
+    root = Path(tempfile.mkdtemp(prefix="flair_raw_")).resolve()
+    try:
+        agent = general_agent.build(cfg_for(root), FakeProvider([]))
+        # parse_tool_args ripiega su {"_raw": ...} quando gli argomenti sono troncati.
+        out, ok = agent._run_tool(ToolCall(id="x", name="write_file", arguments={"_raw": '{"path":"a"'}), {})
+        check("troncamento: errore azionabile, non eseguito", ok is False and out.startswith("❌"))
+        check("troncamento: suggerisce append/parti", "append=true" in out and "troncat" in out.lower(), out)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_finish_reason_truncation_note():
+    import io as _io
+    import os as _os
+    import tempfile
+
+    from rich.console import Console
+
+    from flair.cli import CLI
+
+    root = Path(tempfile.mkdtemp(prefix="flair_fr_")).resolve()
+    cwd = _os.getcwd()
+    try:
+        # Livello agente: il troncamento è un FLAG; il contenuto resta pulito.
+        agent = general_agent.build(cfg_for(root), FakeProvider([
+            LLMResponse(content="risposta a metà", finish_reason="length", usage=Usage(total_tokens=5)),
+        ]))
+        res = agent.run("scrivimi qualcosa di lungo")
+        check("finish_reason: flag truncated", res.truncated is True)
+        check("finish_reason: contenuto NON sporcato", res.content == "risposta a metà", res.content)
+        # In cronologia (lato modello) c'è il marcatore di continuazione, così a un
+        # "continua" riprende dal punto esatto invece di ricominciare.
+        stored = agent.convo.messages[-1]["content"]
+        check("finish_reason: marcatore di continuazione in cronologia",
+              "RIPRENDI" in stored and "risposta a metà" in stored, stored[-120:])
+
+        # Livello CLI in STREAMING (il caso del bug): la nota va comunque mostrata.
+        cli = CLI(cfg_for(root))
+        cli.console = Console(file=_io.StringIO())
+        cli.cfg.stream = True
+        cli.agents["general"] = general_agent.build(cli.cfg, FakeProvider([
+            LLMResponse(content="risposta a metà", finish_reason="length", usage=Usage(total_tokens=5)),
+        ]))
+        saved_stdout = sys.stdout
+        sys.stdout = _io.StringIO()   # in streaming i delta vanno su stdout: zittiscili
+        try:
+            cli.run_task("dimmi tutto", agent_key="general")
+        finally:
+            sys.stdout = saved_stdout
+        out = cli.console.file.getvalue()
+        check("finish_reason: la CLI mostra la nota anche in streaming", "troncata" in out, out[-160:])
+
+        # Caso ragionamento-a-vuoto: troncato MA contenuto vuoto (tutto il budget nel
+        # reasoning). Niente marcatore "RIPRENDI" (inutile e si accumulerebbe), e la CLI
+        # dà la guida giusta (alza FLAIR_MAX_TOKENS / niente --think), non "continua".
+        agent2 = general_agent.build(cfg_for(root), FakeProvider([
+            LLMResponse(content="", finish_reason="length", usage=Usage(total_tokens=5, reasoning_tokens=5)),
+        ]))
+        res2 = agent2.run("ragiona tantissimo")
+        check("finish_reason: ragionamento-a-vuoto è truncated", res2.truncated is True)
+        check("finish_reason: nessun marcatore su contenuto vuoto",
+              "RIPRENDI" not in (agent2.convo.messages[-1]["content"] or ""))
+        cli2 = CLI(cfg_for(root))
+        cli2.console = Console(file=_io.StringIO())
+        cli2.cfg.stream = False
+        cli2.agents["general"] = general_agent.build(cli2.cfg, FakeProvider([
+            LLMResponse(content="", finish_reason="length", usage=Usage(total_tokens=5, reasoning_tokens=5)),
+        ]))
+        cli2.run_task("ragiona tantissimo", agent_key="general")
+        out2 = cli2.console.file.getvalue()
+        check("finish_reason: guida diversa per ragionamento-a-vuoto",
+              "FLAIR_MAX_TOKENS" in out2 and "Nessuna risposta" in out2, out2[-200:])
+    finally:
+        try:
+            _os.chdir(cwd)
+        except OSError:
+            pass
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_write_file_append():
+    import tempfile
+
+    from flair.tools import coding
+
+    root = Path(tempfile.mkdtemp(prefix="flair_append_")).resolve()
+    try:
+        cfg = cfg_for(root)
+        ctx = ToolContext(cfg=cfg)
+        coding.write_file(ctx, path="big.txt", content="parte1\n")
+        out = coding.write_file(ctx, path="big.txt", content="parte2\n", append="true")  # stringa → bool
+        check("append: messaggio 'aggiunto in coda'", "Aggiunto in coda" in out, out)
+        check("append: contenuto concatenato", (root / "big.txt").read_text() == "parte1\nparte2\n")
+        # append su file inesistente = crea
+        out2 = coding.write_file(ctx, path="nuovo.txt", content="x\n", append=True)
+        check("append: su file nuovo crea", (root / "nuovo.txt").read_text() == "x\n" and "Creato" in out2)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def main():
     test_arg_parse()
     test_usage_normalization()
@@ -1395,6 +1627,12 @@ def main():
     test_bool_coercion()
     test_powershell_temp_cleanup()
     test_tool_schemas()
+    test_tool_robustness()
+    test_root_chdir()
+    test_arg_coercion()
+    test_truncated_args_guidance()
+    test_finish_reason_truncation_note()
+    test_write_file_append()
     print(f"\nTUTTI I {len(PASS)} TEST PASSATI ✅")
 
 

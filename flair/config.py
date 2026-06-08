@@ -122,6 +122,7 @@ class Config:
     read_file_max_chars: int = 12000
     grep_max_chars: int = 6000
     command_max_chars: int = 8000
+    repomap_max_chars: int = 8000
     list_dir_max_entries: int = 200
     search_max_results: int = 80
     search_max_scanned: int = 200_000
@@ -210,6 +211,7 @@ def load_config() -> Config:
         read_file_max_chars=_int("FLAIR_READ_MAX", 12000),
         grep_max_chars=_int("FLAIR_GREP_MAX", 6000),
         command_max_chars=_int("FLAIR_CMD_MAX", 8000),
+        repomap_max_chars=_int("FLAIR_REPOMAP_MAX", 8000),
         list_dir_max_entries=_int("FLAIR_LISTDIR_MAX", 200),
         search_max_results=_int("FLAIR_SEARCH_MAX", 80),
         search_max_scanned=_int("FLAIR_SEARCH_SCAN_MAX", 200_000),

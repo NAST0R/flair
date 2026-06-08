@@ -52,7 +52,7 @@ flair/
 
 **One engine, two agents.** `core/agent.py` is generic: it takes a *toolset* and a *prompt*. The two agents differ only in those — no duplicated logic.
 
-- **Coding agent** — `read_file`, `list_directory`, `glob`, `grep`, `edit_file`, `multi_edit`, `write_file`, `run_command`, plus read-only `web_search` / `web_fetch` for information that lives online (library docs, API signatures, error messages). File tools are **sandboxed** to the project root (`--root`): it cannot escape it.
+- **Coding agent** — `read_file`, `list_directory`, `glob`, `grep`, `repo_map`, `edit_file`, `multi_edit`, `write_file`, `run_command`, plus read-only `web_search` / `web_fetch` for information that lives online (library docs, API signatures, error messages). File tools are **sandboxed** to the project root (`--root`): it cannot escape it.
 - **General agent** — `open_url`, `open_path`, `open_application`, `search_files`, `list_directory`, `read_file`, `write_file`, `edit_file`, `run_command`, `run_powershell`, `system_info`, `get_datetime`, `clipboard_get/set`, `web_search`, `web_fetch`. Operates on the **whole machine** (that is its purpose: "open the browser", "find a song", "write a report to disk"). It can also **converse**: if no tool is needed, it just answers.
 
 For complex/multi-line PowerShell on Windows, the agent uses `run_powershell`: the script is written to a temporary file, executed with `-File`, and the temp file is **always removed** (success, error, or timeout) — no escaping headaches, no leftovers. Multi-line commands sent through `run_command` are routed the same way internally, instead of through cmd.exe (which breaks on embedded newlines).
@@ -169,6 +169,8 @@ You can always invoke it as `python -m flair ...` too.
 **Runtime switching.** Change provider or model mid-conversation without restarting: `/provider openai`, `/model <name>`, `/think-model <name>`. Histories are preserved; pricing re-aligns automatically.
 
 **Context indicator + manual compaction.** After each turn the status line shows how full the active agent's context is (e.g. `contesto · coding: 23% (28k/120k)`). `/compact` summarizes older messages on demand to reclaim space (it also happens automatically near the threshold).
+
+**Codebase map.** `repo_map` returns a compact outline of the project — for every source file, its top-level definitions (functions, classes and signatures) — in a single call. The model uses it to orient itself cheaply instead of issuing many `list_directory`/`grep`/`read_file` calls, which both **lowers token usage** on real repositories and improves navigation. It is always generated fresh from the current files (never stale), confined to the project root, and size-capped. Python is parsed with `ast` (accurate); around twenty other languages — JS/TS, Go, Rust, Java, C#, C/C++, Ruby, PHP, Swift, Kotlin, Scala, shell, Lua, Dart, Elixir, and more — are covered with per-language patterns, so it works on virtually any codebase.
 
 **Resilient `edit_file` / `multi_edit`.** Matching `old_string` is not purely literal: it cascades through *exact → outer whitespace ignored → line-ending tolerant → indentation tolerant* (re-indenting the new block to the correct level automatically). If the match is not unique it returns a clear error inviting a re-read of the file, instead of failing opaquely. When it uses a fallback it says so (`[match: indentation tolerant]`). `multi_edit` applies several edits to one file in a single, **atomic** call (if any edit fails, the file is left untouched) — fewer round-trips and tokens.
 

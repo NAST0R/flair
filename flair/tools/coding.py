@@ -14,7 +14,7 @@ import re
 from pathlib import Path
 
 from ..core.tool import ToolContext, ToolError, tool
-from . import fs, shell
+from . import fs, repomap, shell
 
 # ── read_file ────────────────────────────────────────────────────────────────
 
@@ -268,4 +268,25 @@ def multi_edit(ctx: ToolContext, path: str, edits: list) -> str:
     return f"✓ Applicate {len(edits)} modifiche a {fs.display(ctx.cfg.root, p)}{suffix}."
 
 
-TOOLS = [read_file, list_directory, glob, grep, edit_file, multi_edit, write_file, run_command]
+@tool(
+    "repo_map",
+    ("Mappa compatta del progetto: per ogni file sorgente le definizioni di primo "
+     "livello (funzioni, classi e relative firme). Usalo PRIMA di esplorare in "
+     "profondità, per orientarti a basso costo invece di tante chiamate list/grep/read. "
+     "È una panoramica: poi leggi col read_file i file che ti servono. Copre Python "
+     "(preciso, via AST), JS/TS, Go, Rust, Java, C#, C/C++ e molti altri linguaggi."),
+    {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "description": "Sottocartella da mappare (default: tutta la radice del progetto)."},
+        },
+    },
+)
+def repo_map(ctx: ToolContext, path: str = ".") -> str:
+    base = fs.resolve(ctx.cfg.root, path)
+    if not base.exists():
+        return f"❌ Il path non esiste: {fs.display(ctx.cfg.root, base)}"
+    return repomap.build_repo_map(ctx.cfg.root, path, ctx.cfg.repomap_max_chars)
+
+
+TOOLS = [read_file, list_directory, glob, grep, repo_map, edit_file, multi_edit, write_file, run_command]

@@ -1568,7 +1568,6 @@ def test_write_file_append():
     import tempfile
 
     from flair.tools import coding
-
     root = Path(tempfile.mkdtemp(prefix="flair_append_")).resolve()
     try:
         cfg = cfg_for(root)
@@ -1582,6 +1581,113 @@ def test_write_file_append():
         check("append: su file nuovo crea", (root / "nuovo.txt").read_text() == "x\n" and "Creato" in out2)
     finally:
         shutil.rmtree(root, ignore_errors=True)
+
+
+def test_repo_map():
+    import tempfile
+
+    from flair.tools import coding
+
+    root = Path(tempfile.mkdtemp(prefix="flair_map_")).resolve()
+    try:
+        (root / "app.py").write_text(
+            "import os\n\nGLOBAL = 1\n\ndef alpha(a, b=2):\n    return a\n\n"
+            "class Beta:\n    def m1(self): pass\n    def m2(self, x): pass\n",
+            encoding="utf-8")
+        sub = root / "web"
+        sub.mkdir()
+        (sub / "ui.js").write_text(
+            "export function render(state) {}\nclass Widget {}\nconst helper = (x) => x;\n",
+            encoding="utf-8")
+        (root / "README.md").write_text("# titolo\nsolo testo\n", encoding="utf-8")  # niente simboli
+        nm = root / "node_modules" / "dep"
+        nm.mkdir(parents=True)
+        (nm / "lib.js").write_text("function shouldBeSkipped(){}\n", encoding="utf-8")
+
+        cfg = cfg_for(root)
+        ctx = ToolContext(cfg=cfg)
+        out = coding.repo_map(ctx, path=".")
+        check("repo_map: funzione py con args", "def alpha(a, b=…)" in out, out)
+        check("repo_map: classe py coi metodi", "class Beta: m1, m2" in out, out)
+        check("repo_map: funzione js", "function render(state)" in out, out)
+        check("repo_map: classe js + arrow const", "class Widget" in out and "const helper(x)" in out, out)
+        check("repo_map: node_modules saltato", "shouldBeSkipped" not in out and "node_modules" not in out)
+        check("repo_map: file senza simboli escluso", "README.md" not in out)
+        # path inesistente → errore pulito
+        check("repo_map: path inesistente → errore", coding.repo_map(ctx, path="non_esiste").startswith("❌"))
+        # cap rispettato
+        cfg.repomap_max_chars = 50
+        check("repo_map: output limitato dal cap", len(coding.repo_map(ctx, path=".")) < 400)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_repo_map_languages():
+    from flair.tools import repomap
+
+    # Matrice (estensione → sorgente realistico, simboli attesi). Guarda contro
+    # regressioni la copertura multi-linguaggio dell'estrazione (non il filesystem).
+    cases = {
+        ".ts": ("export class Foo {}\nexport function bar(a, b) {}\nexport const baz = (x) => x;\n"
+                "interface Iface {}\ntype Alias = number;\nenum Color { Red }",
+                ["class Foo", "function bar(", "const baz(", "interface Iface", "type Alias", "enum Color"]),
+        ".go": ("package main\nfunc Hello(name string) string { return name }\n"
+                "func (s *Server) Start(p int) {}\ntype Server struct {}",
+                ["func Hello(", "func Start(", "type Server"]),
+        ".rs": ("pub fn add(a: i32) -> i32 { a }\nasync fn run() {}\nstruct Point { x: i32 }\n"
+                "enum Dir { N }\ntrait Draw {}\nimpl Point {\n    fn new() -> Self {}\n}",
+                ["fn add(", "fn run(", "struct Point", "enum Dir", "trait Draw", "fn new("]),
+        ".java": ("public class Main {\n  public static void main(String[] args) {}\n"
+                  "  private int helper(int x) { return x; }\n}\ninterface Svc {}",
+                  ["class Main", "main(", "helper(", "interface Svc"]),
+        ".cs": ("namespace App {\n  public class Worker {\n    public void Run(int n) {}\n  }\n"
+                "  public interface IFoo {}\n}",
+                ["namespace App", "class Worker", "Run(", "interface IFoo"]),
+        ".c": ("int add(int a, int b) { return a+b; }\nstatic void helper(void) {}\n"
+               "int main(void) {\n  if (x) {}\n  for (;;) {}\n}\nstruct Point { int x; };",
+               ["add(", "helper(", "main(", "struct Point"]),
+        ".cpp": ("class Widget {\npublic:\n  void draw();\n};\nvoid Widget::draw() {}\n"
+                 "int compute(int n) { return n; }",
+                 ["class Widget", "compute("]),
+        ".rb": ("class Dog\n  def bark(loud)\n  end\n  def self.make\n  end\nend\nmodule Pets\nend",
+                ["class Dog", "def bark", "def self.make", "module Pets"]),
+        ".php": ("<?php\nclass User {\n  public function getName() {}\n}\ninterface Repo {}\n"
+                 "function freestanding($a) {}",
+                 ["class User", "function getName(", "interface Repo", "function freestanding("]),
+        ".swift": ("class VM {\n  func load(id: Int) {}\n}\nstruct Pt {}\nenum E {}\nprotocol P {}\nfunc global() {}",
+                   ["class VM", "func load(", "struct Pt", "enum E", "protocol P", "func global("]),
+        ".kt": ("class Repo {\n  fun fetch(id: Int): String { return \"\" }\n}\nobject Singleton {}\n"
+                "interface Api {}\nfun topLevel(x: Int) {}",
+                ["class Repo", "fun fetch(", "object Singleton", "interface Api", "fun topLevel("]),
+        ".scala": ("class Service {\n  def run(n: Int): Unit = {}\n}\nobject App {}\ntrait Base {}",
+                   ["class Service", "def run", "object App", "trait Base"]),
+        ".sh": ("#!/bin/bash\nfunction deploy {\n  echo hi\n}\nbuild() {\n  echo build\n}",
+                ["function deploy", "build"]),
+        ".lua": ("function M.greet(name)\nend\nlocal function helper(x)\nend",
+                 ["function M.greet(", "function helper("]),
+        ".dart": ("class Widget {\n  void build() {}\n}\nmixin Logger {}\nenum Status { ok }",
+                  ["class Widget", "mixin Logger", "enum Status"]),
+        ".ex": ("defmodule MyApp do\n  def hello(name) do\n  end\n  defp secret() do\n  end\nend",
+                ["defmodule MyApp", "def hello", "defp secret"]),
+        ".pl": ("package Foo;\nsub greet {\n  my $x = shift;\n}", ["package Foo", "sub greet"]),
+        ".r": ("add <- function(a, b) {\n  a + b\n}\nmul = function(x) x", ["add(", "mul("]),
+        ".jl": ("function area(r)\n  pi*r^2\nend\nstruct Point end\nsquare(x) = x*x",
+                ["function area", "struct Point", "square("]),
+        ".zig": ("pub fn main() void {}\nconst Point = struct { x: i32 };", ["fn main(", "const Point"]),
+        ".nim": ("proc greet(name: string) =\n  echo name\ntype Animal = object", ["proc greet(", "Animal"]),
+        ".clj": ("(defn add [a b] (+ a b))\n(def x 1)\n(defmacro unless [t b] )",
+                 ["defn add", "def x", "defmacro unless"]),
+        ".hs": ("module Main where\nadd :: Int -> Int -> Int\nadd a b = a + b\ndata Tree = Leaf",
+                ["add", "data Tree"]),
+        ".sql": ("CREATE TABLE users (id INT);\ncreate view v as select 1;", ["TABLE users", "view v"]),
+    }
+    for ext, (src, expected) in cases.items():
+        joined = " | ".join(repomap._symbols_for(Path("t" + ext), src))
+        missing = [e for e in expected if e not in joined]
+        check(f"repo_map lang {ext}: simboli estratti", not missing, f"mancanti {missing} in: {joined[:120]}")
+    # I commenti/usi a metà riga non devono generare falsi positivi di rilievo.
+    noise = " | ".join(repomap._symbols_for(Path("t.c"), "    result = compute(x);\n    return foo(y);\n"))
+    check("repo_map: niente falsi positivi da chiamate", "compute(" not in noise and "foo(" not in noise, noise)
 
 
 def main():
@@ -1633,6 +1739,8 @@ def main():
     test_truncated_args_guidance()
     test_finish_reason_truncation_note()
     test_write_file_append()
+    test_repo_map()
+    test_repo_map_languages()
     print(f"\nTUTTI I {len(PASS)} TEST PASSATI ✅")
 
 

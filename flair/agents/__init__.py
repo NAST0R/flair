@@ -1,3 +1,3 @@
-from . import coding, general
+from . import coding, explorer, general
 
-__all__ = ["coding", "general"]
+__all__ = ["coding", "explorer", "general"]

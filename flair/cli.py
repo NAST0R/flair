@@ -34,6 +34,7 @@ from .tools import fs
 
 _TOOL_ICON = {
     "read_file": "📄", "list_directory": "📁", "glob": "🔎", "grep": "🔎",
+    "repo_map": "🗺️ ", "explore": "🔭",
     "edit_file": "✏️ ", "multi_edit": "✏️ ", "write_file": "📝", "run_command": "⚙️ ",
     "run_powershell": "⚙️ ",
     "open_url": "🌐", "open_path": "📂", "open_application": "🚀",
@@ -294,7 +295,7 @@ class CLI:
 
     def run_task(self, task: str, agent_key: str | None = None, think: bool = False) -> None:
         if agent_key is None:
-            agent_key = router.classify(task, self.provider, self.last_agent)
+            agent_key = router.classify(task, self.provider, self.last_agent, convo=self.convo)
         self.last_agent = agent_key
         agent = self.agents[agent_key]
         self._turn_tools = []

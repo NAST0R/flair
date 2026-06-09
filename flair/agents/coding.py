@@ -6,6 +6,7 @@ from .. import prompts
 from ..core.agent import Agent
 from ..core.tool import Toolset
 from ..tools import coding as coding_tools
+from ..tools import subagent as subagent_tools
 from ..tools import web as web_tools
 
 
@@ -15,9 +16,10 @@ def build(cfg, provider, conversation=None, **callbacks) -> Agent:
         name="coding",
         cfg=cfg,
         provider=provider,
-        # Tool del progetto + ricerca web (sola lettura): utile quando servono
-        # informazioni reperibili online (doc di librerie, API, messaggi d'errore).
-        toolset=Toolset(coding_tools.TOOLS + web_tools.TOOLS),
+        # Tool del progetto + ricerca web (sola lettura) + delega di ricerca a un
+        # sub-agente in sola lettura (`explore`), per indagini onerose senza gonfiare
+        # il contesto principale.
+        toolset=Toolset(coding_tools.TOOLS + web_tools.TOOLS + [subagent_tools.explore]),
         system_prompt=system_prompt,
         conversation=conversation,
         **callbacks,

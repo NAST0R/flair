@@ -130,7 +130,6 @@ class Agent:
         self.provider = provider
         self.toolset = toolset
         self.system_prompt = system_prompt
-        self.ctx = ToolContext(cfg=cfg)
 
         self.on_tool = on_tool
         self.on_result = on_result
@@ -143,6 +142,13 @@ class Agent:
         # La memoria è condivisa: chi passa la stessa Conversation ai due agenti li fa
         # ragionare sulla stessa storia. Il system prompt è anteposto alla chiamata.
         self.convo = conversation if conversation is not None else Conversation()
+
+        # Stato condiviso passato ai tool. Il provider serve ai tool che delegano a
+        # un sub-agente (es. `explore`) per costruirlo; `delegated_usage` è il canale
+        # con cui il tool riporta l'usage del sub-agente, che l'agente somma a turno
+        # e sessione.
+        self.ctx = ToolContext(cfg=cfg, provider=provider)
+        self.ctx.delegated_usage = Usage()
 
     @property
     def messages(self) -> list[dict]:
@@ -179,16 +185,17 @@ class Agent:
                     "Il controllo è tornato all'utente; attendi nuove istruzioni."
                 )})
 
-    def run(self, task: str, think: bool = False) -> AgentResult:
+    def run(self, task: str, think: bool = False, max_steps: int | None = None) -> AgentResult:
         self.convo.messages.append({"role": "user", "content": task})
         schemas = self.toolset.schemas()
         recent: dict[str, int] = {}
         step = 0
+        step_limit = max_steps if max_steps is not None else self.cfg.max_steps
         turn_usage = Usage()
         resp: LLMResponse | None = None
 
         try:
-            while step < self.cfg.max_steps:
+            while step < step_limit:
                 resp = self._complete(tools=schemas, think=think and step == 0)
                 turn_usage = turn_usage + resp.usage
 
@@ -223,7 +230,8 @@ class Agent:
                         self.convo.messages.append({"role": "tool", "tool_call_id": tc.id, "content": output})
                 except StoppedByUser:
                     self._answer_unanswered(resp)
-                    return AgentResult("", turn_usage, step, "stopped")
+                    return AgentResult("", self._fold_delegated(turn_usage), step, "stopped")
+                turn_usage = self._fold_delegated(turn_usage)
 
                 if any(c >= 4 for c in recent.values()):
                     content, delta = self._force_final()
@@ -239,10 +247,23 @@ class Agent:
             # conversazione rispondendo agli eventuali tool_call ancora pendenti.
             if resp is not None and resp.has_tool_calls:
                 self._answer_unanswered(resp)
-            return AgentResult("", turn_usage, step, "stopped")
+            return AgentResult("", self._fold_delegated(turn_usage), step, "stopped")
 
         content, delta = self._force_final()
         return AgentResult(content, turn_usage + delta, step, "max_steps")
+
+    def _fold_delegated(self, turn_usage: Usage) -> Usage:
+        """Somma UNA volta (turno + sessione) l'usage riportato dai tool che delegano
+        a un sub-agente (ctx.delegated_usage), poi lo azzera. Va chiamata su OGNI
+        uscita dal batch di tool — normale, stop dell'utente, Ctrl-C — perché i token
+        delegati sono costo reale e non devono perdersi né finire attribuiti al turno
+        sbagliato. A zero (nessuna delega) è un no-op."""
+        d = self.ctx.delegated_usage
+        if d is None:
+            return turn_usage
+        self.convo.total_usage = self.convo.total_usage + d
+        self.ctx.delegated_usage = Usage()
+        return turn_usage + d
 
     # ── chiamata al modello (con compaction e gestione overflow) ──────────────
 

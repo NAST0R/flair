@@ -110,6 +110,7 @@ class Config:
 
     # Loop agentico
     max_steps: int = 60
+    explorer_max_steps: int = 20
 
     # Gestione del contesto (compaction)
     context_window: int = 120_000
@@ -203,6 +204,7 @@ def load_config() -> Config:
         request_timeout=_int("FLAIR_TIMEOUT", 300),
         stream=_bool("FLAIR_STREAM", True),
         max_steps=_int("FLAIR_MAX_STEPS", 60),
+        explorer_max_steps=_int("FLAIR_EXPLORER_MAX_STEPS", 20),
         context_window=_int("FLAIR_CONTEXT_WINDOW", 120_000),
         compact_threshold_ratio=_float("FLAIR_COMPACT_RATIO", 0.75),
         compact_keep_recent=_int("FLAIR_COMPACT_KEEP", 8),

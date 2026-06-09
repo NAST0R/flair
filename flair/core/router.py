@@ -91,9 +91,11 @@ def _classify_heuristic(text: str, last_agent: str | None) -> str:
     return "general"
 
 
-def classify(text: str, provider, last_agent: str | None = None) -> str:
+def classify(text: str, provider, last_agent: str | None = None, convo=None) -> str:
     """Decide l'agente con una singola chiamata LLM economica; ripiega sull'euristica
-    in caso di errore o risposta inattesa."""
+    in caso di errore o risposta inattesa. Se è data una Conversation (`convo`),
+    l'usage della chiamata viene sommato al totale di sessione: è piccolo (prompt
+    corto e in cache, 2 token di output) ma è costo reale e va contato."""
     hint = ""
     if last_agent in ("coding", "general"):
         hint = f"\n\n(Modalità attuale: {last_agent}. Mantienila se la richiesta è coerente.)"
@@ -105,6 +107,8 @@ def classify(text: str, provider, last_agent: str | None = None) -> str:
             think=False,
             max_tokens=2,
         )
+        if convo is not None:
+            convo.total_usage = convo.total_usage + resp.usage
         ans = (resp.content or "").strip().lower()
         if "cod" in ans:
             return "coding"

@@ -1690,6 +1690,141 @@ def test_repo_map_languages():
     check("repo_map: niente falsi positivi da chiamate", "compute(" not in noise and "foo(" not in noise, noise)
 
 
+def test_explore_subagent():
+    from flair.agents import explorer
+    from flair.core.agent import Conversation
+    from flair.tools import subagent
+
+    cfg = cfg_for(Path("."))
+
+    # 1) Il sub-agente esploratore è di SOLA LETTURA e non ricorsivo.
+    exp = explorer.build(cfg, FakeProvider([]), conversation=Conversation())
+    names = {s["function"]["name"] for s in exp.toolset.schemas()}
+    check("explore: sub-agente di sola lettura (niente edit/scrittura/comandi)",
+          {"edit_file", "write_file", "multi_edit", "run_command", "run_powershell"}.isdisjoint(names), str(names))
+    check("explore: niente ricorsione (explore non nel toolset del sub-agente)", "explore" not in names)
+    check("explore: ha i tool di lettura", {"read_file", "grep", "repo_map", "glob", "list_directory"} <= names, str(names))
+
+    # 2) Meccanica: il tool costruisce un sub-agente con conversazione ISOLATA, ne
+    #    restituisce la sintesi e RIPORTA i suoi token via ctx.delegated_usage.
+    prov = FakeProvider([LLMResponse(content="X è in foo.py:10",
+                                     usage=Usage(prompt_tokens=100, completion_tokens=20, total_tokens=120))])
+    ctx = ToolContext(cfg=cfg, provider=prov)
+    out = subagent.explore(ctx, task="dove è definito X?")
+    check("explore: restituisce la sintesi del sub-agente", "X è in foo.py:10" in out, out)
+    check("explore: footer del sub-agente", "🔭 esplorato" in out, out)
+    check("explore: usage del sub-agente riportato (delegated_usage)",
+          ctx.delegated_usage is not None and ctx.delegated_usage.total_tokens == 120, str(ctx.delegated_usage))
+    check("explore: il sub-agente è stato eseguito (1 chiamata)", len(prov.calls) == 1, str(prov.calls))
+
+    # 3) Senza provider nel contesto → errore pulito, niente eccezioni.
+    no_prov = ToolContext(cfg=cfg, provider=None)
+    check("explore: errore pulito senza provider", subagent.explore(no_prov, task="x").startswith("❌"))
+
+
+def test_explore_usage_accounting():
+    """End-to-end: i token del sub-agente confluiscono SIA nel turno SIA nella
+    sessione, una sola volta, e le sue letture NON entrano nel contesto del genitore."""
+    from flair.core.agent import Conversation
+
+    cfg = cfg_for(Path("."))
+    convo = Conversation()
+
+    def U(t, h, m):
+        return Usage(prompt_tokens=t, total_tokens=t, cache_hit_tokens=h, cache_miss_tokens=m)
+
+    # Stesso provider per genitore e sub-agente (come nel reale). Ordine delle chiamate:
+    # genitore→explore, sub→list_directory, sub→sintesi, genitore→risposta finale.
+    prov = FakeProvider([
+        LLMResponse(tool_calls=[tc("explore", task="dove è X?")], usage=U(100, 80, 20)),
+        LLMResponse(tool_calls=[tc("list_directory", path=".")], usage=U(300, 250, 50)),
+        LLMResponse(content="X è in foo.py:10", usage=U(900, 850, 50)),
+        LLMResponse(content="Trovato: foo.py:10", usage=U(260, 230, 30)),
+    ])
+    agent = coding_agent.build(cfg, prov, conversation=convo)
+    result = agent.run("trova X")
+
+    check("explore accounting: il turno include i token del sub-agente",
+          result.usage.total_tokens == 100 + 300 + 900 + 260, str(result.usage))
+    check("explore accounting: sessione = turno (un solo turno)",
+          convo.total_usage.total_tokens == result.usage.total_tokens, str(convo.total_usage))
+    check("explore accounting: cache-hit sommati correttamente",
+          result.usage.cache_hit_tokens == 80 + 250 + 850 + 230, str(result.usage))
+    check("explore accounting: cache-miss sommati correttamente",
+          result.usage.cache_miss_tokens == 20 + 50 + 50 + 30, str(result.usage))
+    check("explore accounting: niente doppio conteggio (delegated_usage azzerato)",
+          agent.ctx.delegated_usage.total_tokens == 0, str(agent.ctx.delegated_usage))
+    joined = " ".join((m.get("content") or "") for m in convo.messages)
+    check("explore accounting: le letture del sub-agente NON sono nel contesto del genitore",
+          "list_directory" not in joined, joined[:160])
+
+
+def test_evals_harness():
+    import importlib.util
+
+    tasks_path = Path(__file__).resolve().parent / "evals" / "tasks.py"
+    check("evals: tasks.py presente", tasks_path.exists())
+    spec = importlib.util.spec_from_file_location("_eval_tasks_probe", tasks_path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["_eval_tasks_probe"] = mod  # le @dataclass risolvono il modulo da sys.modules
+    spec.loader.exec_module(mod)
+    check("evals: almeno un task definito", len(mod.TASKS) >= 1)
+    names = set()
+    for t in mod.TASKS:
+        check(f"evals: task '{t.name}' ben formato",
+              callable(t.setup) and callable(t.check) and bool(t.prompt) and t.agent in ("coding", "general"))
+        names.add(t.name)
+    check("evals: nomi dei task univoci", len(names) == len(mod.TASKS))
+
+
+def test_explore_usage_on_stop():
+    """Regressione: se l'utente ferma il flusso DOPO un explore nello stesso batch,
+    i token delegati non devono perdersi (fold su ogni uscita, anche 'stopped')."""
+    from flair.core.agent import Conversation
+
+    cfg = cfg_for(Path("."))
+    cfg.auto_approve = False   # serve il gate di approvazione per simulare lo stop
+
+    def U(t):
+        return Usage(prompt_tokens=t, total_tokens=t)
+
+    # Batch: explore (gira, delega 900 token) poi write_file (l'utente risponde "stop").
+    prov = FakeProvider([
+        LLMResponse(tool_calls=[tc("explore", task="dove è X?"),
+                                tc("write_file", path="x.txt", content="x")], usage=U(100)),
+        LLMResponse(content="X è in foo.py:10", usage=U(900)),   # risposta del sub-agente
+    ])
+    convo = Conversation()
+    agent = coding_agent.build(cfg, prov, conversation=convo,
+                               approve=lambda name, args: "stop")
+    result = agent.run("trova X e scrivilo in x.txt")
+
+    check("fold su stop: turno interrotto", result.stopped_reason == "stopped", result.stopped_reason)
+    check("fold su stop: il turno include i token delegati",
+          result.usage.total_tokens == 100 + 900, str(result.usage))
+    check("fold su stop: sessione allineata al turno",
+          convo.total_usage.total_tokens == result.usage.total_tokens, str(convo.total_usage))
+    check("fold su stop: delegated_usage azzerato (niente doppi conteggi dopo)",
+          agent.ctx.delegated_usage.total_tokens == 0, str(agent.ctx.delegated_usage))
+
+
+def test_router_usage_accounting():
+    """La chiamata del router è costo reale: con una Conversation va sommata al totale."""
+    from flair.core import router
+    from flair.core.agent import Conversation
+
+    convo = Conversation()
+    prov = FakeProvider([LLMResponse(content="coding", usage=Usage(prompt_tokens=160, total_tokens=162))])
+    key = router.classify("sistemami questo bug nel modulo auth", prov, None, convo=convo)
+    check("router accounting: classificazione corretta", key == "coding", key)
+    check("router accounting: usage sommato alla sessione",
+          convo.total_usage.total_tokens == 162, str(convo.total_usage))
+    # Senza convo: comportamento invariato (nessun errore, nessun accounting).
+    prov2 = FakeProvider([LLMResponse(content="general", usage=Usage(total_tokens=5))])
+    check("router accounting: senza convo funziona come prima",
+          router.classify("che ore sono?", prov2, None) == "general")
+
+
 def main():
     test_arg_parse()
     test_usage_normalization()
@@ -1741,6 +1876,11 @@ def main():
     test_write_file_append()
     test_repo_map()
     test_repo_map_languages()
+    test_explore_subagent()
+    test_explore_usage_accounting()
+    test_explore_usage_on_stop()
+    test_router_usage_accounting()
+    test_evals_harness()
     print(f"\nTUTTI I {len(PASS)} TEST PASSATI ✅")
 
 

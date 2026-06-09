@@ -11,6 +11,7 @@ Efficienza:
 - Leggi in modo mirato. Per i file grandi usa `offset`/`limit` invece di rileggere tutto.
 - Per CREARE un file molto grande, non scriverlo tutto in una sola `write_file` (rischi di superare il limite di output e troncare la chiamata): scrivi la prima parte, poi aggiungi il resto con `write_file` e `append=true`.
 - Non ripetere chiamate identiche: se un tool ha già dato un risultato, riusalo dal contesto.
+- Per un'indagine onerosa che richiederebbe molte letture (es. "dove e come è implementato X in tutta la base di codice?"), valuta `explore`: un sub-agente in sola lettura indaga in un contesto separato e ti restituisce solo la sintesi, senza riempire il tuo contesto. Per leggere o modificare un file che già conosci, vai diretto con `read_file`/`edit_file`.
 - Procedi a piccoli passi concreti; quando hai abbastanza informazioni, fermati e rispondi.
 
 Stile:

@@ -1,7 +1,12 @@
 """Router per scegliere l'agente (modalità) di un turno.
 
 Strategia:
-1. L'LLM decide direttamente, con UNA sola chiamata economica (modello non-thinking,
+0. Le continuazioni nude ("procedi", "ok", "vai", "go ahead"…) restano
+   deterministicamente sull'agente corrente, SENZA chiamata LLM: non contengono
+   alcun segnale di routing, e farle decidere a un modello può mandarle — a metà
+   task — sull'agente sbagliato (sandbox, prompt e tool diversi) invalidando
+   anche il prefisso in cache. In più si risparmiano la chiamata e la latenza.
+1. Per il resto l'LLM decide direttamente, con UNA sola chiamata economica (modello non-thinking,
    output di pochi token). È il decisore primario perché più robusto di regole fisse:
    capisce quando una richiesta ha bisogno di accesso GLOBALE (→ general) anche se
    parla di file, evitando di incastrare l'utente nella modalità coding (confinata).
@@ -76,6 +81,38 @@ _ROUTER_PROMPT = (
 )
 
 
+# Continuazioni/conferme "nude": messaggi composti SOLO da queste parole (e corti)
+# non portano alcun segnale di routing → si resta sull'agente corrente, senza LLM.
+# La regola è prudente per costruzione: basta UNA parola fuori lessico ("vai su
+# google", "procedi col refactor di auth") e si torna al routing normale; e nel
+# peggiore dei casi l'effetto è solo mantenere la modalità corrente, che l'utente
+# può sempre forzare con /code o //do.
+_CONTINUATION_WORDS = {
+    # italiano
+    "ok", "okay", "va", "bene", "sì", "si", "certo", "certamente", "perfetto",
+    "ottimo", "esatto", "giusto", "d'accordo", "daccordo", "procedi", "procediamo",
+    "prosegui", "proseguiamo", "continua", "continuiamo", "vai", "andiamo", "avanti",
+    "dai", "fallo", "falla", "esegui", "eseguilo", "eseguila", "riprendi", "riprova",
+    "ritenta", "ancora", "pure", "così", "cosi", "confermo", "confermato", "grazie",
+    "prego", "favore", "per", "me",
+    # inglese
+    "yes", "yep", "yeah", "sure", "go", "on", "ahead", "proceed", "continue", "do",
+    "it", "keep", "going", "carry", "next", "more", "again", "resume", "please", "for",
+}
+
+_WORD_RX = re.compile(r"[a-zà-ÿ']+")
+
+
+def _is_bare_continuation(text: str) -> bool:
+    """True se il messaggio è SOLO una continuazione/conferma (corto e composto
+    interamente da parole del lessico): nessun contenuto da instradare."""
+    t = text.strip().lower()
+    if not t or len(t) > 40:
+        return False
+    words = _WORD_RX.findall(t)
+    return bool(words) and all(w in _CONTINUATION_WORDS for w in words)
+
+
 def _classify_heuristic(text: str, last_agent: str | None) -> str:
     """Fallback senza rete: parole chiave + continuità di sessione, default general."""
     if _BUILD_RX.search(text):       # "programma/costruisci un sito/app/script…" = coding
@@ -92,10 +129,15 @@ def _classify_heuristic(text: str, last_agent: str | None) -> str:
 
 
 def classify(text: str, provider, last_agent: str | None = None, convo=None) -> str:
-    """Decide l'agente con una singola chiamata LLM economica; ripiega sull'euristica
-    in caso di errore o risposta inattesa. Se è data una Conversation (`convo`),
-    l'usage della chiamata viene sommato al totale di sessione: è piccolo (prompt
-    corto e in cache, 2 token di output) ma è costo reale e va contato."""
+    """Decide l'agente del turno. Le continuazioni nude ("procedi", "ok", "vai"…)
+    restano deterministicamente sull'agente corrente, senza chiamata LLM (vedi
+    docstring del modulo). Per il resto decide l'LLM con una singola chiamata
+    economica; in caso di errore o risposta inattesa si ripiega sull'euristica.
+    Se è data una Conversation (`convo`), l'usage della chiamata viene sommato al
+    totale di sessione: è piccolo (prompt corto e in cache, 2 token di output) ma
+    è costo reale e va contato."""
+    if last_agent in ("coding", "general") and _is_bare_continuation(text):
+        return last_agent
     hint = ""
     if last_agent in ("coding", "general"):
         hint = f"\n\n(Modalità attuale: {last_agent}. Mantienila se la richiesta è coerente.)"

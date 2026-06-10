@@ -117,6 +117,7 @@ class Config:
     compact_threshold_ratio: float = 0.75   # compatta oltre questa frazione della finestra
     compact_keep_recent: int = 8            # messaggi recenti tenuti integri
     compact_summary_max_tokens: int = 2000
+    compact_prune: bool = True              # stadio 0: pota gli output di tool superati prima del riassunto
 
     # Filesystem / tool
     root: Path = Path(".")
@@ -209,6 +210,7 @@ def load_config() -> Config:
         compact_threshold_ratio=_float("FLAIR_COMPACT_RATIO", 0.75),
         compact_keep_recent=_int("FLAIR_COMPACT_KEEP", 8),
         compact_summary_max_tokens=_int("FLAIR_COMPACT_SUMMARY_MAX", 2000),
+        compact_prune=_bool("FLAIR_COMPACT_PRUNE", True),
         root=Path(os.getenv("FLAIR_ROOT", ".")).expanduser().resolve(),
         read_file_max_chars=_int("FLAIR_READ_MAX", 12000),
         grep_max_chars=_int("FLAIR_GREP_MAX", 6000),

@@ -28,6 +28,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from ..llm import LLMProvider, LLMResponse, ToolCall, Usage, is_context_overflow
+from . import prune
 from .tool import ToolContext, ToolError, Toolset
 
 log = logging.getLogger(__name__)
@@ -38,6 +39,7 @@ OnReasoning = Callable[[str], None]
 OnText = Callable[[str], None]
 OnDelta = Callable[[str], None]
 OnCompact = Callable[[int, int], None]
+OnPrune = Callable[[int], None]
 Approve = Callable[[str, dict], bool | str]  # True = procedi, False = nega, "stop" = ferma il flusso
 
 
@@ -50,7 +52,8 @@ _COMPACT_PROMPT = (
     "seguente in modo autosufficiente, così che l'assistente possa proseguire il "
     "lavoro senza aver letto l'originale. Mantieni: l'obiettivo/richiesta, i file "
     "esaminati con i contenuti e le firme rilevanti, le modifiche già applicate, le "
-    "decisioni prese, gli errori incontrati, e lo stato attuale con i prossimi passi. "
+    "decisioni prese, gli errori incontrati, l'eventuale piano/TODO con lo stato di "
+    "ogni passo, e lo stato attuale con i prossimi passi. "
     "Se la conversazione contiene GIÀ un riassunto precedente, incorporane tutte le "
     "informazioni nel nuovo riassunto senza perderle. Sii completo sui fatti tecnici "
     "ma conciso. Non inventare nulla."
@@ -123,6 +126,7 @@ class Agent:
         on_text: OnText | None = None,
         on_delta: OnDelta | None = None,
         on_compact: OnCompact | None = None,
+        on_prune: OnPrune | None = None,
         approve: Approve | None = None,
     ) -> None:
         self.name = name
@@ -137,6 +141,7 @@ class Agent:
         self.on_text = on_text
         self.on_delta = on_delta
         self.on_compact = on_compact
+        self.on_prune = on_prune
         self.approve = approve
 
         # La memoria è condivisa: chi passa la stessa Conversation ai due agenti li fa
@@ -162,8 +167,10 @@ class Agent:
     # ── compaction / contesto ───────────────────────────────────────────────
 
     def compact(self) -> bool:
-        """Compatta su richiesta esplicita (REPL /compact)."""
-        return self._compact()
+        """Compatta su richiesta esplicita (REPL /compact): prima la potatura
+        deterministica (gratis), poi il riassunto LLM."""
+        pruned = self._prune_superseded()
+        return self._compact() or pruned > 0
 
     def context_fill(self) -> tuple[int, float]:
         """(token dell'ultimo contesto inviato, frazione della finestra) per la UI."""
@@ -275,9 +282,16 @@ class Agent:
         try:
             resp = self._raw_complete(tools, think)
         except Exception as exc:  # noqa: BLE001
-            if is_context_overflow(exc) and self._compact(aggressive=True):
-                log.warning("Overflow di contesto: compattato e ritento.")
-                resp = self._raw_complete(tools, think)
+            if is_context_overflow(exc):
+                # Prima la potatura (gratis), poi il riassunto aggressivo: in overflow
+                # ogni carattere conta e la potatura riduce anche l'input del riassunto.
+                shrunk = self._prune_superseded() > 0
+                shrunk = self._compact(aggressive=True) or shrunk
+                if shrunk:
+                    log.warning("Overflow di contesto: compattato e ritento.")
+                    resp = self._raw_complete(tools, think)
+                else:
+                    raise
             else:
                 raise
         self.convo.total_usage = self.convo.total_usage + resp.usage
@@ -313,8 +327,29 @@ class Agent:
         return self.convo.last_prompt_tokens + self._estimate_tokens(self.convo.messages[self.convo.sent_upto:])
 
     def _maybe_compact(self) -> None:
-        if self._ctx_estimate() > self.cfg.compact_threshold:
-            self._compact()
+        if self._ctx_estimate() <= self.cfg.compact_threshold:
+            return
+        # Stadio 0: potatura deterministica degli output superati — gratis (nessuna
+        # chiamata LLM) e senza perdita di fedeltà sul resto. Se basta a rientrare
+        # sotto soglia, il riassunto (che sostituirebbe il dettaglio) non serve.
+        if self._prune_superseded() and self._ctx_estimate() <= self.cfg.compact_threshold:
+            return
+        self._compact()
+
+    def _prune_superseded(self) -> int:
+        """Stub-ba gli output di tool provabilmente superati (vedi core/prune.py).
+        La prima mutazione spezza il prefisso in cache da quel punto: azzeriamo i
+        contatori così la stima del contesto riparte onesta (come per la compaction,
+        che il prefisso lo spezzerebbe comunque)."""
+        if not getattr(self.cfg, "compact_prune", True):
+            return 0
+        pruned = prune.prune_superseded(self.convo.messages)
+        if pruned:
+            self.convo.last_prompt_tokens = 0
+            self.convo.sent_upto = 0
+            if self.on_prune:
+                self.on_prune(pruned)
+        return pruned
 
     def _safe_split(self, keep_recent: int) -> int:
         """Indice (nella storia condivisa) da cui inizia la coda da preservare; mai su

@@ -1825,6 +1825,193 @@ def test_router_usage_accounting():
           router.classify("che ore sono?", prov2, None) == "general")
 
 
+def test_plan_tool():
+    from flair.tools import plan as plan_mod
+
+    cfg = cfg_for(Path("."))
+    ctx = ToolContext(cfg=cfg)
+
+    out = plan_mod.plan(ctx, steps=[
+        {"title": "leggere il modulo", "status": "fatto"},
+        {"title": "scrivere il fix", "status": "in_progress"},   # sinonimo inglese
+        "eseguire i test",                                        # stringa semplice
+    ])
+    check("plan: intestazione con conteggio", out.startswith("📋 Piano (1/3 fatti)"), out)
+    check("plan: simboli di stato", "✔ leggere il modulo" in out and "▸ scrivere il fix (in corso)" in out
+          and "○ eseguire i test" in out, out)
+
+    # Tolleranza: l'intera lista arriva come JSON string → la coercizione la ripara.
+    via_call = plan_mod.plan(ctx, **{"steps": '[{"title": "a"}, {"title": "b", "status": "done"}]'})
+    check("plan: steps come JSON string (coercizione array)", via_call.startswith("📋 Piano (1/2 fatti)"), via_call)
+
+    check("plan: vuoto → errore pulito", plan_mod.plan(ctx, steps=[]).startswith("❌"))
+    check("plan: voci senza titolo → errore pulito", plan_mod.plan(ctx, steps=[{"status": "fatto"}]).startswith("❌"))
+    over = plan_mod.plan(ctx, steps=[f"passo {i}" for i in range(40)])
+    check("plan: tetto sui passi", "oltre il limite" in over and over.count("○") == 30, over)
+
+    # Cablaggio: plan nel coding agent, NON in explorer/general.
+    from flair.agents import coding as ca
+    from flair.agents import explorer as ea
+    from flair.agents import general as ga
+    names = lambda a: {s["function"]["name"] for s in a.toolset.schemas()}  # noqa: E731
+    check("plan: nel coding agent", "plan" in names(ca.build(cfg, FakeProvider([]))))
+    check("plan: NON nell'explorer", "plan" not in names(ea.build(cfg, FakeProvider([]))))
+    check("plan: NON nel general", "plan" not in names(ga.build(cfg, FakeProvider([]))))
+
+
+def _tool_msg(call_id: str, content: str) -> dict:
+    return {"role": "tool", "tool_call_id": call_id, "content": content}
+
+
+def _asst_msg(*tool_calls: ToolCall) -> dict:
+    import json as _json
+    return {"role": "assistant", "content": "", "tool_calls": [
+        {"id": t.id, "type": "function",
+         "function": {"name": t.name, "arguments": _json.dumps(t.arguments, ensure_ascii=False)}}
+        for t in tool_calls
+    ]}
+
+
+def test_prune_superseded_rules():
+    from flair.core import prune
+
+    big = "x" * 1000
+
+    # Regola 1: duplicati — pota la più vecchia, conserva l'ultima.
+    a, b = tc("grep", pattern="foo", path="."), tc("grep", pattern="foo", path=".")
+    msgs = [_asst_msg(a), _tool_msg(a.id, big), _asst_msg(b), _tool_msg(b.id, big + "fresh")]
+    n = prune.prune_superseded(msgs)
+    check("prune dup: una potata", n == 1, n)
+    check("prune dup: la vecchia è stub", msgs[1]["content"] == prune.STUB)
+    check("prune dup: la recente intatta", msgs[3]["content"].endswith("fresh"))
+    check("prune dup: pairing intatto", msgs[1]["tool_call_id"] == a.id and len(msgs) == 4)
+
+    # Regola 2: read superata da write_file (overwrite sì, append no).
+    r1, w1 = tc("read_file", path="src/a.py"), tc("write_file", path="./src\\a.py", content="nuovo")
+    r2, w2 = tc("read_file", path="b.py"), tc("write_file", path="b.py", content="+", append=True)
+    msgs = [_asst_msg(r1), _tool_msg(r1.id, big), _asst_msg(w1), _tool_msg(w1.id, "✓ Sovrascritto"),
+            _asst_msg(r2), _tool_msg(r2.id, big), _asst_msg(w2), _tool_msg(w2.id, "✓ Aggiunto")]
+    n = prune.prune_superseded(msgs)
+    check("prune write: solo la read sovrascritta (path normalizzato)", n == 1 and msgs[1]["content"] == prune.STUB, n)
+    check("prune write: append NON invalida", msgs[5]["content"] == big)
+
+    # Regola 3: read parziale coperta da read INTERA successiva (stesso path).
+    p1 = tc("read_file", path="m.py", offset=10, limit=40)
+    p2 = tc("read_file", path="m.py")
+    other = tc("read_file", path="altro.py", offset=1, limit=5)
+    msgs = [_asst_msg(p1), _tool_msg(p1.id, big), _asst_msg(other), _tool_msg(other.id, big),
+            _asst_msg(p2), _tool_msg(p2.id, big)]
+    n = prune.prune_superseded(msgs)
+    check("prune full-read: parziale coperta potata, altro path intatto",
+          n == 1 and msgs[1]["content"] == prune.STUB and msgs[3]["content"] == big, n)
+
+    # Garanzie: output piccoli e tool di scrittura mai potati; idempotente.
+    s1, s2 = tc("read_file", path="s.py"), tc("read_file", path="s.py")
+    msgs = [_asst_msg(s1), _tool_msg(s1.id, "corto"), _asst_msg(s2), _tool_msg(s2.id, "corto2")]
+    check("prune: output piccoli ignorati", prune.prune_superseded(msgs) == 0)
+    e1, e2 = tc("edit_file", path="c.py", old_string="a", new_string="b"), tc("read_file", path="c.py")
+    msgs = [_asst_msg(e2), _tool_msg(e2.id, big), _asst_msg(e1), _tool_msg(e1.id, "✓ Modificato")]
+    check("prune: edit_file NON invalida le letture", prune.prune_superseded(msgs) == 0)
+    a2, b2 = tc("grep", pattern="q", path="."), tc("grep", pattern="q", path=".")
+    msgs = [_asst_msg(a2), _tool_msg(a2.id, big), _asst_msg(b2), _tool_msg(b2.id, big)]
+    check("prune: idempotente", prune.prune_superseded(msgs) == 1 and prune.prune_superseded(msgs) == 0)
+
+
+def test_prune_in_agent():
+    """Stadio 0 nell'Agent: sopra soglia pota e, se basta, SALTA il riassunto LLM;
+    callback on_prune; /compact manuale conta la potatura; kill-switch rispettato."""
+    from flair.core import prune
+    from flair.core.agent import Conversation
+
+    big = "x" * 4000
+
+    def history():
+        a, b = tc("read_file", path="f.py"), tc("read_file", path="f.py")
+        return [{"role": "user", "content": "task"},
+                _asst_msg(a), _tool_msg(a.id, big),
+                _asst_msg(b), _tool_msg(b.id, big),
+                {"role": "assistant", "content": "ok"}]
+
+    # 1) La potatura basta → NESSUNA chiamata di riassunto (provider mai invocato).
+    cfg = cfg_for(Path("."))
+    cfg.context_window = 4000          # soglia = 3000 token
+    pruned_counts: list[int] = []
+    prov = FakeProvider([])
+    convo = Conversation()
+    convo.messages = history()
+    convo.last_prompt_tokens = 3500    # sopra soglia
+    agent = coding_agent.build(cfg, prov, conversation=convo, on_prune=pruned_counts.append)
+    agent._maybe_compact()
+    check("prune agent: ha potato (callback)", pruned_counts == [1], str(pruned_counts))
+    check("prune agent: stub in contesto", convo.messages[2]["content"] == prune.STUB)
+    check("prune agent: riassunto LLM SALTATO", len(prov.calls) == 0, str(prov.calls))
+    check("prune agent: contatori azzerati (prefisso spezzato)",
+          convo.last_prompt_tokens == 0 and convo.sent_upto == 0)
+    check("prune agent: sotto soglia dopo potatura", agent._ctx_estimate() <= cfg.compact_threshold,
+          str(agent._ctx_estimate()))
+
+    # 2) /compact manuale: la sola potatura conta come "qualcosa fatto" (la storia è
+    #    troppo corta per il riassunto: keep_recent default la copre tutta).
+    cfg2 = cfg_for(Path("."))
+    prov2 = FakeProvider([])
+    convo2 = Conversation()
+    convo2.messages = history()
+    agent2 = coding_agent.build(cfg2, prov2, conversation=convo2)
+    check("prune agent: compact() manuale → True con la sola potatura", agent2.compact() is True)
+    check("prune agent: compact() manuale non ha riassunto (storia corta)", len(prov2.calls) == 0)
+
+    # 3) Kill-switch: FLAIR_COMPACT_PRUNE=false → nessuna potatura, compaction classica.
+    cfg3 = cfg_for(Path("."))
+    cfg3.compact_prune = False
+    cfg3.context_window = 4000
+    cfg3.compact_keep_recent = 2       # storia corta: serve un keep basso perché ci sia testa da riassumere
+    prov3 = FakeProvider([LLMResponse(content="riassunto", usage=Usage(total_tokens=5))])
+    convo3 = Conversation()
+    convo3.messages = history()
+    convo3.last_prompt_tokens = 3500
+    agent3 = coding_agent.build(cfg3, prov3, conversation=convo3)
+    agent3._maybe_compact()
+    check("prune agent: kill-switch → niente stub", all(m.get("content") != prune.STUB for m in convo3.messages))
+    check("prune agent: kill-switch → riassunto LLM eseguito", len(prov3.calls) == 1, str(prov3.calls))
+
+
+def test_router_continuation():
+    """Le continuazioni nude restano sull'agente corrente SENZA chiamata LLM (è il
+    misroute visto dal vivo: 'Procedi.' instradato a general a metà task coding)."""
+    from flair.core import router
+    from flair.core.agent import Conversation
+
+    # 1) Continuazioni nude → sticky deterministico, provider MAI chiamato.
+    for text, last in [("Procedi.", "coding"), ("vai", "coding"), ("Ok, continua pure!", "coding"),
+                       ("sì grazie, procedi", "coding"), ("go ahead", "coding"), ("do it", "coding"),
+                       ("va bene così", "general"), ("riprova", "general"), ("Avanti.", "general")]:
+        prov = FakeProvider([])
+        convo = Conversation()
+        got = router.classify(text, prov, last, convo=convo)
+        check(f"router continuazione: {text!r} resta su {last}", got == last, got)
+        check(f"router continuazione: {text!r} senza chiamata LLM", prov.calls == [], str(prov.calls))
+        check(f"router continuazione: {text!r} nessun usage aggiunto", convo.total_usage.total_tokens == 0)
+
+    # 2) Controesempi: contenuto reale → routing normale (LLM consultato).
+    for text, last in [("vai su google e cerca le notizie", "coding"),
+                       ("procedi con il refactor del modulo auth", "general"),
+                       ("ok ma prima dimmi che ore sono", "coding")]:
+        prov = FakeProvider([LLMResponse(content="general", usage=Usage(total_tokens=3))])
+        got = router.classify(text, prov, last)
+        check(f"router continuazione: {text!r} NON corto-circuitato", len(prov.calls) == 1, str(prov.calls))
+
+    # 3) Senza last_agent (primo messaggio) niente sticky: si instrada normalmente.
+    prov = FakeProvider([LLMResponse(content="coding", usage=Usage(total_tokens=3))])
+    got = router.classify("procedi", prov, None)
+    check("router continuazione: primo messaggio → LLM consultato", len(prov.calls) == 1 and got == "coding")
+
+    # 4) Messaggio lungo di soli filler → oltre il limite, niente corto-circuito.
+    long_filler = "ok " * 20
+    prov = FakeProvider([LLMResponse(content="general", usage=Usage(total_tokens=3))])
+    router.classify(long_filler, prov, "coding")
+    check("router continuazione: oltre 40 char → routing normale", len(prov.calls) == 1)
+
+
 def main():
     test_arg_parse()
     test_usage_normalization()
@@ -1880,6 +2067,10 @@ def main():
     test_explore_usage_accounting()
     test_explore_usage_on_stop()
     test_router_usage_accounting()
+    test_router_continuation()
+    test_plan_tool()
+    test_prune_superseded_rules()
+    test_prune_in_agent()
     test_evals_harness()
     print(f"\nTUTTI I {len(PASS)} TEST PASSATI ✅")
 

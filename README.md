@@ -35,7 +35,7 @@ flair/
 ├── core/                Engine, independent of the concrete tools
 │   ├── tool.py          Tool, Toolset, ToolContext, ToolError, @tool
 │   ├── agent.py         Append-only agent loop + COMPACTION + anti-loop
-│   └── router.py        Agent selection: heuristics + sticky + LLM fallback (capped)
+│   └── router.py        Agent selection: continuation stickiness + LLM (capped) + heuristic fallback
 ├── tools/
 │   ├── fs.py            Filesystem helpers + resilient edit matcher (apply_edit)
 │   ├── coding.py        Coding tools (sandboxed to the project root)
@@ -52,7 +52,7 @@ flair/
 
 **One engine, two agents.** `core/agent.py` is generic: it takes a *toolset* and a *prompt*. The two agents differ only in those — no duplicated logic.
 
-- **Coding agent** — `read_file`, `list_directory`, `glob`, `grep`, `repo_map`, `edit_file`, `multi_edit`, `write_file`, `run_command`, `explore`, plus read-only `web_search` / `web_fetch` for information that lives online (library docs, API signatures, error messages). File tools are **sandboxed** to the project root (`--root`): it cannot escape it.
+- **Coding agent** — `read_file`, `list_directory`, `glob`, `grep`, `repo_map`, `edit_file`, `multi_edit`, `write_file`, `run_command`, `explore`, `plan`, plus read-only `web_search` / `web_fetch` for information that lives online (library docs, API signatures, error messages). File tools are **sandboxed** to the project root (`--root`): it cannot escape it.
 - **General agent** — `open_url`, `open_path`, `open_application`, `search_files`, `list_directory`, `read_file`, `write_file`, `edit_file`, `run_command`, `run_powershell`, `system_info`, `get_datetime`, `clipboard_get/set`, `web_search`, `web_fetch`. Operates on the **whole machine** (that is its purpose: "open the browser", "find a song", "write a report to disk"). It can also **converse**: if no tool is needed, it just answers.
 
 For complex/multi-line PowerShell on Windows, the agent uses `run_powershell`: the script is written to a temporary file, executed with `-File`, and the temp file is **always removed** (success, error, or timeout) — no escaping headaches, no leftovers. Multi-line commands sent through `run_command` are routed the same way internally, instead of through cmd.exe (which breaks on embedded newlines).
@@ -174,6 +174,8 @@ You can always invoke it as `python -m flair ...` too.
 
 **Read-only explorer sub-agent.** `explore` delegates a research question ("where and how is X implemented?", "which files handle Y?") to a **sub-agent with its own isolated context** and a **read-only** toolset (`repo_map`, `list_directory`, `glob`, `grep`, `read_file`, plus web). The sub-agent does the heavy reading in its own conversation and returns only a concise synthesis, so the parent agent's context stays lean — **lowering token usage** on large tasks while adding a focused-investigation capability. It is safe by construction: it cannot edit files or run commands, it cannot recurse (it does not have `explore` itself), it is bounded by `FLAIR_EXPLORER_MAX_STEPS`, and it is confined to the project root. Its token usage is rolled into the session total, so cost stays accurate. If the model never calls it, behaviour is unchanged.
 
+**Explicit plan (`plan`).** For multi-step tasks the model opens with a short, structured TODO list and rewrites it as it goes (`da_fare` / `in_corso` / `fatto`). A visible plan is the standard countermeasure to *flailing* — the real token killer, where a task takes 25 steps instead of 12 — and improves reliability on long tasks. The tool is stateless (each call rewrites the full list), tolerant of model quirks (plain strings, English statuses, JSON-string arrays), capped in size, and shown in full in the CLI. The compaction summarizer is instructed to preserve the current plan and step states.
+
 **Resilient `edit_file` / `multi_edit`.** Matching `old_string` is not purely literal: it cascades through *exact → outer whitespace ignored → line-ending tolerant → indentation tolerant* (re-indenting the new block to the correct level automatically). If the match is not unique it returns a clear error inviting a re-read of the file, instead of failing opaquely. When it uses a fallback it says so (`[match: indentation tolerant]`). `multi_edit` applies several edits to one file in a single, **atomic** call (if any edit fails, the file is left untouched) — fewer round-trips and tokens.
 
 **File creation.** `write_file` creates whole files and intermediate folders; `edit_file` makes targeted changes. The coding agent can therefore both **create** and **modify**.
@@ -193,10 +195,10 @@ You can always invoke it as `python -m flair ...` too.
 ## Token efficiency (without being stingy)
 
 - **Prefix cache** always active (append-only history) → repeated input costs ~1/10 on both providers. The status line shows the cache-hit %.
-- **Context compaction**: when the context exceeds a threshold (a fraction of the model window, default 75%), the older part is summarized into **one** message and the run continues with a new, stable prefix. You pay the cache miss **once per compaction**, not every turn — the opposite of the old Flair, which invalidated the cache every turn. Context size is measured exactly from the API's `prompt_tokens` (no tokenizer to install). If the provider still reports an overflow, Flair compacts aggressively and retries once.
+- **Context compaction**: when the context exceeds a threshold (a fraction of the model window, default 75%), the older part is summarized into **one** message and the run continues with a new, stable prefix. You pay the cache miss **once per compaction**, not every turn — the opposite of the old Flair, which invalidated the cache every turn. Context size is measured exactly from the API's `prompt_tokens` (no tokenizer to install). Before summarizing, a free deterministic **stage 0** prunes provably-superseded tool outputs — duplicates of identical calls, reads of files later overwritten by a full `write_file`, and partial reads covered by a later full read — replacing them with a short stub (tool-call pairing stays intact, the freshest occurrence always survives). If pruning alone brings the context back under the threshold, the LLM summary is skipped entirely: space is reclaimed **without** trading detail for a summary. Disable with `FLAIR_COMPACT_PRUNE=false`. If the provider still reports an overflow, Flair prunes, compacts aggressively and retries once.
 - **Targeted thinking**: with `--think`, the reasoning model is used on the **first** step (planning); the tool loop continues with the fast, cheap model.
 - **Targeted tool output**: files read with `offset`/`limit`, grep/commands truncated with a hint to narrow down.
-- **Near-free router**: it decides by heuristics in most cases; it falls back to the LLM only when truly unsure, with the response capped to **a few tokens**.
+- **Near-free router**: bare continuations ("procedi", "ok", "go ahead"…) stick to the current mode **deterministically, with zero LLM calls** — a contentless message carries no routing signal, and letting a model decide it can switch agent mid-task (different sandbox, prompt and tools) and invalidate the cached prefix. Everything else is decided by one tiny LLM call (response capped to **a few tokens**), with a keyword+sticky heuristic as offline fallback.
 - **Resilient edit_file**: no "old_string not found" loops caused by whitespace/indentation (see above) → fewer wasted attempts.
 - No aggressive budget: the only brake is the repeated-identical-call detector, which leads to a **clean finish** instead of a loop.
 
@@ -230,7 +232,7 @@ Then add it to the `TOOLS` list of the right module (`tools/coding.py`, `tools/s
 
 ## Tests
 
-Offline suite (no network, fake provider) with ~325 assertions covering: robust argument parsing, usage normalization for both providers, the **real provider request path** (parameters sent to the API: `max_tokens` vs `max_completion_tokens`, `temperature` omitted on reasoning models, DeepSeek V4 thinking enabled via parameter, retry on transient errors only), **streaming assembly**, **compaction** and overflow recovery, the resilient `edit_file` matcher and **atomic `multi_edit`**, the **`repo_map`** outline across ~two dozen languages, the **read-only `explore` sub-agent** (isolation, read-only toolset, no recursion, usage roll-up), web **search** (multi-backend cascade + errors) and **fetch**, **session persistence** (save/resume round-trip, at both the store and CLI level), **runtime provider/model switching**, the context indicator, the router, and **both** agents on the real tools.
+Offline suite (no network, fake provider) with ~400 assertions covering: robust argument parsing, usage normalization for both providers, the **real provider request path** (parameters sent to the API: `max_tokens` vs `max_completion_tokens`, `temperature` omitted on reasoning models, DeepSeek V4 thinking enabled via parameter, retry on transient errors only), **streaming assembly**, **compaction** and overflow recovery, the resilient `edit_file` matcher and **atomic `multi_edit`**, the **`repo_map`** outline across ~two dozen languages, the **read-only `explore` sub-agent** (isolation, read-only toolset, no recursion, leak-proof usage roll-up), the **`plan`** tool and **stage-0 context pruning** (rules, guarantees, summary-skip), web **search** (multi-backend cascade + errors) and **fetch**, **session persistence** (save/resume round-trip, at both the store and CLI level), **runtime provider/model switching**, the context indicator, the router (including deterministic continuation stickiness), and **both** agents on the real tools.
 
 ```bash
 python tests/test_smoke.py        # direct runner

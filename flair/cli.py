@@ -34,7 +34,7 @@ from .tools import fs
 
 _TOOL_ICON = {
     "read_file": "📄", "list_directory": "📁", "glob": "🔎", "grep": "🔎",
-    "repo_map": "🗺️ ", "explore": "🔭",
+    "repo_map": "🗺️ ", "explore": "🔭", "plan": "📋",
     "edit_file": "✏️ ", "multi_edit": "✏️ ", "write_file": "📝", "run_command": "⚙️ ",
     "run_powershell": "⚙️ ",
     "open_url": "🌐", "open_path": "📂", "open_application": "🚀",
@@ -90,6 +90,7 @@ class CLI:
             on_reasoning=self._on_reasoning,
             on_delta=self._on_delta,
             on_compact=self._on_compact,
+            on_prune=self._on_prune,
             approve=self._approve,
         )
 
@@ -168,10 +169,19 @@ class CLI:
 
     def _on_result(self, name: str, output: str, ok: bool) -> None:
         self._newline_if_needed()
-        first = output.splitlines()[0] if output else ""
-        self.console.print(f"     [{'green' if ok else 'red'}]{_short(first, 100)}[/]", highlight=False)
+        if name == "plan" and ok:
+            # La scaletta è l'output più utile da mostrare per intero (è corta).
+            for line in output.splitlines():
+                self.console.print(f"     [cyan]{line}[/cyan]", highlight=False)
+        else:
+            first = output.splitlines()[0] if output else ""
+            self.console.print(f"     [{'green' if ok else 'red'}]{_short(first, 100)}[/]", highlight=False)
         if self._turn_tools:
             self._turn_tools[-1].update(ok=ok, output=_short(output, 300))
+
+    def _on_prune(self, count: int) -> None:
+        self._newline_if_needed()
+        self.console.print(f"[dim]  ✂ contesto: potati {count} output di tool superati[/dim]")
 
     def _on_reasoning(self, text: str) -> None:
         self._newline_if_needed()

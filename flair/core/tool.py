@@ -158,9 +158,6 @@ class Toolset:
     def schemas(self) -> list[dict]:
         return [t.schema() for t in self._tools.values()]
 
-    def names(self) -> list[str]:
-        return list(self._tools)
-
     def catalog(self) -> list[tuple[str, str]]:
         """(nome, descrizione) di ogni tool, in ordine — per elencarli nella UI."""
         return [(t.name, t.description) for t in self._tools.values()]

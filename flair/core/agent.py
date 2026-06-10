@@ -36,7 +36,6 @@ log = logging.getLogger(__name__)
 OnTool = Callable[[str, dict], None]
 OnResult = Callable[[str, str, bool], None]
 OnReasoning = Callable[[str], None]
-OnText = Callable[[str], None]
 OnDelta = Callable[[str], None]
 OnCompact = Callable[[int, int], None]
 OnPrune = Callable[[int], None]
@@ -123,7 +122,6 @@ class Agent:
         on_tool: OnTool | None = None,
         on_result: OnResult | None = None,
         on_reasoning: OnReasoning | None = None,
-        on_text: OnText | None = None,
         on_delta: OnDelta | None = None,
         on_compact: OnCompact | None = None,
         on_prune: OnPrune | None = None,
@@ -138,7 +136,6 @@ class Agent:
         self.on_tool = on_tool
         self.on_result = on_result
         self.on_reasoning = on_reasoning
-        self.on_text = on_text
         self.on_delta = on_delta
         self.on_compact = on_compact
         self.on_prune = on_prune
@@ -225,9 +222,6 @@ class Agent:
                         )
                     self.convo.messages.append({"role": "assistant", "content": stored})
                     return AgentResult(resp.content, turn_usage, step, "done", truncated=truncated)
-
-                if resp.content and self.on_text and not self._streaming():
-                    self.on_text(resp.content)
 
                 step += 1
                 self.convo.messages.append(self._assistant_msg(resp))

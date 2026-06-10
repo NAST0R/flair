@@ -195,7 +195,6 @@ def load_config() -> Config:
     )
 
     log_dir = os.getenv("FLAIR_LOG_DIR")
-    hit, miss, out = resolve_pricing(provider, deepseek.model if provider == "deepseek" else openai.model)
 
     cfg = Config(
         provider=provider,
@@ -225,8 +224,8 @@ def load_config() -> Config:
         cost_warn=_float("FLAIR_COST_WARN", 0.0),
         session_dir=Path(os.getenv("FLAIR_SESSION_DIR", str(Path.home() / ".flair" / "sessions"))).expanduser().resolve(),
         auto_approve=_bool("FLAIR_AUTO_APPROVE", False),
-        price_cache_hit=_float("FLAIR_PRICE_CACHE_HIT", hit),
-        price_cache_miss=_float("FLAIR_PRICE_CACHE_MISS", miss),
-        price_output=_float("FLAIR_PRICE_OUTPUT", out),
     )
+    # Prezzi: un'unica fonte di verità (modello attivo + override FLAIR_PRICE_*),
+    # la stessa usata quando si cambia provider/modello a runtime.
+    cfg.refresh_pricing()
     return cfg

@@ -200,6 +200,11 @@ class Agent:
 
         try:
             while step < step_limit:
+                # Budget hard: se il costo di sessione ha raggiunto il tetto, fermati
+                # PRIMA della prossima chiamata a pagamento (no-op se max_cost=0). È il
+                # freno che evita spese fuori controllo in esecuzione non presidiata.
+                if self._over_budget():
+                    return AgentResult("", self._fold_delegated(turn_usage), step, "budget")
                 resp = self._complete(tools=schemas, think=think and step == 0)
                 turn_usage = turn_usage + resp.usage
 
@@ -265,6 +270,16 @@ class Agent:
         self.convo.total_usage = self.convo.total_usage + d
         self.ctx.delegated_usage = Usage()
         return turn_usage + d
+
+    def _over_budget(self) -> bool:
+        """True se il costo cumulativo di sessione ha raggiunto il tetto `max_cost`
+        (USD). A 0 (default) è disattivato: la modalità interattiva non è toccata.
+        Il controllo usa il totale di sessione — la spesa reale mostrata all'utente —
+        così il tetto vale sia per il singolo task sia per una sessione ripresa."""
+        cap = getattr(self.cfg, "max_cost", 0.0) or 0.0
+        if cap <= 0:
+            return False
+        return self.provider.estimate_cost(self.convo.total_usage, self.cfg) >= cap
 
     # ── chiamata al modello (con compaction e gestione overflow) ──────────────
 

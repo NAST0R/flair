@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import difflib
+import json
 import os
 import sys
 from pathlib import Path
@@ -52,6 +53,53 @@ def _kfmt(n: int) -> str:
     return f"{n / 1000:.0f}k" if n >= 1000 else str(n)
 
 
+# Exit code per l'uso non presidiato (cron/CI): distinguono ESITO, non solo ok/ko,
+# così uno scheduler può ramificare. 0 = completato; gli altri = motivi di stop.
+EXIT_CODES = {"done": 0, "max_steps": 2, "loop": 3, "stopped": 4, "budget": 5}
+
+
+def exit_code_for(reason: str) -> int:
+    """Mappa stopped_reason → exit code. Sconosciuto/errore → 1."""
+    return EXIT_CODES.get(reason, 1)
+
+
+_FILE_WRITE_TOOLS = {"write_file", "edit_file", "multi_edit"}
+
+
+def build_result_json(agent_key: str | None, task: str, result, tool_events: list[dict],
+                      cost_usd: float) -> dict:
+    """Oggetto machine-readable di un turno one-shot (modalità --json). Puro e
+    serializzabile: riassume esito, risposta, passi, usage/costo, tool e file toccati."""
+    u = result.usage
+    files: list[str] = []
+    seen: set[str] = set()
+    for ev in tool_events:
+        if ev.get("ok") and ev.get("name") in _FILE_WRITE_TOOLS:
+            p = (ev.get("args") or {}).get("path")
+            if p and p not in seen:
+                seen.add(p)
+                files.append(p)
+    return {
+        "ok": result.stopped_reason == "done",
+        "agent": agent_key,
+        "stopped_reason": result.stopped_reason,
+        "response": result.content or "",
+        "steps": result.steps,
+        "truncated": result.truncated,
+        "usage": {
+            "prompt_tokens": u.prompt_tokens,
+            "completion_tokens": u.completion_tokens,
+            "total_tokens": u.total_tokens,
+            "cache_hit_tokens": u.cache_hit_tokens,
+            "cache_miss_tokens": u.cache_miss_tokens,
+            "reasoning_tokens": u.reasoning_tokens,
+        },
+        "cost_usd": round(cost_usd, 6),
+        "tools": [{"name": e.get("name"), "ok": bool(e.get("ok"))} for e in tool_events],
+        "files_changed": files,
+    }
+
+
 class CLI:
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
@@ -66,6 +114,9 @@ class CLI:
         self._turn_tools: list[dict] = []
         self._always_allow: set[str] = set()
         self._cost_warned = False
+        # "human" (REPL/default), "json" o "quiet": le ultime due sono per l'uso
+        # non presidiato (-p) e silenziano l'output decorato su stdout.
+        self.output_mode = "human"
 
         self.session = SessionStore(cfg.session_dir) if cfg.session_dir else SessionStore(Path.home() / ".flair" / "sessions")
         self.session_name: str | None = None
@@ -150,11 +201,17 @@ class CLI:
             self._mid_line = False
 
     def _on_delta(self, piece: str) -> None:
+        if self.output_mode != "human":
+            return
         sys.stdout.write(piece)
         sys.stdout.flush()
         self._mid_line = not piece.endswith("\n")
 
     def _on_tool(self, name: str, args: dict) -> None:
+        # Raccogliamo sempre l'evento (serve a logger e a --json); stampiamo solo in human.
+        self._turn_tools.append({"name": name, "args": {k: _short(v, 200) for k, v in args.items()}})
+        if self.output_mode != "human":
+            return
         self._newline_if_needed()
         icon = _TOOL_ICON.get(name, "🔧")
         shown = {}
@@ -165,9 +222,12 @@ class CLI:
                 shown[k] = _short(v)
         argstr = "  ".join(f"[cyan]{k}[/cyan]={v}" for k, v in shown.items())
         self.console.print(f"  {icon} [bold]{name}[/bold]  {argstr}", highlight=False)
-        self._turn_tools.append({"name": name, "args": {k: _short(v, 200) for k, v in args.items()}})
 
     def _on_result(self, name: str, output: str, ok: bool) -> None:
+        if self._turn_tools:
+            self._turn_tools[-1].update(ok=ok, output=_short(output, 300))
+        if self.output_mode != "human":
+            return
         self._newline_if_needed()
         if name == "plan" and ok:
             # La scaletta è l'output più utile da mostrare per intero (è corta).
@@ -176,19 +236,23 @@ class CLI:
         else:
             first = output.splitlines()[0] if output else ""
             self.console.print(f"     [{'green' if ok else 'red'}]{_short(first, 100)}[/]", highlight=False)
-        if self._turn_tools:
-            self._turn_tools[-1].update(ok=ok, output=_short(output, 300))
 
     def _on_prune(self, count: int) -> None:
+        if self.output_mode != "human":
+            return
         self._newline_if_needed()
         self.console.print(f"[dim]  ✂ contesto: potati {count} output di tool superati[/dim]")
 
     def _on_reasoning(self, text: str) -> None:
+        if self.output_mode != "human":
+            return
         self._newline_if_needed()
         self.console.print(Panel(Text(text.strip(), style="italic dim"),
                                  title="[dim]ragionamento[/dim]", border_style="dim", padding=(0, 1)))
 
     def _on_compact(self, before: int, after: int) -> None:
+        if self.output_mode != "human":
+            return
         self._newline_if_needed()
         self.console.print(f"[dim]  ⟳ contesto compattato: {before} → {after} messaggi[/dim]")
 
@@ -287,48 +351,74 @@ class CLI:
             self.console.print("[dim]Puoi riprovare. Se è un timeout di rete del modello, "
                                "riprova tra poco o abbassa FLAIR_TIMEOUT.[/dim]\n")
 
+    def _emit_json(self, obj: dict) -> None:
+        # Una sola riga JSON su stdout (JSONL-friendly), nient'altro in modalità json.
+        sys.stdout.write(json.dumps(obj, ensure_ascii=False) + "\n")
+        sys.stdout.flush()
+
     def run_once(self, task: str, agent_key: str | None = None, think: bool = False) -> int:
-        """Esegue un singolo task (modalità `-p`) e ritorna un exit code: 0 ok,
-        1 errore, 130 interruzione. Non fa crashare il processo su timeout/errori
-        di rete del modello (stessa protezione della REPL, ma con exit code per gli script)."""
+        """Esegue un singolo task (modalità `-p`) e ritorna un exit code per gli script:
+        0 done, 2 max-step, 3 loop, 4 fermato (serviva approvazione o stop), 5 budget,
+        1 errore, 130 interruzione. In modalità --json emette SEMPRE un oggetto su stdout
+        (anche su errore/interruzione), così il contratto resta affidabile per l'automazione."""
         try:
-            self.run_task(task, agent_key=agent_key, think=think)
-            return 0
+            result = self.run_task(task, agent_key=agent_key, think=think)
         except KeyboardInterrupt:
             self._newline_if_needed()
-            self.console.print("[yellow]⏹ Interrotto.[/yellow]")
+            if self.output_mode == "json":
+                self._emit_json({"ok": False, "agent": self.last_agent, "stopped_reason": "interrupted",
+                                 "response": "", "error": "interrotto"})
+            elif self.output_mode == "human":
+                self.console.print("[yellow]⏹ Interrotto.[/yellow]")
             return 130
         except Exception as exc:  # noqa: BLE001
             self._newline_if_needed()
-            self.console.print(f"[red]⚠ Errore: {type(exc).__name__}: {exc}[/red]")
+            if self.output_mode == "json":
+                self._emit_json({"ok": False, "agent": self.last_agent, "stopped_reason": "error",
+                                 "response": "", "error": f"{type(exc).__name__}: {exc}"})
+            elif self.output_mode == "human":
+                self.console.print(f"[red]⚠ Errore: {type(exc).__name__}: {exc}[/red]")
             return 1
 
-    def run_task(self, task: str, agent_key: str | None = None, think: bool = False) -> None:
+        if self.output_mode == "json":
+            cost = self.provider.estimate_cost(result.usage, self.cfg)
+            self._emit_json(build_result_json(self.last_agent, task, result, self._turn_tools, cost))
+        elif self.output_mode == "quiet":
+            sys.stdout.write((result.content or "") + "\n")
+            sys.stdout.flush()
+        return exit_code_for(result.stopped_reason)
+
+    def run_task(self, task: str, agent_key: str | None = None, think: bool = False):
         if agent_key is None:
             agent_key = router.classify(task, self.provider, self.last_agent, convo=self.convo)
         self.last_agent = agent_key
         agent = self.agents[agent_key]
         self._turn_tools = []
         self._mid_line = False
+        human = self.output_mode == "human"
 
-        self.console.print(f"[dim]→ agente: {agent_key}[/dim]")
-        if self.cfg.stream:
+        if human:
+            self.console.print(f"[dim]→ agente: {agent_key}[/dim]")
+        if human and self.cfg.stream:
             self.console.print(f"[bold cyan]flair · {agent_key}[/bold cyan]")
             result = agent.run(task, think=think)
             self._newline_if_needed()
             self.console.print()
         else:
             result = agent.run(task, think=think)
-            if result.stopped_reason != "stopped":
+            if human and result.stopped_reason not in ("stopped", "budget"):
                 self.console.print(Panel(
                     Markdown(result.content or "(vuoto)"),
                     title=f"[bold cyan]flair · {agent_key}[/bold cyan]",
                     border_style="cyan", padding=(1, 2),
                 ))
 
-        if result.stopped_reason == "stopped":
+        if human and result.stopped_reason == "stopped":
             self.console.print("[yellow]⏹ Flusso interrotto: hai ripreso il controllo. Dimmi come procedere.[/yellow]\n")
-        if result.truncated:
+        if human and result.stopped_reason == "budget":
+            self.console.print("[yellow]⏹ Interrotto: raggiunto il tetto di costo "
+                               "(--max-cost / FLAIR_MAX_COST).[/yellow]\n")
+        if human and result.truncated:
             if (result.content or "").strip():
                 self.console.print("[yellow]⚠ Risposta troncata: raggiunto il limite di token in output. "
                                    "Chiedi di continuare, o aumenta FLAIR_MAX_TOKENS.[/yellow]")
@@ -343,9 +433,11 @@ class CLI:
         if self.logger:
             self.logger.log_turn(agent_key, task, result, self._turn_tools)
 
-        self._print_turn(result.usage, result.steps, result.stopped_reason)
-        self._print_session()
+        if human:
+            self._print_turn(result.usage, result.steps, result.stopped_reason)
+            self._print_session()
         self._save_session()
+        return result
 
     def _session_usage(self) -> Usage:
         return self.convo.total_usage
@@ -359,7 +451,7 @@ class CLI:
                 f"| cache hit {cache_pct}% | ~${cost:.4f}")
 
     def _print_turn(self, usage: Usage, steps: int, reason: str) -> None:
-        labels = {"max_steps": "max step", "loop": "loop rilevato", "stopped": "interrotto"}
+        labels = {"max_steps": "max step", "loop": "loop rilevato", "stopped": "interrotto", "budget": "budget"}
         flag = f" | [yellow]{labels[reason]}[/yellow]" if reason in labels else ""
         self.console.print(f"[dim]  questo turno · step {steps} · {self._cost_line(usage)}{flag}[/dim]")
 
@@ -592,18 +684,28 @@ def _build_config(args) -> Config:
         cfg.refresh_pricing()
     if args.think_model:
         cfg.active.think_model = args.think_model
+    if args.read_only:
+        cfg.read_only = True
+    if args.max_cost is not None:
+        cfg.max_cost = args.max_cost
     return cfg
 
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="flair", description="Assistente AI agentico (coding + generico) su DeepSeek/OpenAI.")
     ap.add_argument("--version", action="version", version=f"flair {__version__}")
-    ap.add_argument("-p", "--prompt", help="esegue un singolo task e esce")
+    ap.add_argument("-p", "--prompt", help="esegue un singolo task e esce (usa '-' per leggere da stdin)")
     ap.add_argument("--provider", choices=["deepseek", "openai"], help="provider LLM")
     ap.add_argument("--agent", choices=["coding", "general", "auto"], default="auto", help="forza un agente (default: auto)")
     ap.add_argument("--root", help="radice di lavoro per l'agente coding")
     ap.add_argument("--think", action="store_true", help="usa il modello thinking al primo passo")
     ap.add_argument("--yes", action="store_true", help="auto-approva i tool distruttivi")
+    ap.add_argument("--read-only", dest="read_only", action="store_true",
+                    help="esecuzione non presidiata: disabilita i tool distruttivi (write/edit/comandi)")
+    ap.add_argument("--max-cost", dest="max_cost", type=float, default=None,
+                    help="tetto HARD di costo della sessione in USD: oltre, il task si ferma")
+    ap.add_argument("--json", action="store_true", help="con -p: emette un oggetto JSON (per automazioni)")
+    ap.add_argument("-q", "--quiet", action="store_true", help="con -p: stampa solo la risposta finale")
     ap.add_argument("--no-stream", dest="no_stream", action="store_true", help="disabilita lo streaming")
     ap.add_argument("--log", help="cartella in cui scrivere il log di sessione (JSONL)")
     ap.add_argument("--model", help="override del modello veloce")
@@ -612,17 +714,33 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--continue", dest="continue_", action="store_true", help="riprende l'ultima sessione salvata")
     args = ap.parse_args(argv)
 
-    console = Console()
+    # Modalità di output one-shot: json/quiet valgono solo con -p (la REPL resta human).
+    json_mode = bool(args.prompt is not None and args.json)
+    quiet_mode = bool(args.prompt is not None and args.quiet and not args.json)
+    headless = json_mode or quiet_mode
+
+    console = Console(stderr=headless)  # in headless i messaggi umani vanno su stderr
     cfg = _build_config(args)
+    if headless:
+        cfg.stream = False              # niente delta su stdout: resta pulito per la macchina
     try:
         cfg.validate()
     except RuntimeError as exc:
-        console.print(f"[bold red]Configurazione non valida:[/bold red] {exc}")
+        if json_mode:
+            sys.stdout.write(json.dumps(
+                {"ok": False, "stopped_reason": "config_error", "response": "", "error": str(exc)}) + "\n")
+        else:
+            console.print(f"[bold red]Configurazione non valida:[/bold red] {exc}")
         return 1
 
     cli = CLI(cfg)
+    if json_mode:
+        cli.output_mode = "json"
+    elif quiet_mode:
+        cli.output_mode = "quiet"
 
-    # Ripresa sessione (prima di eseguire qualsiasi cosa).
+    # Ripresa sessione (prima di eseguire qualsiasi cosa). In headless i messaggi
+    # informativi vanno su stderr, così stdout resta riservato all'output macchina.
     if args.session:
         cli.session_name = args.session
         if cli._load_session(args.session):
@@ -636,9 +754,18 @@ def main(argv: list[str] | None = None) -> int:
         else:
             console.print("[dim]nessuna sessione da riprendere.[/dim]")
 
-    if args.prompt:
+    if args.prompt is not None:
+        prompt = sys.stdin.read() if args.prompt == "-" else args.prompt
+        prompt = prompt.strip()
+        if not prompt:
+            if json_mode:
+                cli._emit_json({"ok": False, "agent": None, "stopped_reason": "error",
+                                "response": "", "error": "prompt vuoto"})
+            else:
+                console.print("[red]Prompt vuoto.[/red]")
+            return 1
         key = None if args.agent == "auto" else args.agent
-        return cli.run_once(args.prompt, agent_key=key, think=args.think)
+        return cli.run_once(prompt, agent_key=key, think=args.think)
     cli.repl()
     return 0
 

@@ -10,11 +10,15 @@ from ..tools import web as web_tools
 
 
 def build(cfg, provider, conversation=None, **callbacks) -> Agent:
+    tools = system_tools.TOOLS + web_tools.TOOLS
+    if getattr(cfg, "read_only", False):
+        # Esecuzione non presidiata: niente write/edit/comandi sull'intera macchina.
+        tools = [t for t in tools if not t.destructive]
     return Agent(
         name="general",
         cfg=cfg,
         provider=provider,
-        toolset=Toolset(system_tools.TOOLS + web_tools.TOOLS),
+        toolset=Toolset(tools),
         system_prompt=prompts.load("general"),
         conversation=conversation,
         **callbacks,

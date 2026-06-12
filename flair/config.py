@@ -140,6 +140,8 @@ class Config:
 
     # Sicurezza
     auto_approve: bool = False
+    read_only: bool = False                 # esecuzione non presidiata: nessun tool distruttivo
+    max_cost: float = 0.0                   # tetto HARD di costo sessione (USD); 0 = nessun limite
 
     # Pricing (stima di costo, risolto dal modello veloce attivo)
     price_cache_hit: float = 0.028
@@ -224,6 +226,8 @@ def load_config() -> Config:
         cost_warn=_float("FLAIR_COST_WARN", 0.0),
         session_dir=Path(os.getenv("FLAIR_SESSION_DIR", str(Path.home() / ".flair" / "sessions"))).expanduser().resolve(),
         auto_approve=_bool("FLAIR_AUTO_APPROVE", False),
+        read_only=_bool("FLAIR_READ_ONLY", False),
+        max_cost=_float("FLAIR_MAX_COST", 0.0),
     )
     # Prezzi: un'unica fonte di verità (modello attivo + override FLAIR_PRICE_*),
     # la stessa usata quando si cambia provider/modello a runtime.

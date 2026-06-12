@@ -158,6 +158,26 @@ flair --version                                           # print version
 
 You can always invoke it as `python -m flair ...` too.
 
+### Headless / scheduled (cron, systemd, CI)
+
+Flair stays a one-shot command — the OS scheduler (cron, systemd timers, Task Scheduler, CI) handles *when* to run it; Flair handles *what* to do. The flags below make a `-p` run safe and machine-readable for unattended use; the interactive REPL is unchanged.
+
+```bash
+# Read-only report to JSON, with a hard cost ceiling, on a schedule:
+flair -p "summarize today's changes under ./src" \
+      --read-only --json --max-cost 0.10 --root /data >> out.jsonl
+
+echo "audit the auth module" | flair -p - --read-only --quiet   # task from stdin
+```
+
+- **`--json`** prints exactly one JSON object on stdout (and nothing else): `ok`, `agent`, `stopped_reason`, `response`, `steps`, `truncated`, `usage`, `cost_usd`, `tools`, `files_changed`. On error or interruption it still emits a JSON object, so the contract is reliable. Human-oriented notes go to stderr.
+- **Exit codes** reflect the outcome, not just success: `0` done, `2` max-steps, `3` loop, `4` stopped (something needed approval, or was interrupted), `5` budget exceeded, `1` error, `130` interrupted. A scheduler can branch on these.
+- **`--read-only`** disables every destructive tool (write / edit / `run_command` / `run_powershell`) in both agents — the agent can read, search, browse and reason, but cannot change anything. Ideal for monitoring, reporting and audit jobs. (`FLAIR_READ_ONLY=true`.)
+- **`--max-cost <usd>`** is a hard ceiling on the **session** cost: when the cumulative spend reaches it, the run stops (`stopped_reason: "budget"`) before the next paid call — no surprise bills. (`FLAIR_MAX_COST`.) Combined with the existing `--max-steps` (60 by default), runaway loops are bounded both ways.
+- **`--quiet`** (`-q`) prints only the final answer. **`-p -`** reads the task from stdin.
+
+For unattended runs prefer **stateless** invocations (no `--session`): two scheduled runs sharing one session file would race on it.
+
 ---
 
 ## Professional features
@@ -232,7 +252,7 @@ Then add it to the `TOOLS` list of the right module (`tools/coding.py`, `tools/s
 
 ## Tests
 
-Offline suite (no network, fake provider) with ~400 assertions covering: robust argument parsing, usage normalization for both providers, the **real provider request path** (parameters sent to the API: `max_tokens` vs `max_completion_tokens`, `temperature` omitted on reasoning models, DeepSeek V4 thinking enabled via parameter, retry on transient errors only), **streaming assembly**, **compaction** and overflow recovery, the resilient `edit_file` matcher and **atomic `multi_edit`**, the **`repo_map`** outline across ~two dozen languages, the **read-only `explore` sub-agent** (isolation, read-only toolset, no recursion, leak-proof usage roll-up), the **`plan`** tool and **stage-0 context pruning** (rules, guarantees, summary-skip), web **search** (multi-backend cascade + errors) and **fetch**, **session persistence** (save/resume round-trip, at both the store and CLI level), **runtime provider/model switching**, the context indicator, the router (including deterministic continuation stickiness), and **both** agents on the real tools.
+Offline suite (no network, fake provider) with ~440 assertions covering: robust argument parsing, usage normalization for both providers, the **real provider request path** (parameters sent to the API: `max_tokens` vs `max_completion_tokens`, `temperature` omitted on reasoning models, DeepSeek V4 thinking enabled via parameter, retry on transient errors only), **streaming assembly**, **compaction** and overflow recovery, the resilient `edit_file` matcher and **atomic `multi_edit`**, the **`repo_map`** outline across ~two dozen languages, the **read-only `explore` sub-agent** (isolation, read-only toolset, no recursion, leak-proof usage roll-up), the **`plan`** tool and **stage-0 context pruning** (rules, guarantees, summary-skip), web **search** (multi-backend cascade + errors) and **fetch**, **session persistence** (save/resume round-trip, at both the store and CLI level), **runtime provider/model switching**, the context indicator, the router (including deterministic continuation stickiness), **headless execution** (significant exit codes, the `--json` result object, read-only tool filtering, the hard cost budget), and **both** agents on the real tools.
 
 ```bash
 python tests/test_smoke.py        # direct runner

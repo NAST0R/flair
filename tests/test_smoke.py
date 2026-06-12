@@ -9,6 +9,7 @@ generico cross-platform.
 from __future__ import annotations
 
 import io
+import json as json_module
 import shutil
 import sys
 from pathlib import Path
@@ -111,8 +112,8 @@ class FakeProvider:
                 on_delta(ch)
         return r
 
-    def estimate_cost(self, usage, cfg):
-        return 0.0
+    # Stesso calcolo del provider reale (serve al controllo di budget dell'agente).
+    estimate_cost = OpenAICompatProvider.estimate_cost
 
 
 _TC = [0]
@@ -1050,17 +1051,30 @@ def test_cost_estimate_cache():
 
 
 def test_run_once_exit_codes():
-    # A3: la modalità one-shot non crasha; ritorna un exit code pulito.
+    # A3: la modalità one-shot non crasha; ritorna un exit code che riflette l'esito.
     import io as _io
 
     from rich.console import Console
 
     from flair.cli import CLI
+    from flair.core.agent import AgentResult
     cli = CLI(cfg_for(Path(".")))
     cli.console = Console(file=_io.StringIO())
 
-    cli.run_task = lambda *a, **k: None          # type: ignore  # successo
-    check("A3: run_once ok → 0", cli.run_once("ciao") == 0)
+    cli.run_task = lambda *a, **k: AgentResult("ok", stopped_reason="done")   # type: ignore
+    check("A3: run_once done → 0", cli.run_once("ciao") == 0)
+
+    cli.run_task = lambda *a, **k: AgentResult("", stopped_reason="max_steps")  # type: ignore
+    check("A3: run_once max_steps → 2", cli.run_once("ciao") == 2)
+
+    cli.run_task = lambda *a, **k: AgentResult("", stopped_reason="loop")       # type: ignore
+    check("A3: run_once loop → 3", cli.run_once("ciao") == 3)
+
+    cli.run_task = lambda *a, **k: AgentResult("", stopped_reason="stopped")    # type: ignore
+    check("A3: run_once stopped → 4", cli.run_once("ciao") == 4)
+
+    cli.run_task = lambda *a, **k: AgentResult("", stopped_reason="budget")     # type: ignore
+    check("A3: run_once budget → 5", cli.run_once("ciao") == 5)
 
     def _boom(*_a, **_k):
         raise RuntimeError("timeout simulato")
@@ -2012,6 +2026,102 @@ def test_router_continuation():
     check("router continuazione: oltre 40 char → routing normale", len(prov.calls) == 1)
 
 
+def test_budget_abort():
+    """Il tetto di costo HARD ferma il loop prima della chiamata successiva."""
+    from flair.core.agent import Conversation
+
+    cfg = cfg_for(Path("."))
+    cfg.context_window = 1_000_000   # evita interferenze della compaction
+    # Prezzi espliciti per un test deterministico: 1.0 USD per 1M token di input
+    # (cache-miss) e output. La prima risposta (110k token) costa ~0.11 USD.
+    cfg.price_cache_hit = 1.0
+    cfg.price_cache_miss = 1.0
+    cfg.price_output = 1.0
+    cfg.max_cost = 0.05              # USD: 0.11 > 0.05 → al giro dopo si ferma.
+    def U(p, c):
+        return Usage(prompt_tokens=p, completion_tokens=c, total_tokens=p + c)
+    prov = FakeProvider([
+        LLMResponse(tool_calls=[tc("read_file", path="a.py")], usage=U(100_000, 10_000)),
+        LLMResponse(content="non dovrei arrivare qui", usage=U(100, 10)),
+    ])
+    convo = Conversation()
+    agent = coding_agent.build(cfg, prov, conversation=convo)
+    result = agent.run("compito lungo")
+    check("budget: stop con reason 'budget'", result.stopped_reason == "budget", result.stopped_reason)
+    check("budget: una sola chiamata al modello", len(prov.calls) == 1, str(prov.calls))
+    check("budget: nessuna seconda risposta", "non dovrei" not in (result.content or ""))
+    # Senza tetto (default) il loop NON si ferma per budget.
+    cfg2 = cfg_for(Path("."))
+    cfg2.context_window = 1_000_000
+    prov2 = FakeProvider([
+        LLMResponse(tool_calls=[tc("read_file", path="a.py")], usage=U(100_000, 10_000)),
+        LLMResponse(content="ok finito", usage=U(50, 5)),
+    ])
+    agent2 = coding_agent.build(cfg2, prov2, conversation=Conversation())
+    res2 = agent2.run("compito lungo")
+    check("budget off: arriva a done", res2.stopped_reason == "done", res2.stopped_reason)
+
+
+def test_read_only_mode():
+    """read_only filtra i tool distruttivi dai due agenti; explorer è già read-only."""
+    cfg = cfg_for(Path("."))
+    cfg.read_only = True
+    names = lambda a: {s["function"]["name"] for s in a.toolset.schemas()}  # noqa: E731
+
+    cnames = names(coding_agent.build(cfg, FakeProvider([])))
+    for dest in ("write_file", "edit_file", "multi_edit", "run_command"):
+        check(f"read-only coding: {dest} assente", dest not in cnames, dest)
+    for ro in ("read_file", "grep", "repo_map", "explore", "plan"):
+        check(f"read-only coding: {ro} presente", ro in cnames, ro)
+
+    gnames = names(general_agent.build(cfg, FakeProvider([])))
+    for dest in ("write_file", "edit_file", "run_command", "run_powershell"):
+        check(f"read-only general: {dest} assente", dest not in gnames, dest)
+    for ro in ("open_url", "search_files", "read_file"):
+        check(f"read-only general: {ro} presente", ro in gnames, ro)
+
+    # Default (read_only off): i tool distruttivi restano.
+    cfg2 = cfg_for(Path("."))
+    cnames2 = names(coding_agent.build(cfg2, FakeProvider([])))
+    check("read-only off: write_file presente", "write_file" in cnames2)
+    check("read-only off: run_command presente", "run_command" in cnames2)
+
+
+def test_automation_helpers():
+    """Exit code per esito e oggetto JSON one-shot (modalità --json)."""
+    from flair.cli import build_result_json, exit_code_for
+    from flair.core.agent import AgentResult
+
+    check("exit done=0", exit_code_for("done") == 0)
+    check("exit max_steps=2", exit_code_for("max_steps") == 2)
+    check("exit loop=3", exit_code_for("loop") == 3)
+    check("exit stopped=4", exit_code_for("stopped") == 4)
+    check("exit budget=5", exit_code_for("budget") == 5)
+    check("exit sconosciuto=1", exit_code_for("boh") == 1)
+
+    res = AgentResult(content="ciao", usage=Usage(prompt_tokens=10, completion_tokens=5, total_tokens=15),
+                      steps=2, stopped_reason="done")
+    events = [{"name": "read_file", "ok": True, "args": {"path": "a.py"}},
+              {"name": "write_file", "ok": True, "args": {"path": "b.py"}},
+              {"name": "write_file", "ok": False, "args": {"path": "c.py"}}]  # fallito → escluso dai file
+    obj = build_result_json("coding", "task", res, events, cost_usd=0.0012345678)
+    check("json: ok true", obj["ok"] is True)
+    check("json: agente", obj["agent"] == "coding")
+    check("json: risposta", obj["response"] == "ciao")
+    check("json: passi", obj["steps"] == 2)
+    check("json: costo arrotondato", obj["cost_usd"] == round(0.0012345678, 6))
+    check("json: solo file scritti con successo", obj["files_changed"] == ["b.py"], str(obj["files_changed"]))
+    check("json: elenco tool con esito",
+          obj["tools"] == [{"name": "read_file", "ok": True}, {"name": "write_file", "ok": True},
+                           {"name": "write_file", "ok": False}], str(obj["tools"]))
+    check("json: usage totale", obj["usage"]["total_tokens"] == 15)
+    json_module.dumps(obj)  # deve essere serializzabile
+    check("json: serializzabile", True)
+    # stopped_reason ≠ done → ok False
+    res2 = AgentResult(content="", stopped_reason="budget")
+    check("json: budget → ok false", build_result_json("coding", "t", res2, [], 0.0)["ok"] is False)
+
+
 def main():
     test_arg_parse()
     test_usage_normalization()
@@ -2071,6 +2181,9 @@ def main():
     test_plan_tool()
     test_prune_superseded_rules()
     test_prune_in_agent()
+    test_budget_abort()
+    test_read_only_mode()
+    test_automation_helpers()
     test_evals_harness()
     print(f"\nTUTTI I {len(PASS)} TEST PASSATI ✅")
 

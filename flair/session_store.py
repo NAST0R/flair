@@ -10,9 +10,12 @@ mai il lavoro. I segreti non vengono salvati (solo i messaggi della chat).
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
+import os
 import re
+import tempfile
 from datetime import datetime
 from pathlib import Path
 
@@ -37,8 +40,22 @@ class SessionStore:
         try:
             self.dir.mkdir(parents=True, exist_ok=True)
             payload = {"saved_at": datetime.now().isoformat(timespec="seconds"), **state}
-            self._path(name).write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-            return self._path(name)
+            target = self._path(name)
+            data = json.dumps(payload, ensure_ascii=False)
+            # Scrittura ATOMICA: file temporaneo nella stessa cartella + os.replace (atomico
+            # anche su Windows). Così un kill a metà scrittura, o due run concorrenti sulla
+            # stessa sessione, non lasciano mai un JSON troncato: resta il vecchio o c'è il
+            # nuovo completo. Il temp (.<nome>-*.tmp, nascosto) non è un *.json → list() lo ignora.
+            fd, tmp = tempfile.mkstemp(dir=self.dir, prefix=f".{target.stem}-", suffix=".tmp")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    fh.write(data)
+                os.replace(tmp, target)
+            except BaseException:
+                with contextlib.suppress(OSError):
+                    os.unlink(tmp)
+                raise
+            return target
         except OSError as exc:
             log.warning("Salvataggio sessione '%s' fallito: %s", name, exc)
             return None

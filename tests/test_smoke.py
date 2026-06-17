@@ -626,6 +626,14 @@ def test_session_persistence():
     check("sessione: salvataggio crea file", path is not None and path.exists())
     check("sessione: exists()", store.exists("lavoro"))
     check("sessione: latest()", store.latest() == "lavoro")
+    # Scrittura atomica: il file finale è JSON valido e nessun temporaneo (.tmp) resta.
+    import json as _json
+    _json.loads(path.read_text(encoding="utf-8"))
+    leftovers = [p.name for p in cfg.session_dir.iterdir() if p.suffix == ".tmp"]
+    check("sessione: scrittura atomica senza .tmp residui", not leftovers, str(leftovers))
+    store.save("lavoro", {"last_agent": "general", "conversation": agent.convo.dump()})  # sovrascrittura
+    check("sessione: sovrascrittura atomica ancora valida",
+          _json.loads(path.read_text(encoding="utf-8")).get("last_agent") == "general")
 
     agent2 = coding_agent.build(cfg, prov)
     state = store.load("lavoro")
@@ -1413,13 +1421,24 @@ def test_tool_robustness():
     r5 = coding.read_file(ctx, path="alpha.py", limit=1)
     check("dispatch: kwarg validi → nessuna nota", not r5.startswith("ℹ️"), r5.splitlines()[0])
 
-    # Un argomento OBBLIGATORIO mancante resta un errore: i refusi seri restano visibili.
+    # Un argomento OBBLIGATORIO mancante dà ora un errore AZIONABILE (ToolError) che
+    # nomina cosa manca, invece di un TypeError grezzo.
     raised = False
     try:
         coding.grep(ctx, path="alpha.py")  # manca 'pattern'
-    except TypeError:
-        raised = True
-    check("dispatch: obbligatorio mancante → TypeError", raised)
+    except ToolError as exc:
+        raised = "pattern" in str(exc)
+    check("dispatch: obbligatorio mancante → ToolError che nomina l'argomento", raised)
+
+    # Argomento mancante perché inviato col nome SBAGLIATO (filename invece di path):
+    # l'errore nomina la chiave ignorata e suggerisce quella giusta.
+    alias_msg = ""
+    try:
+        coding.read_file(ctx, filename="alpha.py")  # 'filename' al posto di 'path'
+    except ToolError as exc:
+        alias_msg = str(exc)
+    check("dispatch: alias suggerito (filename→path)",
+          "path" in alias_msg and "filename" in alias_msg, alias_msg)
 
     # DRY: write_file condiviso → anche coding ora ha il guard sulle directory.
     rd = coding.write_file(ctx, path="sub", content="x")

@@ -21,6 +21,34 @@ from typing import Any
 _TRUE_STRINGS = {"1", "true", "yes", "si", "sì", "y", "vero", "on"}
 _INT_RX = re.compile(r"[+-]?\d+$")
 
+# Nomi che il modello usa a volte al posto del nome reale di un parametro. Servono SOLO
+# a rendere il messaggio d'errore più azionabile (NON a rimappare in silenzio: l'argomento
+# va comunque inviato col nome esatto dello schema — così il modello capisce subito perché).
+_ARG_ALIASES = {
+    "path": {"file", "filename", "filepath", "file_path", "fname", "pathname", "filenames", "files"},
+}
+
+
+def _missing_args_message(tool_name: str, missing: list[str], unknown: list[str]) -> str:
+    """Messaggio azionabile per argomenti obbligatori mancanti: nomina cosa manca, le
+    eventuali chiavi ignorate, e — se una di esse somiglia a un argomento mancante (es.
+    `filename` per `path`) — lo suggerisce. NON inizia con ❌ (lo antepone il chiamante)."""
+    parts = [f"A «{tool_name}» mancano argomenti obbligatori: {', '.join(missing)}."]
+    if unknown:
+        parts.append(f"Ho ignorato chiavi non previste: {', '.join(unknown)}.")
+        hints: list[str] = []
+        for miss in missing:
+            aliases = _ARG_ALIASES.get(miss, set())
+            for unk in unknown:
+                ul = unk.lower()
+                if (ul in aliases or miss in ul or ul in miss) and f"«{unk}»→«{miss}»" not in hints:
+                    hints.append(f"«{unk}»→«{miss}»")
+        if hints:
+            parts.append("Forse: " + ", ".join(hints) + "?")
+    parts.append("Gli strumenti sono stateless: a ogni chiamata includi sempre TUTTI gli "
+                 "argomenti obbligatori, coi nomi esatti dello schema.")
+    return " ".join(parts)
+
 
 def _coerce(value: Any, schema_type: str | None) -> Any:
     """Riallinea un argomento al tipo dichiarato dallo schema quando il modello invia
@@ -97,6 +125,7 @@ class Tool:
     _accepts: frozenset = field(init=False, repr=False, compare=False)
     _var_kw: bool = field(init=False, repr=False, compare=False)
     _types: dict = field(init=False, repr=False, compare=False)
+    _required: tuple = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         # Precalcola parametri accettati (per scartare quelli inventati) e i loro tipi
@@ -107,13 +136,21 @@ class Tool:
         self._accepts = frozenset(sig.parameters)  # include 'ctx', innocuo
         props = (self.parameters or {}).get("properties", {})
         self._types = {k: v.get("type") for k, v in props.items() if isinstance(v, dict)}
+        # Argomenti che la FUNZIONE richiede davvero: dichiarati 'required' nello schema,
+        # presenti nella firma e SENZA default. Solo la loro assenza impedisce la chiamata
+        # → errore azionabile, senza falsi positivi su argomenti che hanno già un default.
+        req = (self.parameters or {}).get("required", []) or []
+        self._required = tuple(
+            r for r in req
+            if r in sig.parameters and sig.parameters[r].default is inspect.Parameter.empty
+        )
 
     def __call__(self, ctx: ToolContext, **kwargs) -> str:
-        # 1) Coercizione dei tipi sugli argomenti previsti; 2) scarto tollerante di
-        # quelli non previsti (un kwarg inventato non deve far fallire la chiamata: il
-        # tool gira e si segnala cosa è stato ignorato). NB: un argomento OBBLIGATORIO
-        # mancante dà comunque errore a valle (TypeError), quindi i refusi seri restano
-        # visibili. Se il tool accetta **kwargs, ci fidiamo e passiamo tutto.
+        # 1) Coercizione dei tipi sugli argomenti previsti; 2) scarto tollerante di quelli
+        # non previsti (un kwarg inventato non deve far fallire la chiamata: il tool gira e
+        # si segnala cosa è stato ignorato); 3) se manca un argomento OBBLIGATORIO si solleva
+        # un ToolError azionabile PRIMA di chiamare la funzione (vedi sotto). Se il tool
+        # accetta **kwargs, ci fidiamo e passiamo tutto.
         if self._var_kw:
             return self.func(ctx, **kwargs)
         clean: dict[str, Any] = {}
@@ -124,6 +161,12 @@ class Tool:
                 continue
             t = self._types.get(k)
             clean[k] = _coerce(v, t) if t else v
+        # Argomento obbligatorio mancante (spesso il modello manda `filename` invece di
+        # `path`, o lo omette nei contesti lunghi): errore azionabile che nomina cosa manca
+        # e le chiavi scartate, invece di un TypeError grezzo che non dice quale chiave usare.
+        missing = [r for r in self._required if r not in clean]
+        if missing:
+            raise ToolError(_missing_args_message(self.name, missing, unknown))
         out = self.func(ctx, **clean)
         if unknown:
             out = f"ℹ️ Argomenti ignorati (non previsti da {self.name}): {', '.join(unknown)}.\n" + out

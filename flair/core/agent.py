@@ -25,6 +25,7 @@ import hashlib
 import json
 import logging
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 
 from ..llm import LLMProvider, LLMResponse, ToolCall, Usage, is_context_overflow
@@ -231,9 +232,15 @@ class Agent:
                 step += 1
                 self.convo.messages.append(self._assistant_msg(resp))
                 try:
-                    for tc in resp.tool_calls:
-                        output, _ok = self._run_tool(tc, recent)
-                        self.convo.messages.append({"role": "tool", "tool_call_id": tc.id, "content": output})
+                    if self._should_parallelize(resp.tool_calls):
+                        # Batch di soli tool read-only e indipendenti → esecuzione
+                        # concorrente (latenza ridotta su letture/ricerche/explore). Append,
+                        # callback e usage restano nel thread principale, in ordine.
+                        self._run_batch_parallel(resp.tool_calls, recent)
+                    else:
+                        for tc in resp.tool_calls:
+                            output, _ok = self._run_tool(tc, recent)
+                            self.convo.messages.append({"role": "tool", "tool_call_id": tc.id, "content": output})
                 except StoppedByUser:
                     self._answer_unanswered(resp)
                     return AgentResult("", self._fold_delegated(turn_usage), step, "stopped")
@@ -446,6 +453,120 @@ class Agent:
             ],
         }
 
+    @staticmethod
+    def _sig(name: str, args: dict) -> str:
+        """Firma stabile di una chiamata (nome + argomenti) per il rilevamento dei loop."""
+        return hashlib.md5(json.dumps([name, args], sort_keys=True, default=str).encode()).hexdigest()[:12]
+
+    @staticmethod
+    def _raw_args_error(name: str) -> str:
+        """Messaggio azionabile quando gli argomenti sono ininterpretabili (di solito
+        troncati perché l'output era troppo lungo)."""
+        return (
+            f"❌ Non sono riuscito a interpretare gli argomenti di «{name}»: probabilmente "
+            "sono stati troncati perché l'output era troppo lungo (di solito quando si "
+            "scrive un file molto grande in una sola chiamata). Riprova con un contenuto "
+            "più conciso, oppure scrivi il file in più parti: prima write_file con la "
+            "prima parte, poi le successive con write_file e append=true."
+        )
+
+    def _execute_pure(self, name: str, args: dict) -> tuple[str, bool, Usage]:
+        """Esecuzione PURA di un tool, senza stato condiviso: usa un ToolContext ISOLATO
+        (così i tool che delegano — explore — sommano l'usage su un canale proprio, mai
+        in race con altri worker), non tocca self e non chiama callback. Pensata per
+        girare in un thread del pool. Ritorna (output, ok, usage_delegato)."""
+        t = self.toolset.get(name)
+        ctx = ToolContext(cfg=self.cfg, provider=self.provider)
+        ctx.delegated_usage = Usage()
+        try:
+            out = t(ctx, **args)
+            ok = not out.startswith("❌")
+        except ToolError as exc:
+            out, ok = f"❌ {exc}", False
+        except TypeError as exc:
+            out, ok = f"❌ Argomenti non validi per {name}: {exc}", False
+        except Exception as exc:  # noqa: BLE001
+            out, ok = f"❌ Errore in {name}: {type(exc).__name__}: {exc}", False
+            log.exception("Errore inatteso nel tool %s", name)
+        return out, ok, (ctx.delegated_usage or Usage())
+
+    def _should_parallelize(self, tcs: list[ToolCall]) -> bool:
+        """Vero solo se conviene ed è SICURO eseguire il batch in parallelo: più di una
+        chiamata e OGNI tool non distruttivo (read-only). Così niente gate di approvazione
+        concorrente, niente dipendenze d'ordine (es. due edit sullo stesso file) e niente
+        effetti collaterali da serializzare. Batch con anche un solo tool distruttivo, o
+        singoli, restano sequenziali: comportamento identico a prima."""
+        if not getattr(self.cfg, "parallel_tools", True) or len(tcs) < 2:
+            return False
+        for tc in tcs:
+            if "_raw" in tc.arguments:
+                continue                       # errore gestito a valle, non esegue nulla
+            t = self.toolset.get(tc.name)
+            if t is None:
+                continue                       # sconosciuto: errore a valle, non esegue
+            if t.destructive:
+                return False
+        return True
+
+    def _run_batch_parallel(self, tcs: list[ToolCall], recent: dict[str, int]) -> None:
+        """Esegue in parallelo un batch di tool tutti non distruttivi e indipendenti.
+        I worker fanno SOLO esecuzione pura (ctx isolato); TUTTO ciò che tocca stato
+        condiviso — contatori anti-loop, callback UI, append dei messaggi, somma
+        dell'usage — avviene qui nel thread principale, IN ORDINE. Niente callback dai
+        thread → nessun output interlacciato né associazione errata dei risultati. I
+        messaggi 'tool' sono accodati nell'ordine delle tool_call (non di completamento),
+        preservando il pairing dell'API e una trascrizione deterministica."""
+        cap = max(1, int(getattr(self.cfg, "parallel_tools_max_workers", 8) or 8))
+        # Pre-fase (in ordine): chi non esegue nulla (argomenti illeggibili / tool
+        # sconosciuto) ha un output di errore pronto; gli altri vanno eseguiti, e solo
+        # per loro si incrementa il contatore anti-loop (come nel percorso sequenziale).
+        precomputed: dict[str, str] = {}
+        to_run: list[ToolCall] = []
+        for tc in tcs:
+            if "_raw" in tc.arguments:
+                precomputed[tc.id] = self._raw_args_error(tc.name)
+            elif self.toolset.get(tc.name) is None:
+                precomputed[tc.id] = f"❌ Tool sconosciuto: {tc.name}"
+            else:
+                sig = self._sig(tc.name, tc.arguments)
+                recent[sig] = recent.get(sig, 0) + 1
+                to_run.append(tc)
+
+        results: dict[str, tuple[str, bool, Usage]] = {}
+        if to_run:
+            pool = ThreadPoolExecutor(max_workers=min(len(to_run), cap))
+            try:
+                futs = {pool.submit(self._execute_pure, tc.name, tc.arguments): tc for tc in to_run}
+                try:
+                    for f in as_completed(futs):
+                        results[futs[f].id] = f.result()
+                except BaseException:
+                    # Ctrl-C nel thread principale: annulla i pendenti e rilancia. I worker
+                    # già in esecuzione sono PURI (nessuna scrittura su stato condiviso né a
+                    # video) → finiscono in background innocui, il loro esito viene scartato.
+                    for f in futs:
+                        f.cancel()
+                    raise
+            finally:
+                pool.shutdown(wait=False)
+
+        # Report (in ordine, main thread): callback appaiati per-tool (così l'handler che
+        # aggiorna l'ultimo elemento resta corretto), append e somma dell'usage delegato.
+        delegated = Usage()
+        for tc in tcs:
+            if self.on_tool:
+                self.on_tool(tc.name, tc.arguments)
+            if tc.id in precomputed:
+                out, ok = precomputed[tc.id], False
+            else:
+                out, ok, used = results[tc.id]
+                delegated = delegated + used
+            if self.on_result:
+                self.on_result(tc.name, out, ok)
+            self.convo.messages.append({"role": "tool", "tool_call_id": tc.id, "content": out})
+        if delegated != Usage():
+            self.ctx.delegated_usage = (self.ctx.delegated_usage or Usage()) + delegated
+
     def _run_tool(self, tc: ToolCall, recent: dict[str, int]) -> tuple[str, bool]:
         name, args = tc.name, tc.arguments
         if self.on_tool:
@@ -457,13 +578,7 @@ class Agent:
         # una sola chiamata). Diamo al modello un messaggio azionabile, prima del gate
         # di approvazione, così smette di ripetere la stessa chiamata destinata a fallire.
         if "_raw" in args:
-            out = (
-                f"❌ Non sono riuscito a interpretare gli argomenti di «{name}»: probabilmente "
-                "sono stati troncati perché l'output era troppo lungo (di solito quando si "
-                "scrive un file molto grande in una sola chiamata). Riprova con un contenuto "
-                "più conciso, oppure scrivi il file in più parti: prima write_file con la "
-                "prima parte, poi le successive con write_file e append=true."
-            )
+            out = self._raw_args_error(name)
             if self.on_result:
                 self.on_result(name, out, False)
             return out, False
@@ -475,7 +590,7 @@ class Agent:
                 self.on_result(name, out, False)
             return out, False
 
-        sig = hashlib.md5(json.dumps([name, args], sort_keys=True, default=str).encode()).hexdigest()[:12]
+        sig = self._sig(name, args)
         recent[sig] = recent.get(sig, 0) + 1
 
         if t.destructive and not self.cfg.auto_approve and self.approve:

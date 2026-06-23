@@ -111,6 +111,13 @@ class Config:
     # Loop agentico
     max_steps: int = 60
     explorer_max_steps: int = 20
+    # Esecuzione concorrente dei tool: quando il modello emette più tool call in un
+    # turno e sono TUTTE non distruttive (read-only), vengono eseguite in parallelo
+    # (latenza ridotta su letture/ricerche/explore). I batch con tool distruttivi, o
+    # singoli, restano sequenziali. L'output è identico (stesso ordine): cambia solo la
+    # velocità. parallel_tools=False forza il vecchio comportamento sequenziale.
+    parallel_tools: bool = True
+    parallel_tools_max_workers: int = 8     # tetto di thread per batch (evita di saturare la rete)
 
     # Gestione del contesto (compaction)
     context_window: int = 120_000
@@ -207,6 +214,8 @@ def load_config() -> Config:
         stream=_bool("FLAIR_STREAM", True),
         max_steps=_int("FLAIR_MAX_STEPS", 60),
         explorer_max_steps=_int("FLAIR_EXPLORER_MAX_STEPS", 20),
+        parallel_tools=_bool("FLAIR_PARALLEL_TOOLS", True),
+        parallel_tools_max_workers=_int("FLAIR_PARALLEL_TOOLS_MAX", 8),
         context_window=_int("FLAIR_CONTEXT_WINDOW", 120_000),
         compact_threshold_ratio=_float("FLAIR_COMPACT_RATIO", 0.75),
         compact_keep_recent=_int("FLAIR_COMPACT_KEEP", 8),

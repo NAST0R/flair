@@ -2141,6 +2141,104 @@ def test_automation_helpers():
     check("json: budget → ok false", build_result_json("coding", "t", res2, [], 0.0)["ok"] is False)
 
 
+def test_parallel_tools():
+    import time
+
+    from flair.core.agent import Agent
+    from flair.core.tool import Tool, Toolset
+    NOOBJ = {"type": "object", "properties": {}, "required": []}
+
+    def agent_with(tools, script, **kw):
+        cfg = cfg_for(Path("."))
+        cfg.context_window = 10_000_000      # niente compaction
+        cfg.stream = False
+        return Agent("coding", cfg, FakeProvider(script), Toolset(tools), "sys",
+                     conversation=Conversation(), **kw)
+
+    def slow(nm, delay):
+        def f(ctx):
+            time.sleep(delay)
+            return f"out-{nm}"
+        return Tool(nm, nm, NOOBJ, f, destructive=False)
+
+    def tool_calls_resp(calls):
+        return LLMResponse(tool_calls=calls, finish_reason="tool_calls")
+    done_resp = LLMResponse(content="done", finish_reason="stop")   # usage 0: non sporca i conteggi
+
+    # 1) Happy path: 3 tool read-only; append nell'ORDINE delle tool_call anche se il
+    #    completamento è fuori ordine (il primo dorme di più).
+    calls = [tc("a"), tc("b"), tc("c")]
+    ag = agent_with([slow("a", 0.03), slow("b", 0.01), slow("c", 0.0)], [tool_calls_resp(calls)])
+    ag.run("vai")
+    tmsgs = [m for m in ag.convo.messages if m.get("role") == "tool"]
+    check("parallel: tutti i risultati presenti", len(tmsgs) == 3)
+    check("parallel: append nell'ordine delle tool_call (non di completamento)",
+          [m["tool_call_id"] for m in tmsgs] == [c.id for c in calls])
+    check("parallel: contenuti corretti", [m["content"] for m in tmsgs] == ["out-a", "out-b", "out-c"])
+
+    # 2) Usage delegato (come explore): N tool deleganti in parallelo → somma ESATTA,
+    #    nessuna perdita (ogni worker usa un ctx isolato). Lo sleep allarga la finestra
+    #    in cui un canale condiviso perderebbe aggiornamenti.
+    def deleg(nm):
+        def f(ctx):
+            time.sleep(0.005)
+            ctx.delegated_usage = (ctx.delegated_usage or Usage()) + Usage(total_tokens=1, completion_tokens=1)
+            return f"ok-{nm}"
+        return Tool(nm, nm, NOOBJ, f, destructive=False)
+    n = 8
+    calls = [tc(f"d{i}") for i in range(n)]
+    ag = agent_with([deleg(f"d{i}") for i in range(n)], [tool_calls_resp(calls), done_resp])
+    ag.run("vai")
+    check("parallel: usage delegato sommato senza perdite",
+          ag.convo.total_usage.total_tokens == n, f"atteso {n}, ottenuto {ag.convo.total_usage.total_tokens}")
+
+    # 3) Batch con un tool DISTRUTTIVO → resta sequenziale: il gate di approvazione scatta
+    #    (in parallelo non potrebbe), l'ordine è preservato e lo 'stop' funziona.
+    ran = []
+    def rec(nm, destr):
+        def f(ctx):
+            ran.append(nm)
+            return f"out-{nm}"
+        return Tool(nm, nm, NOOBJ, f, destructive=destr)
+    cfg = cfg_for(Path("."))
+    cfg.context_window = 10_000_000
+    cfg.stream = False
+    cfg.auto_approve = False
+    approvals = []
+    calls = [tc("r"), tc("w")]
+    ag = Agent("coding", cfg, FakeProvider([tool_calls_resp(calls)]),
+               Toolset([rec("r", False), rec("w", True)]), "sys", conversation=Conversation(),
+               approve=lambda name, args: (approvals.append(name), "stop")[1])
+    res = ag.run("vai")
+    check("parallel: batch con distruttivo resta sequenziale (approval invocato)", approvals == ["w"], str(approvals))
+    check("parallel: stop sul distruttivo → stopped", res.stopped_reason == "stopped", res.stopped_reason)
+    check("parallel: read-only prima del distruttivo eseguito (ordine sequenziale)", ran == ["r"], str(ran))
+
+    # 4) Associazione corretta risultato↔tool (il bug del tentativo precedente): handler
+    #    stile CLI (append in on_tool, aggiorna l'ultimo in on_result).
+    turn_tools = []
+    calls = [tc("x"), tc("y"), tc("z")]
+    ag = agent_with([slow("x", 0.02), slow("y", 0.005), slow("z", 0.0)], [tool_calls_resp(calls)],
+                    on_tool=lambda name, args: turn_tools.append({"name": name}),
+                    on_result=lambda name, output, ok: turn_tools[-1].update(result_of=name) if turn_tools else None)
+    ag.run("vai")
+    mism = [t for t in turn_tools if t.get("name") != t.get("result_of")]
+    check("parallel: callback appaiati → nessun risultato associato al tool sbagliato", not mism, str(turn_tools))
+
+    # 5) parallel_tools=False → percorso sequenziale, comunque corretto e in ordine.
+    cfg = cfg_for(Path("."))
+    cfg.context_window = 10_000_000
+    cfg.stream = False
+    cfg.parallel_tools = False
+    calls = [tc("a"), tc("b")]
+    ag = Agent("coding", cfg, FakeProvider([tool_calls_resp(calls)]),
+               Toolset([slow("a", 0.0), slow("b", 0.0)]), "sys", conversation=Conversation())
+    ag.run("vai")
+    tmsgs = [m for m in ag.convo.messages if m.get("role") == "tool"]
+    check("parallel: flag off → sequenziale, risultati in ordine",
+          [m["tool_call_id"] for m in tmsgs] == [c.id for c in calls])
+
+
 def main():
     test_arg_parse()
     test_usage_normalization()
@@ -2158,6 +2256,7 @@ def main():
     test_overflow_retry()
     test_web_search()
     test_session_persistence()
+    test_parallel_tools()
     test_cli_session_roundtrip()
     test_shared_memory()
     test_router_llm()

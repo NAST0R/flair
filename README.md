@@ -281,4 +281,4 @@ python tests/evals/run_evals.py --self-test  # exercise the runner with no netwo
 
 ## License
 
-Personal use.
+Released under the MIT License. See [`LICENSE`](LICENSE) for details.

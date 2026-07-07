@@ -1253,9 +1253,18 @@ def test_powershell_temp_cleanup():
     check("ps cleanup: TimeoutExpired propagato", raised and cap["existed_to"] is True)
     check("ps cleanup: file CANCELLATO anche dopo timeout", not os.path.exists(cap["path_to"]))
 
-    # 3) PowerShell assente (sandbox): il tool risponde con errore pulito, niente crash.
+    # 3) PowerShell assente: il tool risponde con errore pulito, niente crash. Forziamo
+    #    l'assenza (FileNotFoundError) così il test è deterministico su OGNI piattaforma —
+    #    anche dove PowerShell/pwsh È installato, es. i runner CI Linux.
     from flair.tools import system as st
-    out = st.run_powershell(ToolContext(cfg=cfg_for(Path("."))), script="Write-Output hi", timeout=5)
+
+    def fake_missing(args, **kw):
+        raise FileNotFoundError(2, "No such file or directory", args[0])
+    shell.subprocess.run = fake_missing
+    try:
+        out = st.run_powershell(ToolContext(cfg=cfg_for(Path("."))), script="Write-Output hi", timeout=5)
+    finally:
+        shell.subprocess.run = real_run
     check("ps cleanup: errore pulito se PowerShell assente", out.startswith("❌"), out)
 
 
@@ -2239,6 +2248,36 @@ def test_parallel_tools():
           [m["tool_call_id"] for m in tmsgs] == [c.id for c in calls])
 
 
+def test_atomic_writes():
+    import os as _os
+    import tempfile as _tf
+
+    from flair.tools import fs
+    d = Path(_tf.mkdtemp(prefix="flair_atomic_"))
+    f = d / "code.py"
+
+    # Creazione (file nuovo): scrittura diretta, contenuto corretto.
+    fs.write_file_impl(None, str(f), "v1\n")
+    check("atomic: creazione contenuto", f.read_text() == "v1\n")
+
+    # Sovrascrittura di file esistente → atomica; contenuto aggiornato, nessun .tmp residuo.
+    fs.write_file_impl(None, str(f), "v2 molto piu lungo\n")
+    check("atomic: sovrascrittura contenuto", f.read_text() == "v2 molto piu lungo\n")
+    check("atomic: nessun .tmp dopo sovrascrittura", not list(d.glob(".*.tmp")))
+
+    # Edit di file esistente → atomico; nessun .tmp residuo.
+    fs.edit_file_impl(None, str(f), "v2 molto piu lungo", "v3")
+    check("atomic: edit contenuto", f.read_text() == "v3\n")
+    check("atomic: nessun .tmp dopo edit", not list(d.glob(".*.tmp")))
+
+    # Su POSIX i permessi del file esistente vanno preservati dopo un edit atomico.
+    if _os.name != "nt":
+        _os.chmod(f, 0o640)
+        fs.edit_file_impl(None, str(f), "v3", "v4")
+        check("atomic: permessi preservati dopo edit (POSIX)", (f.stat().st_mode & 0o777) == 0o640,
+              oct(f.stat().st_mode & 0o777))
+
+
 def main():
     test_arg_parse()
     test_usage_normalization()
@@ -2289,6 +2328,7 @@ def main():
     test_truncated_args_guidance()
     test_finish_reason_truncation_note()
     test_write_file_append()
+    test_atomic_writes()
     test_repo_map()
     test_repo_map_languages()
     test_explore_subagent()

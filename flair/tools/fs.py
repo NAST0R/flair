@@ -11,6 +11,9 @@ agenti, evitando duplicazione: cambia solo il `root` passato.
 
 from __future__ import annotations
 
+import contextlib
+import os
+import tempfile
 from pathlib import Path
 
 from ..core.tool import ToolError
@@ -184,6 +187,26 @@ def apply_edit(text: str, old: str, new: str, replace_all: bool = False) -> tupl
     )
 
 
+def _atomic_write(p: Path, content: str) -> None:
+    """Scrittura ATOMICA di un file esistente: file temporaneo nella STESSA cartella +
+    os.replace (atomico anche su Windows). Un crash o un'interruzione a metà scrittura non
+    lascia mai il file monco: resta il vecchio o c'è il nuovo completo. Preserva i permessi
+    del file originale (su Windows è un no-op innocuo). Pensata per sovrascritture/edit,
+    dove c'è del contenuto da NON perdere; la creazione di file nuovi resta scrittura diretta.
+    """
+    fd, tmp = tempfile.mkstemp(dir=p.parent, prefix=f".{p.name}-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(content)
+        with contextlib.suppress(OSError):
+            os.chmod(tmp, os.stat(p).st_mode & 0o7777)  # preserva i permessi del file esistente
+        os.replace(tmp, p)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+
+
 def read_file_impl(root: Path | None, path: str, offset: int, limit: int | None, max_chars: int) -> str:
     p = resolve(root, path)
     if not p.exists():
@@ -254,7 +277,10 @@ def write_file_impl(root: Path | None, path: str, content: str, append: bool = F
         with p.open("a", encoding="utf-8") as fh:
             fh.write(content)
         return f"✓ Aggiunto in coda a {display(root, p)} ({len(content)} caratteri)."
-    p.write_text(content, encoding="utf-8")
+    if existed:
+        _atomic_write(p, content)   # sovrascrittura ATOMICA: protegge il contenuto preesistente
+    else:
+        p.write_text(content, encoding="utf-8")  # file nuovo: nessun dato pregresso a rischio
     verb = "Sovrascritto" if existed else "Creato"
     return f"✓ {verb} {display(root, p)} ({len(content)} caratteri)."
 
@@ -273,6 +299,6 @@ def edit_file_impl(root: Path | None, path: str, old_string: str, new_string: st
     new_text, strategy = apply_edit(text, old_string, new_string, replace_all)
     if new_text == text:
         return f"⚠️ Nessuna modifica: il risultato è identico a {display(root, p)}."
-    p.write_text(new_text, encoding="utf-8")
+    _atomic_write(p, new_text)   # il file esiste: scrittura atomica, così un crash non lo corrompe
     note = "" if strategy == "esatto" else f" [match: {strategy}]"
     return f"✓ Modificato {display(root, p)}{note}."

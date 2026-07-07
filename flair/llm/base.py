@@ -46,7 +46,7 @@ except Exception:  # pragma: no cover
 # di rete a metà stream sfugge al fallback e fa crashare il programma.
 try:
     import httpx
-    _HTTPX_TRANSIENT: tuple[type[BaseException], ...] = (httpx.TransportError,)
+    _HTTPX_TRANSIENT: tuple[type[Exception], ...] = (httpx.TransportError,)
 except Exception:  # pragma: no cover
     _HTTPX_TRANSIENT = ()
 
@@ -54,7 +54,9 @@ log = logging.getLogger(__name__)
 
 _MAX_RETRIES = 3
 _BACKOFF = (1.0, 2.0, 4.0)
-_TRANSIENT = (APITimeoutError, APIConnectionError, RateLimitError, InternalServerError, *_HTTPX_TRANSIENT)
+_TRANSIENT: tuple[type[Exception], ...] = (
+    APITimeoutError, APIConnectionError, RateLimitError, InternalServerError, *_HTTPX_TRANSIENT,
+)
 
 _OVERFLOW_RX = re.compile(
     r"context length|maximum context|context window|too many tokens|"

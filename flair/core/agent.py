@@ -11,7 +11,7 @@ Efficienza e robustezza sui token:
 - COMPACTION: quando il contesto supera una soglia (frazione della finestra del
   modello) la parte vecchia viene riassunta in UN messaggio e si riparte con un
   nuovo prefisso stabile. Si paga il cache-miss una volta per compaction, non a
-  ogni turno. È l'opposto del vecchio Flair, che mutava il prefisso ogni turno.
+  ogni turno — a differenza degli approcci naïf che invalidano la cache a ogni turno.
 - La dimensione del contesto è misurata in modo esatto dai prompt_tokens
   restituiti dall'API (più una stima per i messaggi accodati dopo l'ultima
   chiamata): niente tokenizer da installare.
@@ -65,7 +65,7 @@ class AgentResult:
     content: str
     usage: Usage = field(default_factory=Usage)
     steps: int = 0
-    stopped_reason: str = "done"   # done | max_steps | loop | stopped
+    stopped_reason: str = "done"   # done | max_steps | loop | stopped | budget
     truncated: bool = False        # True se la risposta finale è stata tagliata dal limite di output
 
 
@@ -476,6 +476,8 @@ class Agent:
         in race con altri worker), non tocca self e non chiama callback. Pensata per
         girare in un thread del pool. Ritorna (output, ok, usage_delegato)."""
         t = self.toolset.get(name)
+        if t is None:  # invariante garantita dal chiamante; guardia esplicita per sicurezza e tipi
+            return f"❌ Tool sconosciuto: {name}", False, Usage()
         ctx = ToolContext(cfg=self.cfg, provider=self.provider)
         ctx.delegated_usage = Usage()
         try:

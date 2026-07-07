@@ -2278,6 +2278,133 @@ def test_atomic_writes():
               oct(f.stat().st_mode & 0o777))
 
 
+def test_session_memory():
+    import io as _io
+    import tempfile as _tf
+
+    from rich.console import Console
+
+    from flair.memory import SessionMemory
+
+    # ── modulo: add, dedup, filtri, tetto ────────────────────────────────────
+    m = SessionMemory(max_chars=4000)
+    ok, _ = m.add("I test si lanciano con `python tests/test_smoke.py`")
+    check("memoria: add ok", ok and len(m.notes) == 1)
+    ok, msg = m.add("  i test SI lanciano   con `python tests/test_smoke.py` ")
+    check("memoria: dedup (case/spazi)", not ok and "già in memoria" in msg, msg)
+    ok, msg = m.add("la chiave è sk-abcdef1234567890abcd")
+    check("memoria: filtro segreti (sk-)", not ok and "segreti" in msg, msg)
+    ok, msg = m.add("api_key=xyz123segreto per il deploy")
+    check("memoria: filtro segreti (api_key=)", not ok, msg)
+    ok, msg = m.add("x" * 300)
+    check("memoria: nota troppo lunga rifiutata", not ok and "troppo lunga" in msg, msg)
+    piccolo = SessionMemory(max_chars=200)
+    piccolo.add("nota uno abbastanza lunga da occupare spazio nel tetto totale qui")
+    piccolo.add("nota due abbastanza lunga da occupare spazio nel tetto totale qui")
+    ok, msg = piccolo.add("nota tre che non deve entrare perché il tetto è stato raggiunto")
+    check("memoria: tetto totale → rifiuto azionabile", not ok and "piena" in msg, msg)
+
+    # ── blocco per il prompt ─────────────────────────────────────────────────
+    check("memoria: vuota → blocco vuoto (zero token)", SessionMemory().block() == "")
+    blk = m.block()
+    check("memoria: blocco con header e note",
+          "## Memoria di sessione" in blk and "test_smoke.py" in blk, blk[:80])
+
+    # ── serializzazione: roundtrip, dedup difensivo, manomissioni ────────────
+    m.add("In questo repo i file devono essere LF")
+    testo = m.to_text()
+    m2 = SessionMemory()
+    n, trunc = m2.load_text(testo)
+    check("memoria: roundtrip sidecar", n == 2 and not trunc and m2.notes == m.notes)
+    m.notes.append(m.notes[0])                      # doppione teorico da batch parallelo
+    check("memoria: to_text() ripulisce i doppioni", m.to_text().count("test_smoke.py") == 1)
+    manomesso = ("# commento\n- nota valida\n- " + "y" * 500 + "\nriga ignorata\n"
+                 "- password=hunter2 da saltare\n- nota valida\n")
+    m3 = SessionMemory(max_chars=4000, max_note_chars=100)
+    n, trunc = m3.load_text(manomesso)
+    check("memoria: load tollerante (tronca lunghe, salta segreti, dedup)",
+          n == 2 and trunc and len(m3.notes[1]) == 100, str((n, trunc)))
+    stretto = SessionMemory(max_chars=210)
+    n, trunc = stretto.load_text("- " + "a" * 90 + "\n- " + "b" * 90 + "\n- " + "c" * 90 + "\n")
+    check("memoria: load oltre il tetto → troncato con flag", n == 2 and trunc, str((n, trunc)))
+
+    # ── SessionStore: sidecar atomico, rimozione a vuoto ─────────────────────
+    from flair.session_store import SessionStore
+    d = Path(_tf.mkdtemp(prefix="flair_mem_"))
+    st = SessionStore(d)
+    st.save_memory("lavoro", m2.to_text())
+    check("store: sidecar scritto", (d / "lavoro.memory.md").exists())
+    check("store: load_memory roundtrip", "LF" in st.load_memory("lavoro"))
+    check("store: nessun .tmp residuo", not list(d.glob("*.tmp")) and not list(d.glob(".*.tmp")))
+    st.save_memory("lavoro", "")
+    check("store: memoria vuota → sidecar rimosso", not (d / "lavoro.memory.md").exists())
+    check("store: load di sidecar assente → ''", st.load_memory("mai-esistita") == "")
+
+    # ── agente: tool remember, anche in batch parallelo (ctx isolati) ────────
+    from flair.agents import coding as ca
+    cfg = cfg_for(Path("."))
+    cfg.context_window = 10_000_000
+    cfg.stream = False
+    ag = ca.build(cfg, FakeProvider([
+        LLMResponse(tool_calls=[tc("remember", note="Fatto A sul progetto"),
+                                tc("remember", note="Fatto B sul progetto"),
+                                tc("remember", note="fatto a SUL progetto")],   # dup di A
+                    finish_reason="tool_calls"),
+        LLMResponse(content="fine", finish_reason="stop"),
+    ]), conversation=Conversation())
+    mem = SessionMemory()
+    ag.ctx.memory = mem
+    ag.run("ricorda queste cose")
+    check("memoria: remember via agente (batch parallelo, ctx isolati)",
+          sorted(mem.notes) == ["Fatto A sul progetto", "Fatto B sul progetto"], str(mem.notes))
+
+    cfg_ro = cfg_for(Path("."))
+    cfg_ro.read_only = True
+    names_ro = {sc["function"]["name"] for sc in ca.build(cfg_ro, FakeProvider([]), conversation=Conversation()).toolset.schemas()}
+    check("memoria: remember disponibile in read-only", "remember" in names_ro, str(sorted(names_ro)))
+    cfg_off = cfg_for(Path("."))
+    cfg_off.memory_enabled = False
+    names_off = {sc["function"]["name"] for sc in ca.build(cfg_off, FakeProvider([]), conversation=Conversation()).toolset.schemas()}
+    check("memoria: flag off → tool assente (zero schema)", "remember" not in names_off)
+    from flair.agents import general as ga
+    names_gen = {sc["function"]["name"] for sc in ga.build(cfg, FakeProvider([]), conversation=Conversation()).toolset.schemas()}
+    check("memoria: remember anche nell'agente generico", "remember" in names_gen)
+    from flair.tools.memory import remember as rem_tool
+    out = rem_tool.func(ToolContext(cfg=cfg), note="qualcosa")
+    check("memoria: ctx senza memoria → errore pulito", out.startswith("❌"), out)
+
+    # ── CLI end-to-end: iniezione, save/load, /reset conserva, clear ─────────
+    from flair.cli import CLI
+    cfg2 = cfg_for(Path("."))
+    cfg2.session_dir = d
+    cli = CLI(cfg2)
+    cli.console = Console(file=_io.StringIO())
+    base_len = len(cli.agents["coding"].system_prompt)
+    cli.memory.add("Il comando di build è `make all`")
+    check("cli: remember NON riscrive il prompt in corso (cache preservata)",
+          len(cli.agents["coding"].system_prompt) == base_len)
+    cli.session_name = "memtest"
+    cli._save_session()
+    check("cli: /save scrive il sidecar", (d / "memtest.memory.md").exists())
+    cli2 = CLI(cfg2)
+    cli2.console = Console(file=_io.StringIO())
+    check("cli: sessione nuova → memoria vuota, prompt base", cli2.memory.notes == []
+          and "## Memoria di sessione" not in cli2.agents["coding"].system_prompt)
+    check("cli: /load ripristina la memoria", cli2._load_session("memtest") and
+          cli2.memory.notes == ["Il comando di build è `make all`"])
+    check("cli: dopo /load il prompt contiene il blocco (entrambi gli agenti)",
+          all("make all" in ag.system_prompt for ag in cli2.agents.values()))
+    cli2.convo.reset()   # è ciò che fa /reset: la memoria resta
+    check("cli: /reset conserva la memoria", cli2.memory.notes != [] and
+          "make all" in cli2.agents["coding"].system_prompt)
+    cli2.memory.clear()
+    cli2._refresh_memory_prompts()
+    cli2._save_session()
+    check("cli: clear → blocco rimosso dal prompt e sidecar cancellato",
+          "make all" not in cli2.agents["coding"].system_prompt
+          and not (d / "memtest.memory.md").exists())
+
+
 def main():
     test_arg_parse()
     test_usage_normalization()
@@ -2295,6 +2422,7 @@ def main():
     test_overflow_retry()
     test_web_search()
     test_session_persistence()
+    test_session_memory()
     test_parallel_tools()
     test_cli_session_roundtrip()
     test_shared_memory()

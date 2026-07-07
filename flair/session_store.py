@@ -36,6 +36,39 @@ class SessionStore:
     def _path(self, name: str) -> Path:
         return self.dir / f"{_safe_name(name)}.json"
 
+    def _memory_path(self, name: str) -> Path:
+        # Sidecar della memoria: accanto al JSON, non è un *.json → list() lo ignora.
+        return self.dir / f"{_safe_name(name)}.memory.md"
+
+    def save_memory(self, name: str, text: str) -> None:
+        """Persiste il sidecar della memoria (scrittura atomica). Testo vuoto →
+        rimuove il sidecar: una memoria svuotata non deve risorgere al prossimo load."""
+        p = self._memory_path(name)
+        try:
+            if not text.strip():
+                with contextlib.suppress(OSError):
+                    p.unlink()
+                return
+            self.dir.mkdir(parents=True, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(dir=self.dir, prefix=f".{p.stem}-", suffix=".tmp")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    fh.write(text)
+                os.replace(tmp, p)
+            except BaseException:
+                with contextlib.suppress(OSError):
+                    os.unlink(tmp)
+                raise
+        except OSError as exc:
+            log.warning("Salvataggio memoria di '%s' fallito: %s", name, exc)
+
+    def load_memory(self, name: str) -> str:
+        """Contenuto del sidecar della memoria, o '' se assente/illeggibile."""
+        try:
+            return self._memory_path(name).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return ""
+
     def save(self, name: str, state: dict) -> Path | None:
         try:
             self.dir.mkdir(parents=True, exist_ok=True)

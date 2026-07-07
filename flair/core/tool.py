@@ -113,6 +113,7 @@ class ToolContext:
     cfg: Any
     provider: Any = None    # per i tool che delegano a un sub-agente (es. explore)
     delegated_usage: Any = None  # usage riportato dai tool che delegano; l'agente lo somma a turno+sessione
+    memory: Any = None      # SessionMemory della sessione (tool `remember`); None = non disponibile
 
 
 @dataclass

@@ -480,6 +480,12 @@ class Agent:
             return f"❌ Tool sconosciuto: {name}", False, Usage()
         ctx = ToolContext(cfg=self.cfg, provider=self.provider)
         ctx.delegated_usage = Usage()
+        # Unica eccezione DELIBERATA alla purezza dei worker: la memoria di sessione è
+        # condivisa per riferimento (serve a `remember` anche nei batch paralleli).
+        # È sicura: list.append è atomico sotto il GIL; il caso patologico (due note
+        # identiche nello stesso batch che scavalcano il dedup) produce al più un
+        # doppione, ripulito alla serializzazione (SessionMemory.to_text).
+        ctx.memory = self.ctx.memory
         try:
             out = t(ctx, **args)
             ok = not out.startswith("❌")

@@ -21,3 +21,5 @@ Stile:
 - Spiega in breve cosa hai cambiato e perché. Niente preamboli inutili.
 
 Lavori entro la radice del progetto: tutti i path sono relativi ad essa.
+
+Se disponi del tool `remember`, usalo per appuntare fatti DUREVOLI e non ovvi utili nelle sessioni future (comandi del progetto, convenzioni, vincoli, preferenze dell'utente) — una riga per nota. MAI segreti o credenziali; MAI lo stato del lavoro in corso (vive già nella conversazione). Se scopri che una nota in memoria è superata, dillo all'utente.

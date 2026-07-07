@@ -144,6 +144,11 @@ class Config:
     log_dir: Path | None = None
     cost_warn: float = 0.0                  # avviso quando il costo sessione supera questa soglia (USD); 0 = off
     session_dir: Path | None = None         # dove salvare/riprendere le sessioni
+    # Memoria di sessione: fatti durevoli iniettati nel system prompt (prefisso
+    # stabile → cache) e persistiti come sidecar accanto al JSON di sessione.
+    # Vuota non inietta nulla; a False il tool `remember` non esiste proprio.
+    memory_enabled: bool = True
+    memory_max_chars: int = 4000            # tetto DURO del blocco memoria (~1k token)
 
     # Sicurezza
     auto_approve: bool = False
@@ -234,6 +239,8 @@ def load_config() -> Config:
         log_dir=Path(log_dir).expanduser().resolve() if log_dir else None,
         cost_warn=_float("FLAIR_COST_WARN", 0.0),
         session_dir=Path(os.getenv("FLAIR_SESSION_DIR", str(Path.home() / ".flair" / "sessions"))).expanduser().resolve(),
+        memory_enabled=_bool("FLAIR_MEMORY", True),
+        memory_max_chars=_int("FLAIR_MEMORY_MAX_CHARS", 4000),
         auto_approve=_bool("FLAIR_AUTO_APPROVE", False),
         read_only=_bool("FLAIR_READ_ONLY", False),
         max_cost=_float("FLAIR_MAX_COST", 0.0),

@@ -6,6 +6,7 @@ from .. import prompts
 from ..core.agent import Agent
 from ..core.tool import Toolset
 from ..tools import coding as coding_tools
+from ..tools import memory as memory_tools
 from ..tools import plan as plan_tools
 from ..tools import subagent as subagent_tools
 from ..tools import web as web_tools
@@ -17,6 +18,10 @@ def build(cfg, provider, conversation=None, **callbacks) -> Agent:
     # sub-agente in sola lettura (`explore`) + scaletta dei passi (`plan`) per
     # i task multi-step.
     tools = coding_tools.TOOLS + web_tools.TOOLS + [subagent_tools.explore, plan_tools.plan]
+    if getattr(cfg, "memory_enabled", True):
+        # Memoria di sessione: fatti durevoli che sopravvivono a compaction e riavvii.
+        # A flag spento il tool NON esiste (niente schema inviato al modello).
+        tools = [*tools, memory_tools.remember]
     if getattr(cfg, "read_only", False):
         # Esecuzione non presidiata: nessuna modifica al filesystem né comandi.
         tools = [t for t in tools if not t.destructive]

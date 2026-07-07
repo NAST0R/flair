@@ -29,6 +29,7 @@ from .core import router
 from .core.agent import Conversation
 from .core.tool import ToolError
 from .llm import Usage, create_provider
+from .memory import SessionMemory
 from .session_log import SessionLogger, setup_file_logging
 from .session_store import SessionStore
 from .tools import fs
@@ -133,6 +134,15 @@ class CLI:
             "coding": coding_agent.build(cfg, self.provider, conversation=self.convo, **self._callbacks()),
             "general": general_agent.build(cfg, self.provider, conversation=self.convo, **self._callbacks()),
         }
+        # Memoria di SESSIONE: fatti durevoli, ancorati alla sessione (non alla root).
+        # Condivisa per riferimento dai due agenti via ToolContext (tool `remember`);
+        # iniettata nel system prompt SOLO ai confini di sessione (qui, /load,
+        # /memory clear) così il prefisso in cache non si rompe mai a metà lavoro.
+        self.memory = SessionMemory(max_chars=cfg.memory_max_chars)
+        self._base_prompts = {k: ag.system_prompt for k, ag in self.agents.items()}
+        for ag in self.agents.values():
+            ag.ctx.memory = self.memory
+        self._refresh_memory_prompts()
 
     def _callbacks(self) -> dict:
         return dict(
@@ -158,10 +168,23 @@ class CLI:
     def _apply_root(self, new_root: Path) -> None:
         """Cambia la root a runtime (comando /root): aggiorna cfg.root, allinea la
         directory di processo e ricostruisce il coding agent per ricaricare le
-        istruzioni di progetto, preservando la memoria condivisa."""
+        istruzioni di progetto, preservando la memoria condivisa. La memoria di
+        SESSIONE non viene toccata: è ancorata alla sessione, non al percorso."""
         self.cfg.root = new_root
         self._chdir_root()
         self.agents["coding"] = coding_agent.build(self.cfg, self.provider, conversation=self.convo, **self._callbacks())
+        self._base_prompts["coding"] = self.agents["coding"].system_prompt
+        self.agents["coding"].ctx.memory = self.memory
+        self._refresh_memory_prompts()
+
+    def _refresh_memory_prompts(self) -> None:
+        """(Ri)compone i system prompt: base (prompt + istruzioni di progetto) + blocco
+        memoria. Da chiamare SOLO ai confini di sessione (avvio, /load, /memory clear,
+        /root): lì la cache del prefisso si rinnova comunque, quindi è gratis. Memoria
+        vuota o disabilitata → prompt base, zero caratteri in più."""
+        block = self.memory.block() if self.cfg.memory_enabled else ""
+        for key, ag in self.agents.items():
+            ag.system_prompt = self._base_prompts[key] + block
 
     # ── sessioni (persistenza) ────────────────────────────────────────────────
 
@@ -174,6 +197,9 @@ class CLI:
     def _save_session(self) -> None:
         if self.session_name:
             self.session.save(self.session_name, self._session_state())
+            if self.cfg.memory_enabled:
+                # Sidecar della memoria accanto al JSON (vuota → sidecar rimosso).
+                self.session.save_memory(self.session_name, self.memory.to_text())
 
     def _load_session(self, name: str) -> bool:
         state = self.session.load(name)
@@ -190,6 +216,15 @@ class CLI:
         self.convo.load(convo_state)
         self.last_agent = state.get("last_agent")
         self.session_name = name
+        # Ripristina la memoria della sessione (sidecar assente/illeggibile → vuota:
+        # le sessioni pre-memoria si caricano senza errori) e ricompone i prompt.
+        # Siamo a un confine di sessione: la cache del prefisso si rinnova comunque.
+        if self.cfg.memory_enabled:
+            _, truncated = self.memory.load_text(self.session.load_memory(name))
+            if truncated:
+                self.console.print("[yellow]⚠ memoria oltre il tetto: caricata troncata "
+                                   f"({self.memory.used_chars()}/{self.memory.max_chars} caratteri).[/yellow]")
+            self._refresh_memory_prompts()
         return True
 
     # ── callback UI ─────────────────────────────────────────────────────────
@@ -495,6 +530,7 @@ class CLI:
             ("/save [nome]", "salva la sessione (default: nome corrente)"),
             ("/load <nome>", "riprende una sessione salvata"),
             ("/sessions", "elenca le sessioni salvate"),
+            ("/memory [clear]", "mostra (o svuota) la memoria di sessione"),
             ("/reset", "azzera la conversazione condivisa"),
             ("/root <path>", "cambia la cartella di lavoro (coding + general; ricarica le istruzioni)"),
             ("/help", "questo aiuto"),
@@ -575,6 +611,37 @@ class CLI:
                 else:
                     body = "\n".join(f"  • {n}  [dim]{ts}[/dim]" for n, ts in items)
                     self.console.print(f"[dim]sessioni salvate:[/dim]\n{body}\n")
+                continue
+            if low.startswith("/memory"):
+                if not self.cfg.memory_enabled:
+                    self.console.print("[dim]memoria disabilitata (FLAIR_MEMORY=false).[/dim]\n")
+                    continue
+                arg = line.split(maxsplit=1)[1].strip().lower() if len(line.split(maxsplit=1)) == 2 else ""
+                if arg == "clear":
+                    if not self.memory.notes:
+                        self.console.print("[dim]memoria già vuota.[/dim]\n")
+                        continue
+                    try:
+                        ans = self.console.input(f"    svuoto {len(self.memory.notes)} note? \\[y]es / \\[n]o ").strip().lower()
+                    except (EOFError, KeyboardInterrupt):
+                        self.console.print()
+                        continue
+                    if ans in ("y", "yes", "si", "sì"):
+                        self.memory.clear()
+                        self._refresh_memory_prompts()   # confine esplicito: il prompt perde il blocco
+                        self._save_session()             # se la sessione è salvata, rimuove anche il sidecar
+                        self.console.print("[yellow]memoria svuotata.[/yellow]\n")
+                    continue
+                if arg:
+                    self.console.print("[dim]uso: /memory  oppure  /memory clear[/dim]\n")
+                    continue
+                if not self.memory.notes:
+                    self.console.print("[dim]memoria vuota. L'agente vi appunta fatti durevoli col tool "
+                                       "`remember`; le note seguono la sessione (/save, /load).[/dim]\n")
+                    continue
+                body = "\n".join(f"  {i}. {n}" for i, n in enumerate(self.memory.notes, 1))
+                self.console.print(f"[dim]memoria di sessione "
+                                   f"({self.memory.used_chars()}/{self.memory.max_chars} caratteri):[/dim]\n{body}\n")
                 continue
             if low.startswith("/save"):
                 parts = line.split(maxsplit=1)

@@ -252,12 +252,29 @@ def read_file_impl(root: Path | None, path: str, offset: int, limit: int | None,
     total = len(lines)
     offset = max(1, offset)
     end = total if limit is None else min(total, offset - 1 + limit)
-    chunk = "\n".join(lines[offset - 1:end])
 
-    header = f"{display(root, p)}  (righe {offset}-{end} di {total})\n"
+    # Budget caratteri applicato PRIMA dell'header, per righe intere: l'header dichiara
+    # SEMPRE il range davvero consegnato. (Prima l'header era composto sul range richiesto
+    # e il corpo veniva amputato dopo: su file grandi certificava letture "complete" mai
+    # avvenute — la fonte meccanica delle false visioni d'insieme del modello.)
+    budget = max(200, max_chars - 160)          # margine per header e hint di continuazione
+    used = 0
+    real_end = offset - 1
+    for i in range(offset - 1, end):
+        cost = len(lines[i]) + 8                # numeri di riga + tab + newline
+        if used + cost > budget and real_end >= offset:
+            break                               # almeno una riga viene sempre consegnata
+        used += cost
+        real_end = i + 1
+    if real_end < offset:                       # riga singola oltre il budget (es. minificato)
+        real_end = min(offset, total)
+
+    chunk = "\n".join(lines[offset - 1:real_end])
+    header = f"{display(root, p)}  (righe {offset}-{real_end} di {total})\n"
     out = header + add_line_numbers(chunk, start=offset)
-    if end < total:
-        out += f"\n...[restano {total - end} righe; continua con read_file(path, offset={end + 1})]"
+    if real_end < total:
+        out += f"\n...[restano {total - real_end} righe; continua con read_file(path, offset={real_end + 1})]"
+    # _trunc resta solo come rete per il caso patologico della riga singola enorme.
     return _trunc(out, max_chars, hint="leggi un range più piccolo con offset/limit")
 
 

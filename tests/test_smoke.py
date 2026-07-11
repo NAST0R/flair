@@ -2467,6 +2467,69 @@ def test_grep_context_and_move():
     check("move: è distruttivo (gate approvazione)", coding.move_path.destructive is True)
 
 
+def test_honest_reads_and_inventory():
+    import tempfile as _tf
+
+    from flair.core.agent import Agent
+    from flair.tools import fs
+
+    # ── read_file onesto: header = range CONSEGNATO, hint sempre presente ────
+    d = Path(_tf.mkdtemp(prefix="flair_hr_"))
+    big = d / "big.py"
+    big.write_text("\n".join(f"riga_{i} = {i}" for i in range(1, 2001)))
+    out = fs.read_file_impl(None, str(big), offset=1, limit=None, max_chars=2000)
+    import re as _re
+    m = _re.search(r"\(righe (\d+)-(\d+) di (\d+)\)", out)
+    lo, hi, tot = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    check("read onesto: header dichiara meno del totale", lo == 1 and hi < tot and tot == 2000, m.group(0))
+    body_lines = [x for x in out.splitlines()[1:] if _re.match(r"\s*\d+ \| ", x)]
+    check("read onesto: header == righe davvero consegnate", len(body_lines) == hi, f"{len(body_lines)} vs {hi}")
+    check("read onesto: hint di continuazione presente e corretto",
+          f"continua con read_file(path, offset={hi + 1})" in out, out[-90:])
+    check("read onesto: budget rispettato", len(out) <= 2000, str(len(out)))
+    out2 = fs.read_file_impl(None, str(big), offset=hi + 1, limit=None, max_chars=2000)
+    check("read onesto: la continuazione riparte dal punto giusto", f"(righe {hi + 1}-" in out2, out2[:60])
+    # file piccolo: comportamento invariato, nessun hint
+    small = d / "s.py"
+    small.write_text("a = 1\nb = 2\n")
+    outs = fs.read_file_impl(None, str(small), offset=1, limit=None, max_chars=12000)
+    check("read onesto: file piccolo integro senza hint", "(righe 1-2 di 2)" in outs and "restano" not in outs, outs)
+    # riga singola enorme: consegna comunque qualcosa, con la rete _trunc
+    mono = d / "min.js"
+    mono.write_text("x" * 9000)
+    outm = fs.read_file_impl(None, str(mono), offset=1, limit=None, max_chars=1000)
+    check("read onesto: riga enorme → rete _trunc, nessun crash",
+          outm.startswith(str(mono)[:0] + fs.display(None, mono)) and "troncato" in outm, outm[:60])
+
+    # ── inventario meccanico dal transcript potato ────────────────────────────
+    def rf_call(cid, path):
+        return {"role": "assistant", "tool_calls": [{"id": cid, "type": "function",
+                "function": {"name": "read_file", "arguments": json_module.dumps({"path": path})}}]}
+    msgs = [
+        rf_call("1", "pyproject.toml"),
+        {"role": "tool", "tool_call_id": "1", "content": "pyproject.toml (righe 1-49 di 49)\n..."},
+        rf_call("2", "tests/test_smoke.py"),
+        {"role": "tool", "tool_call_id": "2", "content": "...\n...[restano 2241 righe; continua con read_file(path, offset=301)]"},
+        rf_call("3", "pyproject.toml"),   # riletto: resta completo
+        {"role": "tool", "tool_call_id": "3", "content": "pyproject.toml (righe 1-49 di 49)"},
+        {"role": "assistant", "tool_calls": [{"id": "4", "type": "function",
+            "function": {"name": "grep", "arguments": "{\"pattern\": \"x\"}"}}]},
+        {"role": "tool", "tool_call_id": "4", "content": "1 corrispondenza"},
+    ]
+    inv = Agent._read_inventory(msgs)
+    check("inventario: path in ordine di prima lettura, dedup", inv.startswith("pyproject.toml, tests/test_smoke.py"), inv)
+    check("inventario: parziale marcato", "tests/test_smoke.py (parziale)" in inv, inv)
+    check("inventario: completo non marcato", "pyproject.toml (parziale)" not in inv, inv)
+    check("inventario: tool non-read ignorati", "grep" not in inv, inv)
+    many = []
+    for i in range(80):
+        many.append(rf_call(f"m{i}", f"cartella/file_{i:03}.py"))
+        many.append({"role": "tool", "tool_call_id": f"m{i}", "content": "ok (righe 1-3 di 3)"})
+    invm = Agent._read_inventory(many)
+    check("inventario: tetto con conteggio dei rimanenti", len(invm) < 1000 and "… e altri" in invm, invm[-30:])
+    check("inventario: vuoto se nessuna read_file", Agent._read_inventory(msgs[-2:]) == "")
+
+
 def main():
     test_arg_parse()
     test_usage_normalization()
@@ -2486,6 +2549,7 @@ def main():
     test_session_persistence()
     test_session_memory()
     test_grep_context_and_move()
+    test_honest_reads_and_inventory()
     test_parallel_tools()
     test_cli_session_roundtrip()
     test_shared_memory()

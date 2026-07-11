@@ -388,6 +388,13 @@ class Agent:
         except Exception as exc:  # noqa: BLE001
             log.warning("Compaction fallita (%s): mantengo il contesto invariato.", exc)
             return False
+        # Il riassunto LLM è lossy e NON conserva l'inventario: senza questo, dopo una
+        # compattazione il modello ricostruisce "cosa esiste" da glob parziali e finisce
+        # per asserire assenze false (es. "non ci sono test" su test letti un'ora prima).
+        # L'inventario è estratto MECCANICAMENTE dalle tool call potate: esatto, zero LLM.
+        inventory = self._read_inventory(to_summarize)
+        if inventory:
+            summary += "\n\nFile già letti (inventario meccanico, non dal riassunto): " + inventory
 
         before = len(self.convo.messages)
         tail = self.convo.messages[split:]
@@ -414,6 +421,47 @@ class Agent:
         )
         self.convo.total_usage = self.convo.total_usage + resp.usage
         return resp.content or "(riassunto non disponibile)"
+
+    @staticmethod
+    def _read_inventory(msgs: list[dict], cap: int = 900) -> str:
+        """Elenco deterministico dei path letti con read_file nei messaggi dati, in ordine
+        di prima lettura; "(parziale)" se NESSUNA lettura di quel path è risultata completa
+        (marcatori 'restano N righe' / 'output troncato' nel risultato). Tetto in caratteri:
+        oltre, si chiude con il conteggio dei rimanenti."""
+        id_to_path: dict[str, str] = {}
+        status: dict[str, bool] = {}            # path -> almeno una lettura completa
+        order: list[str] = []
+        for m in msgs:
+            if m.get("role") == "assistant":
+                for tc in m.get("tool_calls") or []:
+                    fn = tc.get("function", {})
+                    if fn.get("name") != "read_file":
+                        continue
+                    try:
+                        path = str(json.loads(fn.get("arguments") or "{}").get("path", "")).strip()
+                    except (TypeError, ValueError):
+                        path = ""
+                    if path:
+                        id_to_path[tc.get("id", "")] = path
+                        if path not in status:
+                            status[path] = False
+                            order.append(path)
+            elif m.get("role") == "tool":
+                tpath = id_to_path.get(m.get("tool_call_id", ""))
+                if tpath is not None:
+                    content = m.get("content") or ""
+                    if "[restano " not in content and "output troncato" not in content:
+                        status[tpath] = True
+        parts: list[str] = []
+        used = 0
+        for i, path in enumerate(order):
+            item = path + ("" if status.get(path) else " (parziale)")
+            if used + len(item) + 2 > cap:
+                parts.append(f"… e altri {len(order) - i}")
+                break
+            parts.append(item)
+            used += len(item) + 2
+        return ", ".join(parts)
 
     @staticmethod
     def _render_for_summary(msgs: list[dict]) -> str:

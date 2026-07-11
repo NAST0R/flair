@@ -88,7 +88,9 @@ def glob(ctx: ToolContext, pattern: str, path: str = ".") -> str:
 
 @tool(
     "grep",
-    "Cerca una regex nei file di testo del progetto. Ritorna path:riga: contenuto. Ottimo per definizioni e usi di un simbolo.",
+    ("Cerca una regex nei file di testo del progetto. Ritorna path:riga: contenuto. Ottimo per "
+     "definizioni e usi di un simbolo. Con `context` mostra anche N righe attorno a ogni match "
+     "(spesso evita una read_file successiva); con `files_only` elenca solo i file."),
     {
         "type": "object",
         "properties": {
@@ -96,15 +98,23 @@ def glob(ctx: ToolContext, pattern: str, path: str = ".") -> str:
             "path": {"type": "string", "description": "Directory di partenza. Default '.'."},
             "glob_filter": {"type": "string", "description": "Filtro nomi file, es. '*.py'. Opzionale."},
             "ignore_case": {"type": "boolean", "description": "Case-insensitive. Default false."},
+            "context": {"type": "integer", "description": "Righe di contesto prima/dopo ogni match (stile grep -C, max 10). Default 0."},
+            "files_only": {"type": "boolean", "description": "Se true elenca solo i file col numero di match, senza le righe. Default false."},
         },
         "required": ["pattern"],
     },
 )
-def grep(ctx: ToolContext, pattern: str, path: str = ".", glob_filter: str = "", ignore_case: bool = False) -> str:
+def grep(ctx: ToolContext, pattern: str, path: str = ".", glob_filter: str = "",
+         ignore_case: bool = False, context: int = 0, files_only: bool = False) -> str:
     base = fs.resolve(ctx.cfg.root, path)
     if not base.exists():
         return f"❌ Il path non esiste: {fs.display(ctx.cfg.root, base)}"
     ignore_case = fs.as_bool(ignore_case)   # il modello può inviare "true"/"false" come stringa
+    files_only = fs.as_bool(files_only)
+    try:
+        context = max(0, min(int(context or 0), 10))  # tetto: il contesto non deve diventare una read_file
+    except (TypeError, ValueError):
+        context = 0
     try:
         rx = re.compile(pattern, re.IGNORECASE if ignore_case else 0)
     except re.error as exc:
@@ -124,16 +134,54 @@ def grep(ctx: ToolContext, pattern: str, path: str = ".", glob_filter: str = "",
                 yield Path(root_dir) / f
 
     results: list[str] = []
+    n_match = 0
     for full in _files():
         if full.suffix.lower() in fs._BINARY_EXT:
             continue
+        relp = fs.display(ctx.cfg.root, full)
         try:
-            with full.open(encoding="utf-8", errors="replace") as fh:
-                for n, line in enumerate(fh, 1):
-                    if rx.search(line):
-                        results.append(f"{fs.display(ctx.cfg.root, full)}:{n}: {line.rstrip()}")
-                        if len(results) >= 400:
-                            break
+            if files_only:
+                # Scoperta larga a costo minimo: solo "file (n. match)", niente righe.
+                with full.open(encoding="utf-8", errors="replace") as fh:
+                    count = sum(1 for line in fh if rx.search(line))
+                if count:
+                    results.append(f"{relp} ({count})")
+                    n_match += count
+            elif context == 0:
+                # Percorso classico, streaming riga per riga (invariato).
+                with full.open(encoding="utf-8", errors="replace") as fh:
+                    for n, line in enumerate(fh, 1):
+                        if rx.search(line):
+                            results.append(f"{relp}:{n}: {line.rstrip()}")
+                            n_match += 1
+                            if len(results) >= 400:
+                                break
+            else:
+                # Con contesto: righe del file in memoria (solo per i file che matchano),
+                # intervalli [i-C, i+C] FUSI se si toccano — come `grep -C` — così due
+                # match vicini non duplicano le righe. Match marcati con ':', contesto
+                # con '-', blocchi separati da '--'.
+                lines = full.read_text(encoding="utf-8", errors="replace").splitlines()
+                hits = [i for i, line in enumerate(lines) if rx.search(line)]
+                if not hits:
+                    continue
+                n_match += len(hits)
+                hitset = set(hits)
+                spans: list[list[int]] = []
+                for i in hits:
+                    lo, hi = max(0, i - context), min(len(lines) - 1, i + context)
+                    if spans and lo <= spans[-1][1] + 1:
+                        spans[-1][1] = max(spans[-1][1], hi)
+                    else:
+                        spans.append([lo, hi])
+                for lo, hi in spans:
+                    if results:
+                        results.append("--")
+                    for i in range(lo, hi + 1):
+                        sep = ":" if i in hitset else "-"
+                        results.append(f"{relp}{sep}{i + 1}{sep} {lines[i].rstrip()}")
+                    if len(results) >= 400:
+                        break
         except OSError:
             continue
         if len(results) >= 400:
@@ -141,7 +189,8 @@ def grep(ctx: ToolContext, pattern: str, path: str = ".", glob_filter: str = "",
 
     if not results:
         return f"Nessuna corrispondenza per /{pattern}/ sotto {fs.display(ctx.cfg.root, base)}"
-    out = f"{len(results)} corrispondenze per /{pattern}/:\n" + "\n".join(results)
+    label = f"{len(results)} file con corrispondenze" if files_only else f"{n_match} corrispondenze"
+    out = f"{label} per /{pattern}/:\n" + "\n".join(results)
     return fs._trunc(out, ctx.cfg.grep_max_chars, hint="restringi pattern o path")
 
 
@@ -289,4 +338,23 @@ def repo_map(ctx: ToolContext, path: str = ".") -> str:
     return repomap.build_repo_map(ctx.cfg.root, path, ctx.cfg.repomap_max_chars)
 
 
-TOOLS = [read_file, list_directory, glob, grep, repo_map, edit_file, multi_edit, write_file, run_command]
+@tool(
+    "move_path",
+    ("Sposta o rinomina un file o una cartella DENTRO la root del progetto (entrambi i capi "
+     "confinati). La destinazione non deve esistere; le cartelle intermedie vengono create. "
+     "Preferito a mv/move via run_command: cross-platform e senza sorprese."),
+    {
+        "type": "object",
+        "properties": {
+            "src": {"type": "string", "description": "Percorso di origine (file o cartella)."},
+            "dst": {"type": "string", "description": "Percorso di destinazione (non deve esistere)."},
+        },
+        "required": ["src", "dst"],
+    },
+    destructive=True,
+)
+def move_path(ctx: ToolContext, src: str, dst: str) -> str:
+    return fs.move_path_impl(ctx.cfg.root, src, dst)
+
+
+TOOLS = [read_file, list_directory, glob, grep, repo_map, edit_file, multi_edit, write_file, move_path, run_command]

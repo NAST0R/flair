@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import shutil
 import tempfile
 from pathlib import Path
 
@@ -185,6 +186,36 @@ def apply_edit(text: str, old: str, new: str, replace_all: bool = False) -> tupl
         "old_string non trovato. Rileggi il file con read_file e copia il testo "
         "esatto da sostituire (inclusa l'indentazione)."
     )
+
+
+def move_path_impl(root: Path | None, src: str, dst: str) -> str:
+    """Sposta o rinomina un file o una cartella. Semantica DETERMINISTICA e prudente:
+    entrambi i capi sono confinati alla root (niente sponda per uscire dal perimetro,
+    a differenza di `mv`/`move` via shell); la destinazione NON deve esistere (mai
+    sovrascritture silenziose, mai lo "sposta DENTRO la cartella" implicito di mv);
+    le cartelle intermedie della destinazione vengono create. Cross-platform e
+    robusto anche tra filesystem diversi (shutil.move)."""
+    p_src = resolve(root, src)
+    p_dst = resolve(root, dst)
+    if not p_src.exists():
+        return f"❌ Il percorso di origine non esiste: {display(root, p_src)}"
+    if p_dst.exists():
+        return (f"❌ La destinazione esiste già: {display(root, p_dst)}. "
+                "Scegli un nome diverso o rimuovi prima il file esistente.")
+    if p_src == p_dst:
+        return "⚠️ Origine e destinazione coincidono: niente da fare."
+    try:
+        if p_dst.is_relative_to(p_src):  # es. spostare una cartella dentro sé stessa
+            return "❌ La destinazione è dentro l'origine: spostamento impossibile."
+    except AttributeError:  # pragma: no cover - Python < 3.9 non supportato comunque
+        pass
+    p_dst.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        shutil.move(str(p_src), str(p_dst))
+    except OSError as exc:
+        return f"❌ Spostamento fallito: {exc}"
+    kind = "cartella" if p_dst.is_dir() else "file"
+    return f"✓ Spostato ({kind}): {display(root, p_src)} → {display(root, p_dst)}"
 
 
 def _atomic_write(p: Path, content: str) -> None:

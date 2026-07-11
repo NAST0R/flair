@@ -2405,6 +2405,68 @@ def test_session_memory():
           and not (d / "memtest.memory.md").exists())
 
 
+def test_grep_context_and_move():
+    import tempfile as _tf
+
+    from flair.tools import coding
+    root = Path(_tf.mkdtemp(prefix="flair_gcm_")).resolve()
+    (root / "a.py").write_text("uno\ndue\nBERSAGLIO qui\nquattro\ncinque\nBERSAGLIO due\nsette\n")
+    (root / "sub").mkdir()
+    (root / "sub" / "b.py").write_text("niente\nBERSAGLIO b\ncoda\n")
+    cfg = cfg_for(root)
+    ctx = ToolContext(cfg=cfg)
+
+    # context=1: match marcati con ':', contesto con '-', blocchi fusi se adiacenti
+    out = coding.grep(ctx, pattern="BERSAGLIO", path=".", context=1)
+    check("grep ctx: match marcato ':'", "a.py:3: BERSAGLIO qui" in out, out)
+    check("grep ctx: contesto marcato '-'", "a.py-2- due" in out and "a.py-4- quattro" in out, out)
+    check("grep ctx: intervalli adiacenti fusi (riga 4 una sola volta)",
+          out.count("quattro") == 1 and out.count("-5-") == 1, out)
+    check("grep ctx: separatore tra blocchi/file", "--" in out)
+    check("grep ctx: conteggio dei MATCH (non delle righe emesse)", out.startswith("3 corrispondenze"), out[:30])
+    # coercion da stringa + clamp
+    out2 = coding.grep(ctx, pattern="BERSAGLIO", path="a.py", context="1")
+    check("grep ctx: context come stringa coercito", "a.py-2- due" in out2)
+    out3 = coding.grep(ctx, pattern="BERSAGLIO", path="a.py", context=999)
+    check("grep ctx: clamp a 10 (nessuna esplosione)", out3.count("\n") < 20, str(out3.count("\n")))
+    # files_only: solo file+conteggio, niente testo delle righe
+    outf = coding.grep(ctx, pattern="BERSAGLIO", files_only=True)
+    check("grep files_only: elenca file con conteggio", "a.py (2)" in outf and "b.py (1)" in outf, outf)
+    check("grep files_only: nessuna riga di testo", "qui" not in outf and ":3:" not in outf, outf)
+    check("grep files_only: etichetta corretta", outf.startswith("2 file con corrispondenze"), outf[:40])
+    outfc = coding.grep(ctx, pattern="BERSAGLIO", files_only="true", context=3)
+    check("grep files_only: vince su context (e coercion stringa)", "a.py (2)" in outfc and "-2-" not in outfc)
+
+    # move_path: rinomina, sposta con parents, semantica prudente, confinamento
+    ok = coding.move_path(ctx, src="a.py", dst="renamed.py")
+    check("move: rinomina ok", ok.startswith("✓") and (root / "renamed.py").exists()
+          and not (root / "a.py").exists(), ok)
+    check("move: contenuto preservato", "BERSAGLIO qui" in (root / "renamed.py").read_text())
+    ok = coding.move_path(ctx, src="renamed.py", dst="nuova/dir/pro.py")
+    check("move: crea cartelle intermedie", ok.startswith("✓") and (root / "nuova" / "dir" / "pro.py").exists(), ok)
+    out = coding.move_path(ctx, src="sub/b.py", dst="nuova/dir/pro.py")
+    check("move: destinazione esistente → rifiuto", out.startswith("❌") and "esiste già" in out, out)
+    out = coding.move_path(ctx, src="fantasma.py", dst="x.py")
+    check("move: origine mancante → errore pulito", out.startswith("❌"), out)
+    out = coding.move_path(ctx, src="sub", dst="sub2")
+    check("move: sposta cartelle", out.startswith("✓") and (root / "sub2" / "b.py").exists(), out)
+    out = coding.move_path(ctx, src="sub2", dst="sub2/dentro")
+    check("move: destinazione dentro l'origine → rifiuto", out.startswith("❌"), out)
+    try:
+        coding.move_path(ctx, src="renamed.py", dst="../fuori.py")
+        escaped = False
+    except ToolError:
+        escaped = True
+    check("move: uscita dalla root bloccata (dst)", escaped)
+    try:
+        coding.move_path(ctx, src="../../etc/passwd", dst="dentro.py")
+        escaped = False
+    except ToolError:
+        escaped = True
+    check("move: uscita dalla root bloccata (src)", escaped)
+    check("move: è distruttivo (gate approvazione)", coding.move_path.destructive is True)
+
+
 def main():
     test_arg_parse()
     test_usage_normalization()
@@ -2423,6 +2485,7 @@ def main():
     test_web_search()
     test_session_persistence()
     test_session_memory()
+    test_grep_context_and_move()
     test_parallel_tools()
     test_cli_session_roundtrip()
     test_shared_memory()

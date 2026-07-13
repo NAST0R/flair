@@ -48,15 +48,15 @@ class StoppedByUser(Exception):
     agentico si ferma subito e il controllo torna all'utente."""
 
 _COMPACT_PROMPT = (
-    "Sei un compressore di contesto per un assistente AI. Riassumi la conversazione "
-    "seguente in modo autosufficiente, così che l'assistente possa proseguire il "
-    "lavoro senza aver letto l'originale. Mantieni: l'obiettivo/richiesta, i file "
-    "esaminati con i contenuti e le firme rilevanti, le modifiche già applicate, le "
-    "decisioni prese, gli errori incontrati, l'eventuale piano/TODO con lo stato di "
-    "ogni passo, e lo stato attuale con i prossimi passi. "
-    "Se la conversazione contiene GIÀ un riassunto precedente, incorporane tutte le "
-    "informazioni nel nuovo riassunto senza perderle. Sii completo sui fatti tecnici "
-    "ma conciso. Non inventare nulla."
+    "You are a context compressor for an AI assistant. Summarize the conversation "
+    "below in a self-sufficient way, so the assistant can continue the work without "
+    "having read the original. Keep: the goal/request, the files examined with the "
+    "relevant contents and signatures, the edits already applied, the decisions "
+    "made, the errors encountered, any plan/TODO with the status of each step, and "
+    "the current status with the next steps. "
+    "If the conversation ALREADY contains a previous summary, incorporate all of its "
+    "information into the new summary without losing any of it. Be complete on "
+    "technical facts but concise. Do not invent anything."
 )
 
 
@@ -186,8 +186,8 @@ class Agent:
         for tc in resp.tool_calls:
             if tc.id not in answered:
                 self.convo.messages.append({"role": "tool", "tool_call_id": tc.id, "content": (
-                    f"⛔ Interrotto dall'utente: «{tc.name}» non è stato eseguito. "
-                    "Il controllo è tornato all'utente; attendi nuove istruzioni."
+                    f"⛔ Stopped by the user: «{tc.name}» was not executed. "
+                    "Control has returned to the user; wait for new instructions."
                 )})
 
     def run(self, task: str, think: bool = False, max_steps: int | None = None) -> AgentResult:
@@ -222,9 +222,9 @@ class Agent:
                     stored = resp.content
                     if truncated and has_content:
                         stored = (stored or "") + (
-                            "\n\n[⚠ Output interrotto qui dal limite di lunghezza, non per scelta. "
-                            "Se l'utente chiede di continuare, RIPRENDI esattamente da questo punto, "
-                            "senza ricominciare né ripetere ciò che è già scritto sopra.]"
+                            "\n\n[⚠ Output cut here by the length limit, not by choice. "
+                            "If the user asks to continue, RESUME exactly from this point, "
+                            "without starting over or repeating what is already written above.]"
                         )
                     self.convo.messages.append({"role": "assistant", "content": stored})
                     return AgentResult(resp.content, turn_usage, step, "done", truncated=truncated)
@@ -394,7 +394,7 @@ class Agent:
         # L'inventario è estratto MECCANICAMENTE dalle tool call potate: esatto, zero LLM.
         inventory = self._read_inventory(to_summarize)
         if inventory:
-            summary += "\n\nFile già letti (inventario meccanico, non dal riassunto): " + inventory
+            summary += "\n\nFiles already read (mechanical inventory, not from the summary): " + inventory
 
         before = len(self.convo.messages)
         tail = self.convo.messages[split:]
@@ -450,14 +450,14 @@ class Agent:
                 tpath = id_to_path.get(m.get("tool_call_id", ""))
                 if tpath is not None:
                     content = m.get("content") or ""
-                    if "[restano " not in content and "output troncato" not in content:
+                    if " more lines;" not in content and "output truncated" not in content:
                         status[tpath] = True
         parts: list[str] = []
         used = 0
         for i, path in enumerate(order):
-            item = path + ("" if status.get(path) else " (parziale)")
+            item = path + ("" if status.get(path) else " (partial)")
             if used + len(item) + 2 > cap:
-                parts.append(f"… e altri {len(order) - i}")
+                parts.append(f"… and {len(order) - i} more")
                 break
             parts.append(item)
             used += len(item) + 2
@@ -511,11 +511,11 @@ class Agent:
         """Messaggio azionabile quando gli argomenti sono ininterpretabili (di solito
         troncati perché l'output era troppo lungo)."""
         return (
-            f"❌ Non sono riuscito a interpretare gli argomenti di «{name}»: probabilmente "
-            "sono stati troncati perché l'output era troppo lungo (di solito quando si "
-            "scrive un file molto grande in una sola chiamata). Riprova con un contenuto "
-            "più conciso, oppure scrivi il file in più parti: prima write_file con la "
-            "prima parte, poi le successive con write_file e append=true."
+            f"❌ I could not parse the arguments for «{name}»: they were probably "
+            "truncated because the output was too long (usually when writing a very "
+            "large file in a single call). Retry with more concise content, or write "
+            "the file in parts: first write_file with the first part, then the rest "
+            "with write_file and append=true."
         )
 
     def _execute_pure(self, name: str, args: dict) -> tuple[str, bool, Usage]:
@@ -525,7 +525,7 @@ class Agent:
         girare in un thread del pool. Ritorna (output, ok, usage_delegato)."""
         t = self.toolset.get(name)
         if t is None:  # invariante garantita dal chiamante; guardia esplicita per sicurezza e tipi
-            return f"❌ Tool sconosciuto: {name}", False, Usage()
+            return f"❌ Unknown tool: {name}", False, Usage()
         ctx = ToolContext(cfg=self.cfg, provider=self.provider)
         ctx.delegated_usage = Usage()
         # Unica eccezione DELIBERATA alla purezza dei worker: la memoria di sessione è
@@ -540,9 +540,9 @@ class Agent:
         except ToolError as exc:
             out, ok = f"❌ {exc}", False
         except TypeError as exc:
-            out, ok = f"❌ Argomenti non validi per {name}: {exc}", False
+            out, ok = f"❌ Invalid arguments for {name}: {exc}", False
         except Exception as exc:  # noqa: BLE001
-            out, ok = f"❌ Errore in {name}: {type(exc).__name__}: {exc}", False
+            out, ok = f"❌ Error in {name}: {type(exc).__name__}: {exc}", False
             log.exception("Errore inatteso nel tool %s", name)
         return out, ok, (ctx.delegated_usage or Usage())
 
@@ -582,7 +582,7 @@ class Agent:
             if "_raw" in tc.arguments:
                 precomputed[tc.id] = self._raw_args_error(tc.name)
             elif self.toolset.get(tc.name) is None:
-                precomputed[tc.id] = f"❌ Tool sconosciuto: {tc.name}"
+                precomputed[tc.id] = f"❌ Unknown tool: {tc.name}"
             else:
                 sig = self._sig(tc.name, tc.arguments)
                 recent[sig] = recent.get(sig, 0) + 1
@@ -641,7 +641,7 @@ class Agent:
 
         t = self.toolset.get(name)
         if t is None:
-            out = f"❌ Tool sconosciuto: {name}"
+            out = f"❌ Unknown tool: {name}"
             if self.on_result:
                 self.on_result(name, out, False)
             return out, False
@@ -653,10 +653,10 @@ class Agent:
             decision = self.approve(name, args)
             if decision == "stop":
                 if self.on_result:
-                    self.on_result(name, "⛔ interrotto dall'utente", False)
+                    self.on_result(name, "⛔ stopped by the user", False)
                 raise StoppedByUser(name)
             if not decision:
-                out = f"⚠️ Operazione '{name}' annullata dall'utente."
+                out = f"⚠️ Operation '{name}' was cancelled by the user."
                 if self.on_result:
                     self.on_result(name, out, False)
                 return out, False
@@ -667,9 +667,9 @@ class Agent:
         except ToolError as exc:
             out, ok = f"❌ {exc}", False
         except TypeError as exc:
-            out, ok = f"❌ Argomenti non validi per {name}: {exc}", False
+            out, ok = f"❌ Invalid arguments for {name}: {exc}", False
         except Exception as exc:  # noqa: BLE001
-            out, ok = f"❌ Errore in {name}: {type(exc).__name__}: {exc}", False
+            out, ok = f"❌ Error in {name}: {type(exc).__name__}: {exc}", False
             log.exception("Errore inatteso nel tool %s", name)
 
         if self.on_result:
@@ -678,12 +678,12 @@ class Agent:
 
     def _force_final(self) -> tuple[str, Usage]:
         self.convo.messages.append({"role": "user", "content": (
-            "Concludi ora: scrivi la risposta finale basandoti solo su ciò che hai "
-            "effettivamente fatto/letto. Niente altre tool call."
+            "Conclude now: write the final answer based only on what you actually "
+            "did/read. No more tool calls."
         )})
         try:
             resp = self._complete(tools=None, think=False)
             self.convo.messages.append({"role": "assistant", "content": resp.content})
-            return resp.content or "(nessuna risposta prodotta)", resp.usage
+            return resp.content or "(no answer produced)", resp.usage
         except Exception as exc:  # noqa: BLE001
-            return f"Interrotto. Errore nella sintesi finale: {exc}", Usage()
+            return f"Stopped. Error in the final synthesis: {exc}", Usage()

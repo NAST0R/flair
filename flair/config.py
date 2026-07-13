@@ -178,7 +178,7 @@ class Config:
 
     def validate(self) -> None:
         if self.provider not in ("deepseek", "openai"):
-            raise RuntimeError(f"Provider non valido: {self.provider} (usa 'deepseek' o 'openai').")
+            raise RuntimeError(f"Invalid provider: {self.provider} (use 'deepseek' or 'openai').")
         if not self.active.api_key:
             key_name = "DEEPSEEK_API_KEY" if self.provider == "deepseek" else "OPENAI_API_KEY"
             raise RuntimeError(
@@ -186,7 +186,7 @@ class Config:
                 "o esporta la variabile d'ambiente."
             )
         if not self.root.exists():
-            raise RuntimeError(f"FLAIR_ROOT non esiste: {self.root}")
+            raise RuntimeError(f"FLAIR_ROOT does not exist: {self.root}")
 
 
 def load_config() -> Config:

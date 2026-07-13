@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import re
 
-_HEADER = "## Memoria di sessione (fatti appresi in lavori precedenti)"
+_HEADER = "## Session memory (facts learned in previous work)"
 
 # Pattern ovvi di credenziali/segreti: una nota che li contiene viene rifiutata.
 # Volutamente conservativo (pochi falsi positivi): non è una barriera perfetta,
@@ -69,19 +69,19 @@ class SessionMemory:
         zero chiamate LLM: dedup, filtro segreti e tetto sono regole fisse."""
         note = " ".join(str(note).split())  # una riga, spazi normalizzati
         if not note:
-            return False, "nota vuota: niente da memorizzare."
+            return False, "empty note: nothing to store."
         if len(note) > self.max_note_chars:
-            return False, (f"nota troppo lunga ({len(note)} caratteri, max {self.max_note_chars}): "
-                           "sintetizza il fatto in una riga.")
+            return False, (f"note too long ({len(note)} chars, max {self.max_note_chars}): "
+                           "condense the fact into one line.")
         if _SECRET_RX.search(note):
-            return False, "la nota sembra contenere credenziali o segreti: non memorizzabile."
+            return False, "the note appears to contain credentials or secrets: not stored."
         if self._norm(note) in {self._norm(n) for n in self.notes}:
-            return False, "fatto già in memoria."
+            return False, "already in memory."
         if self.used_chars() + len(note) + 3 > self.max_chars:
-            return False, (f"memoria piena ({self.used_chars()}/{self.max_chars} caratteri): "
-                           "sii più selettivo; l'utente può ripulirla con /memory.")
+            return False, (f"memory is full ({self.used_chars()}/{self.max_chars} chars): "
+                           "be more selective; the user can prune it with /memory.")
         self.notes.append(note)
-        return True, f"memorizzato ({len(self.notes)} note in memoria)."
+        return True, f"stored ({len(self.notes)} notes in memory)."
 
     def clear(self) -> None:
         self.notes = []
@@ -110,8 +110,8 @@ class SessionMemory:
         self.notes = out
         if not out:
             return ""
-        return ("# Memoria di sessione (flair)\n"
-                "# Una riga per nota; il file è modificabile a mano.\n\n"
+        return ("# Session memory (flair)\n"
+                "# One line per note; this file can be edited by hand.\n\n"
                 + "\n".join(f"- {n}" for n in out) + "\n")
 
     def load_text(self, text: str) -> tuple[int, bool]:

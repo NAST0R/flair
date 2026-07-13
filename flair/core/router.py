@@ -69,15 +69,15 @@ _BUILD_RX = re.compile(
 )
 
 _ROUTER_PROMPT = (
-    "Sei il router di un assistente con due modalità. Rispondi con UNA parola: "
-    "'coding' o 'general'.\n"
-    "- 'coding': SCRIVERE SOFTWARE — creare, leggere o modificare codice e costruire un "
-    "progetto (sito web, app, script, gioco, tool…) nella cartella di lavoro, anche da zero "
-    "o in una nuova sottocartella; più test, refactoring, git.\n"
-    "- 'general': tutto il resto sul computer o di conversazione — aprire app/URL, "
-    "riprodurre media, cercare/aprire file fuori dal progetto, info di sistema, appunti, "
-    "ricerche web, scrivere testi non-codice, domande generiche.\n"
-    "Programmare o costruire software → 'coding'. Nel dubbio, o se è conversazione → 'general'."
+    "You are the router of an assistant with two modes. Reply with ONE word: "
+    "'coding' or 'general'.\n"
+    "- 'coding': WRITING SOFTWARE — creating, reading or modifying code and building a "
+    "project (website, app, script, game, tool…) in the working folder, even from scratch "
+    "or in a new subfolder; plus tests, refactoring, git.\n"
+    "- 'general': everything else on the computer or conversational — opening apps/URLs, "
+    "playing media, searching/opening files outside the project, system info, clipboard, "
+    "web searches, writing non-code text, generic questions.\n"
+    "Programming or building software → 'coding'. When in doubt, or if it is conversation → 'general'."
 )
 
 
@@ -140,7 +140,7 @@ def classify(text: str, provider, last_agent: str | None = None, convo=None) -> 
         return last_agent
     hint = ""
     if last_agent in ("coding", "general"):
-        hint = f"\n\n(Modalità attuale: {last_agent}. Mantienila se la richiesta è coerente.)"
+        hint = f"\n\n(Current mode: {last_agent}. Keep it if the request is consistent.)"
     try:
         resp = provider.complete(
             [{"role": "system", "content": _ROUTER_PROMPT},
@@ -158,5 +158,5 @@ def classify(text: str, provider, last_agent: str | None = None, convo=None) -> 
             return "general"
         return _classify_heuristic(text, last_agent)  # risposta inattesa
     except Exception as exc:  # noqa: BLE001
-        log.warning("Router LLM non disponibile (%s) — uso l'euristica.", exc)
+        log.warning("LLM router unavailable (%s) — falling back to the heuristic.", exc)
         return _classify_heuristic(text, last_agent)

@@ -20,13 +20,13 @@ from . import fs, repomap, shell
 
 @tool(
     "read_file",
-    "Legge un file di testo del progetto con numeri di riga. Usa offset/limit per i file grandi.",
+    "Read a project text file with line numbers. Use offset/limit for large files.",
     {
         "type": "object",
         "properties": {
-            "path": {"type": "string", "description": "Path del file, relativo alla radice del progetto."},
-            "offset": {"type": "integer", "description": "Prima riga (1-based). Default 1."},
-            "limit": {"type": "integer", "description": "Numero massimo di righe. Omesso = fino alla fine."},
+            "path": {"type": "string", "description": "File path, relative to the project root."},
+            "offset": {"type": "integer", "description": "First line (1-based). Default 1."},
+            "limit": {"type": "integer", "description": "Maximum number of lines. Omitted = to the end."},
         },
         "required": ["path"],
     },
@@ -39,10 +39,10 @@ def read_file(ctx: ToolContext, path: str, offset: int = 1, limit: int | None = 
 
 @tool(
     "list_directory",
-    "Elenca file e sottocartelle di una directory del progetto (un livello).",
+    "List files and subfolders of a project directory (one level).",
     {
         "type": "object",
-        "properties": {"path": {"type": "string", "description": "Directory relativa alla radice. Default '.'."}},
+        "properties": {"path": {"type": "string", "description": "Directory relative to the root. Default '.'."}},
     },
 )
 def list_directory(ctx: ToolContext, path: str = ".") -> str:
@@ -53,12 +53,12 @@ def list_directory(ctx: ToolContext, path: str = ".") -> str:
 
 @tool(
     "glob",
-    "Trova file per pattern glob, es. '**/*.py' o 'src/**/*.ts'.",
+    "Find files by glob pattern, e.g. '**/*.py' or 'src/**/*.ts'.",
     {
         "type": "object",
         "properties": {
-            "pattern": {"type": "string", "description": "Pattern glob."},
-            "path": {"type": "string", "description": "Directory di partenza. Default '.'."},
+            "pattern": {"type": "string", "description": "Glob pattern."},
+            "path": {"type": "string", "description": "Starting directory. Default '.'."},
         },
         "required": ["pattern"],
     },
@@ -66,7 +66,7 @@ def list_directory(ctx: ToolContext, path: str = ".") -> str:
 def glob(ctx: ToolContext, pattern: str, path: str = ".") -> str:
     base = fs.resolve(ctx.cfg.root, path)
     if not base.exists():
-        return f"❌ Il path non esiste: {fs.display(ctx.cfg.root, base)}"
+        return f"❌ Path does not exist: {fs.display(ctx.cfg.root, base)}"
     matches: list[str] = []
     for root_dir, dirs, files in os.walk(base):
         dirs[:] = [d for d in dirs if d not in fs.NOISE_DIRS]
@@ -77,10 +77,10 @@ def glob(ctx: ToolContext, pattern: str, path: str = ".") -> str:
                 matches.append(relp)
     matches.sort()
     if not matches:
-        return f"Nessun file corrisponde a '{pattern}' sotto {fs.display(ctx.cfg.root, base)}"
-    out = f"{len(matches)} file per '{pattern}':\n" + "\n".join(matches[:300])
+        return f"No files match '{pattern}' under {fs.display(ctx.cfg.root, base)}"
+    out = f"{len(matches)} files for '{pattern}':\n" + "\n".join(matches[:300])
     if len(matches) > 300:
-        out += f"\n...[altri {len(matches) - 300}]"
+        out += f"\n...[{len(matches) - 300} more]"
     return out
 
 
@@ -88,18 +88,18 @@ def glob(ctx: ToolContext, pattern: str, path: str = ".") -> str:
 
 @tool(
     "grep",
-    ("Cerca una regex nei file di testo del progetto. Ritorna path:riga: contenuto. Ottimo per "
-     "definizioni e usi di un simbolo. Con `context` mostra anche N righe attorno a ogni match "
-     "(spesso evita una read_file successiva); con `files_only` elenca solo i file."),
+    ("Search a regex in the project's text files. Returns path:line: content. Great for "
+     "definitions and usages of a symbol. With `context` it also shows N lines around each "
+     "match (often saves a follow-up read_file); with `files_only` it lists only the files."),
     {
         "type": "object",
         "properties": {
-            "pattern": {"type": "string", "description": "Espressione regolare."},
-            "path": {"type": "string", "description": "Directory di partenza. Default '.'."},
-            "glob_filter": {"type": "string", "description": "Filtro nomi file, es. '*.py'. Opzionale."},
+            "pattern": {"type": "string", "description": "Regular expression."},
+            "path": {"type": "string", "description": "Starting directory. Default '.'."},
+            "glob_filter": {"type": "string", "description": "Filename filter, e.g. '*.py'. Optional."},
             "ignore_case": {"type": "boolean", "description": "Case-insensitive. Default false."},
-            "context": {"type": "integer", "description": "Righe di contesto prima/dopo ogni match (stile grep -C, max 10). Default 0."},
-            "files_only": {"type": "boolean", "description": "Se true elenca solo i file col numero di match, senza le righe. Default false."},
+            "context": {"type": "integer", "description": "Context lines before/after each match (grep -C style, max 10). Default 0."},
+            "files_only": {"type": "boolean", "description": "If true, list only the files with their match counts, no lines. Default false."},
         },
         "required": ["pattern"],
     },
@@ -108,7 +108,7 @@ def grep(ctx: ToolContext, pattern: str, path: str = ".", glob_filter: str = "",
          ignore_case: bool = False, context: int = 0, files_only: bool = False) -> str:
     base = fs.resolve(ctx.cfg.root, path)
     if not base.exists():
-        return f"❌ Il path non esiste: {fs.display(ctx.cfg.root, base)}"
+        return f"❌ Path does not exist: {fs.display(ctx.cfg.root, base)}"
     ignore_case = fs.as_bool(ignore_case)   # il modello può inviare "true"/"false" come stringa
     files_only = fs.as_bool(files_only)
     try:
@@ -118,7 +118,7 @@ def grep(ctx: ToolContext, pattern: str, path: str = ".", glob_filter: str = "",
     try:
         rx = re.compile(pattern, re.IGNORECASE if ignore_case else 0)
     except re.error as exc:
-        return f"❌ Regex non valida: {exc}"
+        return f"❌ Invalid regex: {exc}"
 
     def _files():
         # Se 'path' è già un file, cerca in QUEL file (intuitivo: "grep in questo
@@ -188,26 +188,26 @@ def grep(ctx: ToolContext, pattern: str, path: str = ".", glob_filter: str = "",
             break
 
     if not results:
-        return f"Nessuna corrispondenza per /{pattern}/ sotto {fs.display(ctx.cfg.root, base)}"
-    label = f"{len(results)} file con corrispondenze" if files_only else f"{n_match} corrispondenze"
-    out = f"{label} per /{pattern}/:\n" + "\n".join(results)
-    return fs._trunc(out, ctx.cfg.grep_max_chars, hint="restringi pattern o path")
+        return f"No matches for /{pattern}/ under {fs.display(ctx.cfg.root, base)}"
+    label = f"{len(results)} files with matches" if files_only else f"{n_match} matches"
+    out = f"{label} for /{pattern}/:\n" + "\n".join(results)
+    return fs._trunc(out, ctx.cfg.grep_max_chars, hint="narrow the pattern or path")
 
 
 # ── edit_file ────────────────────────────────────────────────────────────────
 
 @tool(
     "edit_file",
-    ("Modifica chirurgica: sostituisce old_string con new_string. old_string deve essere "
-     "univoco nel file (includi contesto) a meno di replace_all. Preferito a write_file "
-     "per cambiare parti di un file esistente."),
+    ("Surgical edit: replaces old_string with new_string. old_string must be unique in "
+     "the file (include context) unless replace_all. Preferred over write_file for "
+     "changing parts of an existing file."),
     {
         "type": "object",
         "properties": {
-            "path": {"type": "string", "description": "Path del file da modificare."},
-            "old_string": {"type": "string", "description": "Testo esatto da sostituire (spazi/indentazione inclusi)."},
-            "new_string": {"type": "string", "description": "Testo nuovo."},
-            "replace_all": {"type": "boolean", "description": "Sostituisce tutte le occorrenze. Default false."},
+            "path": {"type": "string", "description": "Path of the file to edit."},
+            "old_string": {"type": "string", "description": "Exact text to replace (whitespace/indentation included)."},
+            "new_string": {"type": "string", "description": "New text."},
+            "replace_all": {"type": "boolean", "description": "Replace all occurrences. Default false."},
         },
         "required": ["path", "old_string", "new_string"],
     },
@@ -221,15 +221,15 @@ def edit_file(ctx: ToolContext, path: str, old_string: str, new_string: str, rep
 
 @tool(
     "write_file",
-    ("Crea o sovrascrive un intero file del progetto (crea le cartelle intermedie). Per "
-     "modifiche puntuali usare edit_file. Per file molto grandi, scrivi la prima parte e "
-     "poi aggiungi il resto con append=true (eviti di superare il limite di token)."),
+    ("Create or overwrite a whole project file (intermediate folders are created). For "
+     "targeted changes use edit_file. For very large files, write the first part and "
+     "then add the rest with append=true (avoids exceeding the token limit)."),
     {
         "type": "object",
         "properties": {
-            "path": {"type": "string", "description": "Path del file."},
-            "content": {"type": "string", "description": "Contenuto completo del file."},
-            "append": {"type": "boolean", "description": "Aggiunge in coda invece di sovrascrivere (per scrivere un file grande in più parti). Default false."},
+            "path": {"type": "string", "description": "File path."},
+            "content": {"type": "string", "description": "Full file content."},
+            "append": {"type": "boolean", "description": "Append instead of overwriting (to write a large file in parts). Default false."},
         },
         "required": ["path", "content"],
     },
@@ -243,13 +243,13 @@ def write_file(ctx: ToolContext, path: str, content: str, append: bool = False) 
 
 @tool(
     "run_command",
-    ("Esegue un comando nella shell di sistema, nella radice del progetto (test, build, "
-     "git, linter...). Usa cmd su Windows e sh su Unix. Ritorna stdout+stderr ed exit code."),
+    ("Run a command in the system shell, in the project root (tests, builds, git, "
+     "linters...). Uses cmd on Windows and sh on Unix. Returns stdout+stderr and the exit code."),
     {
         "type": "object",
         "properties": {
-            "command": {"type": "string", "description": "Comando da eseguire."},
-            "timeout": {"type": "integer", "description": "Timeout in secondi. Default 120."},
+            "command": {"type": "string", "description": "Command to run."},
+            "timeout": {"type": "integer", "description": "Timeout in seconds. Default 120."},
         },
         "required": ["command"],
     },
@@ -261,22 +261,22 @@ def run_command(ctx: ToolContext, command: str, timeout: int = 120) -> str:
 
 @tool(
     "multi_edit",
-    ("Applica più sostituzioni a UN file in una sola chiamata, in ordine e in modo "
-     "atomico (se una fallisce, il file non viene toccato). Più efficiente di tante "
-     "edit_file separate. Ogni edit usa la stessa logica resiliente di edit_file."),
+    ("Apply multiple replacements to ONE file in a single call, in order and atomically "
+     "(if one fails, the file is left untouched). More efficient than many separate "
+     "edit_file calls. Each edit uses the same resilient matching as edit_file."),
     {
         "type": "object",
         "properties": {
-            "path": {"type": "string", "description": "Path del file."},
+            "path": {"type": "string", "description": "File path."},
             "edits": {
                 "type": "array",
-                "description": "Lista di modifiche, applicate in sequenza.",
+                "description": "List of edits, applied in sequence.",
                 "items": {
                     "type": "object",
                     "properties": {
-                        "old_string": {"type": "string", "description": "Testo da sostituire."},
-                        "new_string": {"type": "string", "description": "Testo nuovo."},
-                        "replace_all": {"type": "boolean", "description": "Sostituire tutte le occorrenze (default false)."},
+                        "old_string": {"type": "string", "description": "Text to replace."},
+                        "new_string": {"type": "string", "description": "New text."},
+                        "replace_all": {"type": "boolean", "description": "Replace all occurrences (default false)."},
                     },
                     "required": ["old_string", "new_string"],
                 },
@@ -289,65 +289,65 @@ def run_command(ctx: ToolContext, command: str, timeout: int = 120) -> str:
 def multi_edit(ctx: ToolContext, path: str, edits: list) -> str:
     p = fs.resolve(ctx.cfg.root, path)
     if not p.exists():
-        return f"❌ Il file non esiste: {fs.display(ctx.cfg.root, p)} (usa write_file per crearlo)"
+        return f"❌ File does not exist: {fs.display(ctx.cfg.root, p)} (use write_file to create it)"
     if p.is_dir():
-        return f"❌ È una directory: {fs.display(ctx.cfg.root, p)}"
+        return f"❌ It is a directory: {fs.display(ctx.cfg.root, p)}"
     if not isinstance(edits, list) or not edits:
-        return "❌ 'edits' deve essere una lista non vuota di modifiche."
+        return "❌ 'edits' must be a non-empty list of edits."
 
     text = p.read_text(encoding="utf-8", errors="replace")
     working = text
     notes = []
     for i, e in enumerate(edits, 1):
         if not isinstance(e, dict) or "old_string" not in e or "new_string" not in e:
-            return f"❌ Modifica #{i} non valida: servono 'old_string' e 'new_string'."
+            return f"❌ Edit #{i} is invalid: 'old_string' and 'new_string' are required."
         # apply_edit solleva ToolError su match non univoco → annulliamo tutto
         # (il file non è ancora stato scritto: l'operazione resta atomica).
         try:
             working, strategy = fs.apply_edit(working, e["old_string"], e["new_string"], e.get("replace_all", False))
         except ToolError as exc:
-            return f"❌ Modifica #{i} non applicata ({exc}) — nessuna modifica scritta sul file."
+            return f"❌ Edit #{i} not applied ({exc}) — no changes were written to the file."
         notes.append(strategy)
 
     if working == text:
-        return f"⚠️ Nessuna modifica: il risultato è identico a {fs.display(ctx.cfg.root, p)}."
+        return f"⚠️ No change: the result is identical to {fs.display(ctx.cfg.root, p)}."
     p.write_text(working, encoding="utf-8")
-    extra = [n for n in notes if n != "esatto"]
+    extra = [n for n in notes if n != "exact"]
     suffix = f" [match: {', '.join(extra)}]" if extra else ""
-    return f"✓ Applicate {len(edits)} modifiche a {fs.display(ctx.cfg.root, p)}{suffix}."
+    return f"✓ Applied {len(edits)} edits to {fs.display(ctx.cfg.root, p)}{suffix}."
 
 
 @tool(
     "repo_map",
-    ("Mappa compatta del progetto: per ogni file sorgente le definizioni di primo "
-     "livello (funzioni, classi e relative firme). Usalo PRIMA di esplorare in "
-     "profondità, per orientarti a basso costo invece di tante chiamate list/grep/read. "
-     "È una panoramica: poi leggi col read_file i file che ti servono. Copre Python "
-     "(preciso, via AST), JS/TS, Go, Rust, Java, C#, C/C++ e molti altri linguaggi."),
+    ("Compact map of the project: for each source file, its top-level definitions "
+     "(functions, classes and their signatures). Use it BEFORE exploring in depth, to "
+     "orient yourself cheaply instead of many list/grep/read calls. It is an overview: "
+     "then read the files you need with read_file. Covers Python (precise, via AST), "
+     "JS/TS, Go, Rust, Java, C#, C/C++ and many other languages."),
     {
         "type": "object",
         "properties": {
-            "path": {"type": "string", "description": "Sottocartella da mappare (default: tutta la radice del progetto)."},
+            "path": {"type": "string", "description": "Subfolder to map (default: the whole project root)."},
         },
     },
 )
 def repo_map(ctx: ToolContext, path: str = ".") -> str:
     base = fs.resolve(ctx.cfg.root, path)
     if not base.exists():
-        return f"❌ Il path non esiste: {fs.display(ctx.cfg.root, base)}"
+        return f"❌ Path does not exist: {fs.display(ctx.cfg.root, base)}"
     return repomap.build_repo_map(ctx.cfg.root, path, ctx.cfg.repomap_max_chars)
 
 
 @tool(
     "move_path",
-    ("Sposta o rinomina un file o una cartella DENTRO la root del progetto (entrambi i capi "
-     "confinati). La destinazione non deve esistere; le cartelle intermedie vengono create. "
-     "Preferito a mv/move via run_command: cross-platform e senza sorprese."),
+    ("Move or rename a file or a folder INSIDE the project root (both endpoints "
+     "confined). The destination must not exist; intermediate folders are created. "
+     "Preferred over mv/move via run_command: cross-platform and with no surprises."),
     {
         "type": "object",
         "properties": {
-            "src": {"type": "string", "description": "Percorso di origine (file o cartella)."},
-            "dst": {"type": "string", "description": "Percorso di destinazione (non deve esistere)."},
+            "src": {"type": "string", "description": "Source path (file or folder)."},
+            "dst": {"type": "string", "description": "Destination path (must not exist)."},
         },
         "required": ["src", "dst"],
     },

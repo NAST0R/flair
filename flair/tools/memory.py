@@ -14,14 +14,14 @@ from ..core.tool import ToolContext, tool
 
 @tool(
     "remember",
-    ("Memorizza un fatto DUREVOLE e non ovvio, utile nelle sessioni future: comandi "
-     "del progetto, convenzioni, vincoli, preferenze dell'utente. UNA riga concisa "
-     "per nota. NON usarlo per lo stato del lavoro in corso (vive già nella "
-     "conversazione) né per segreti/credenziali (verrebbero rifiutati)."),
+    ("Store a DURABLE, non-obvious fact useful in future sessions: project commands, "
+     "conventions, constraints, user preferences. ONE concise line per note. Do NOT "
+     "use it for in-progress work state (it already lives in the conversation) nor "
+     "for secrets/credentials (they would be rejected)."),
     {
         "type": "object",
         "properties": {
-            "note": {"type": "string", "description": "Il fatto da ricordare, in una riga concisa."},
+            "note": {"type": "string", "description": "The fact to remember, one concise line."},
         },
         "required": ["note"],
     },
@@ -30,6 +30,6 @@ from ..core.tool import ToolContext, tool
 def remember(ctx: ToolContext, note: str) -> str:
     mem = getattr(ctx, "memory", None)
     if mem is None:
-        return "❌ Memoria di sessione non disponibile in questa modalità."
+        return "❌ Session memory is not available in this mode."
     ok, msg = mem.add(note)
     return ("✓ " if ok else "⚠️ ") + msg

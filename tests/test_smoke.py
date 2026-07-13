@@ -258,7 +258,7 @@ def test_coding_agent():
     a3 = coding_agent.build(cfg, fake3)
     a3.run("edit ambiguo")
     tmsg = [m for m in a3.messages if m["role"] == "tool"][0]["content"]
-    check("coding: edit ambiguo rifiutato", "compare 2 volte" in tmsg and (root / "amb.py").read_text() == "x = 1\nx = 1\n")
+    check("coding: edit ambiguo rifiutato", "occurs 2 times" in tmsg and (root / "amb.py").read_text() == "x = 1\nx = 1\n")
 
     # anti-loop
     loop = [LLMResponse(tool_calls=[tc("read_file", path="app.py")], usage=Usage(total_tokens=1)) for _ in range(10)]
@@ -317,7 +317,7 @@ def test_approval_gate():
     agent.run("scrivi")
     check("approval: edit distruttivo negato non scrive", (root / "f.py").read_text() == "a=1\n")
     tmsg = [m for m in agent.messages if m["role"] == "tool"][0]["content"]
-    check("approval: messaggio di annullamento", "annullata" in tmsg)
+    check("approval: messaggio di annullamento", "cancelled" in tmsg)
 
 
 # ── 9. matcher resiliente di edit_file ────────────────────────────────────────
@@ -325,15 +325,15 @@ def test_approval_gate():
 def test_apply_edit():
     # esatto
     r, k = apply_edit("def f():\n    return 1\n", "return 1", "return 2")
-    check("apply_edit: esatto", k == "esatto" and "return 2" in r)
-    # fine-riga tollerato (trailing space nel file)
+    check("apply_edit: esatto", k == "exact" and "return 2" in r)
+    # line-ending tolerant (trailing space nel file)
     r, k = apply_edit("def f():\n    x = 1   \n    return x\n", "    x = 1\n    return x",
                       "    x = 2\n    return x")
-    check("apply_edit: fine-riga", k == "fine-riga tollerato" and "x = 2" in r, k)
-    # indentazione tollerata + re-indentazione corretta
+    check("apply_edit: fine-riga", k == "line-ending tolerant" and "x = 2" in r, k)
+    # indentation tolerant + re-indentazione corretta
     src = "class A:\n    def m(self):\n        a = 1\n        b = 2\n        return a + b\n"
     r, k = apply_edit(src, "  a = 1\n  b = 2\n  return a + b", "  a = 10\n  b = 20\n  return a * b")
-    check("apply_edit: indentazione", k == "indentazione tollerata", k)
+    check("apply_edit: indentazione", k == "indentation tolerant", k)
     check("apply_edit: re-indenta a 8 spazi", "        a = 10" in r and "        return a * b\n" in r, r)
     # ambiguo (match esatto multiplo)
     try:
@@ -602,7 +602,7 @@ def test_web_search():
     finally:
         urllib.request.urlopen = orig
         web_tools.DDGS = orig_ddgs
-    check("web fail: errore onesto", out.startswith("❌ Nessun risultato") and "TAVILY_API_KEY" in out, out)
+    check("web fail: errore onesto", out.startswith("❌ No results") and "TAVILY_API_KEY" in out, out)
     check("web fail: suggerisce ddgs", "pip install ddgs" in out, out)
 
 
@@ -676,7 +676,7 @@ def test_multi_edit():
         {"old_string": "x = 1", "new_string": "x = 10"},
         {"old_string": "z = 3", "new_string": "z = 30"},
     ])
-    check("multi_edit: due modifiche applicate", out.startswith("✓") and "2 modifiche" in out)
+    check("multi_edit: due modifiche applicate", out.startswith("✓") and "2 edits" in out)
     check("multi_edit: contenuto corretto", (root / "a.py").read_text() == "x = 10\ny = 2\nz = 30\n")
 
     before = (root / "a.py").read_text()
@@ -684,7 +684,7 @@ def test_multi_edit():
         {"old_string": "x = 10", "new_string": "x = 99"},
         {"old_string": "NON_ESISTE", "new_string": "!"},
     ])
-    check("multi_edit: fallimento indica la modifica", out.startswith("❌ Modifica #2"))
+    check("multi_edit: fallimento indica la modifica", out.startswith("❌ Edit #2"))
     check("multi_edit: atomico (nessuna scrittura su errore)", (root / "a.py").read_text() == before)
 
 
@@ -711,7 +711,7 @@ def test_web_fetch():
         out = web_tools.web_fetch(ctx, url="https://x")
     finally:
         urllib.request.urlopen = orig
-    check("web_fetch: errore pulito", out.startswith("❌ Impossibile scaricare"))
+    check("web_fetch: errore pulito", out.startswith("❌ Could not fetch"))
 
 
 def test_runtime_switch_and_context():
@@ -805,10 +805,10 @@ def test_system_write_edit():
     target = root / "REPORT.md"
 
     out = st.write_file(ctx, path=str(target), content="# Titolo\n\nCorpo.\n")
-    check("system write_file: crea", target.exists() and "Creato" in out)
+    check("system write_file: crea", target.exists() and "Created" in out)
     check("system write_file: contenuto", target.read_text() == "# Titolo\n\nCorpo.\n")
     out = st.write_file(ctx, path=str(target), content="nuovo")
-    check("system write_file: sovrascrive", "Sovrascritto" in out and target.read_text() == "nuovo")
+    check("system write_file: sovrascrive", "Overwrote" in out and target.read_text() == "nuovo")
 
     nested = root / "a" / "b" / "c.txt"
     st.write_file(ctx, path=str(nested), content="ok")
@@ -851,7 +851,7 @@ def test_approval_prompt_brackets():
 
     from rich.console import Console
     c = Console(file=_io.StringIO())
-    c.print(r"procedo? \[y]es / \[n]o / \[a]lways")  # parentesi escape-ate
+    c.print(r"proceed? \[y]es / \[n]o / \[a]lways")  # parentesi escape-ate
     out = c.file.getvalue()
     check("prompt: mostra [y]es/[n]o/[a]lways letterali", "[y]es" in out and "[n]o" in out and "[a]lways" in out, out)
 
@@ -869,7 +869,7 @@ def test_help_renders():
     for token in ("/code", "/do", "/provider", "/model", "/think-model", "/compact",
                   "/save", "/load", "/sessions", "/reset", "/root", "exit"):
         check(f"help: contiene {token}", token in out, out[:200])
-    check("help: argomenti opzionali [nome] mostrati", "[nome]" in out and "<task>" in out, out[:400])
+    check("help: argomenti opzionali [nome] mostrati", "[name]" in out and "<task>" in out, out[:400])
 
 
 def test_stop_flow():
@@ -899,7 +899,7 @@ def test_stop_flow():
     answered = {m["tool_call_id"] for m in agent.messages if m["role"] == "tool"}
     check("stop: ogni tool_call risposta (conversazione valida)", tool_ids <= answered, f"{tool_ids} vs {answered}")
     tmsgs = [m["content"] for m in agent.messages if m["role"] == "tool"]
-    check("stop: l'interruzione diventa informazione", any("Interrotto dall'utente" in t for t in tmsgs))
+    check("stop: l'interruzione diventa informazione", any("Stopped by the user" in t for t in tmsgs))
 
 
 def test_keyboard_interrupt_during_model_call():
@@ -947,7 +947,7 @@ def test_keyboard_interrupt_mid_tools():
     answered = {m["tool_call_id"] for m in agent.messages if m["role"] == "tool"}
     check("ctrl-c (tool): ogni tool_call risposta (conversazione valida)", tool_ids <= answered, f"{tool_ids} vs {answered}")
     tmsgs = [m["content"] for m in agent.messages if m["role"] == "tool"]
-    check("ctrl-c (tool): interruzione registrata", any("Interrotto dall'utente" in t for t in tmsgs))
+    check("ctrl-c (tool): interruzione registrata", any("Stopped by the user" in t for t in tmsgs))
 
 
 def test_repl_survives_turn_error():
@@ -1410,14 +1410,14 @@ def test_tool_robustness():
 
     # 1) Path inesistente → errore chiaro (non un "nessuna corrispondenza" fuorviante).
     r = coding.grep(ctx, pattern="foo", path="non_esiste")
-    check("grep: path inesistente → ❌", r.startswith("❌") and "non esiste" in r, r)
+    check("grep: path inesistente → ❌", r.startswith("❌") and "does not exist" in r, r)
     g = coding.glob(ctx, pattern="*.py", path="non_esiste")
     check("glob: path inesistente → ❌", g.startswith("❌"), g)
 
     # 2) grep puntato su un FILE → cerca in quel file (prima tornava vuoto in silenzio).
     r2 = coding.grep(ctx, pattern="class Bar", path="alpha.py")
     check("grep: su un singolo file trova le corrispondenze",
-          "alpha.py" in r2 and "Nessuna" not in r2 and not r2.startswith("❌"), r2)
+          "alpha.py" in r2 and "No files match" not in r2 and not r2.startswith("❌"), r2)
 
     # Caso normale invariato: ricorsivo su cartella, attraversa le sottocartelle.
     r3 = coding.grep(ctx, pattern="foo")
@@ -1426,7 +1426,7 @@ def test_tool_robustness():
     # 3) Argomento sconosciuto: il tool gira lo stesso, con nota; nessuna eccezione.
     r4 = coding.read_file(ctx, path="alpha.py", raw=True)
     check("dispatch: kwarg sconosciuto ignorato con nota",
-          r4.startswith("ℹ️ Argomenti ignorati") and "raw" in r4.splitlines()[0], r4.splitlines()[0])
+          r4.startswith("ℹ️ Ignored arguments") and "raw" in r4.splitlines()[0], r4.splitlines()[0])
     r5 = coding.read_file(ctx, path="alpha.py", limit=1)
     check("dispatch: kwarg validi → nessuna nota", not r5.startswith("ℹ️"), r5.splitlines()[0])
 
@@ -1515,7 +1515,7 @@ def test_arg_coercion():
         (root / "f.txt").write_text("riga1\nriga2\nriga3\n", encoding="utf-8")
         out = coding.read_file(ctx, path="f.txt", offset="2", limit="1")
         check("coerce: read_file offset/limit stringa",
-              not out.startswith("❌") and "riga2" in out and "righe 2-2" in out, out.splitlines()[0])
+              not out.startswith("❌") and "riga2" in out and "lines 2-2" in out, out.splitlines()[0])
         (root / "code.py").write_text("def GREP_ME():\n    pass\n", encoding="utf-8")
         g = coding.grep(ctx, pattern="grep_me", path="code.py", ignore_case="true")
         check("coerce: grep ignore_case stringa", not g.startswith("❌") and "Nessuna" not in g, g[:60])
@@ -1532,7 +1532,7 @@ def test_truncated_args_guidance():
         # parse_tool_args ripiega su {"_raw": ...} quando gli argomenti sono troncati.
         out, ok = agent._run_tool(ToolCall(id="x", name="write_file", arguments={"_raw": '{"path":"a"'}), {})
         check("troncamento: errore azionabile, non eseguito", ok is False and out.startswith("❌"))
-        check("troncamento: suggerisce append/parti", "append=true" in out and "troncat" in out.lower(), out)
+        check("troncamento: suggerisce append/parti", "append=true" in out and "truncat" in out.lower(), out)
     finally:
         shutil.rmtree(root, ignore_errors=True)
 
@@ -1560,7 +1560,7 @@ def test_finish_reason_truncation_note():
         # "continua" riprende dal punto esatto invece di ricominciare.
         stored = agent.convo.messages[-1]["content"]
         check("finish_reason: marcatore di continuazione in cronologia",
-              "RIPRENDI" in stored and "risposta a metà" in stored, stored[-120:])
+              "RESUME" in stored and "risposta a metà" in stored, stored[-120:])
 
         # Livello CLI in STREAMING (il caso del bug): la nota va comunque mostrata.
         cli = CLI(cfg_for(root))
@@ -1576,7 +1576,7 @@ def test_finish_reason_truncation_note():
         finally:
             sys.stdout = saved_stdout
         out = cli.console.file.getvalue()
-        check("finish_reason: la CLI mostra la nota anche in streaming", "troncata" in out, out[-160:])
+        check("finish_reason: la CLI mostra la nota anche in streaming", "truncated" in out, out[-160:])
 
         # Caso ragionamento-a-vuoto: troncato MA contenuto vuoto (tutto il budget nel
         # reasoning). Niente marcatore "RIPRENDI" (inutile e si accumulerebbe), e la CLI
@@ -1597,7 +1597,7 @@ def test_finish_reason_truncation_note():
         cli2.run_task("ragiona tantissimo", agent_key="general")
         out2 = cli2.console.file.getvalue()
         check("finish_reason: guida diversa per ragionamento-a-vuoto",
-              "FLAIR_MAX_TOKENS" in out2 and "Nessuna risposta" in out2, out2[-200:])
+              "FLAIR_MAX_TOKENS" in out2 and "No answer" in out2, out2[-200:])
     finally:
         try:
             _os.chdir(cwd)
@@ -1616,11 +1616,11 @@ def test_write_file_append():
         ctx = ToolContext(cfg=cfg)
         coding.write_file(ctx, path="big.txt", content="parte1\n")
         out = coding.write_file(ctx, path="big.txt", content="parte2\n", append="true")  # stringa → bool
-        check("append: messaggio 'aggiunto in coda'", "Aggiunto in coda" in out, out)
+        check("append: messaggio 'aggiunto in coda'", "Appended to" in out, out)
         check("append: contenuto concatenato", (root / "big.txt").read_text() == "parte1\nparte2\n")
         # append su file inesistente = crea
         out2 = coding.write_file(ctx, path="nuovo.txt", content="x\n", append=True)
-        check("append: su file nuovo crea", (root / "nuovo.txt").read_text() == "x\n" and "Creato" in out2)
+        check("append: su file nuovo crea", (root / "nuovo.txt").read_text() == "x\n" and "Created" in out2)
     finally:
         shutil.rmtree(root, ignore_errors=True)
 
@@ -1878,13 +1878,13 @@ def test_plan_tool():
         {"title": "scrivere il fix", "status": "in_progress"},   # sinonimo inglese
         "eseguire i test",                                        # stringa semplice
     ])
-    check("plan: intestazione con conteggio", out.startswith("📋 Piano (1/3 fatti)"), out)
-    check("plan: simboli di stato", "✔ leggere il modulo" in out and "▸ scrivere il fix (in corso)" in out
+    check("plan: intestazione con conteggio", out.startswith("📋 Plan (1/3 done)"), out)
+    check("plan: simboli di stato", "✔ leggere il modulo" in out and "▸ scrivere il fix (in progress)" in out
           and "○ eseguire i test" in out, out)
 
     # Tolleranza: l'intera lista arriva come JSON string → la coercizione la ripara.
     via_call = plan_mod.plan(ctx, **{"steps": '[{"title": "a"}, {"title": "b", "status": "done"}]'})
-    check("plan: steps come JSON string (coercizione array)", via_call.startswith("📋 Piano (1/2 fatti)"), via_call)
+    check("plan: steps come JSON string (coercizione array)", via_call.startswith("📋 Plan (1/2 done)"), via_call)
 
     check("plan: vuoto → errore pulito", plan_mod.plan(ctx, steps=[]).startswith("❌"))
     check("plan: voci senza titolo → errore pulito", plan_mod.plan(ctx, steps=[{"status": "fatto"}]).startswith("❌"))
@@ -2018,7 +2018,7 @@ def test_prune_in_agent():
 
 
 def test_router_continuation():
-    """Le continuazioni nude restano sull'agente corrente SENZA chiamata LLM (è il
+    """Le continuazioni nude restano sull'current agent SENZA chiamata LLM (è il
     misroute visto dal vivo: 'Procedi.' instradato a general a metà task coding)."""
     from flair.core import router
     from flair.core.agent import Conversation
@@ -2291,24 +2291,24 @@ def test_session_memory():
     ok, _ = m.add("I test si lanciano con `python tests/test_smoke.py`")
     check("memoria: add ok", ok and len(m.notes) == 1)
     ok, msg = m.add("  i test SI lanciano   con `python tests/test_smoke.py` ")
-    check("memoria: dedup (case/spazi)", not ok and "già in memoria" in msg, msg)
+    check("memoria: dedup (case/spazi)", not ok and "already in memory" in msg, msg)
     ok, msg = m.add("la chiave è sk-abcdef1234567890abcd")
-    check("memoria: filtro segreti (sk-)", not ok and "segreti" in msg, msg)
+    check("memoria: filtro segreti (sk-)", not ok and "secrets" in msg, msg)
     ok, msg = m.add("api_key=xyz123segreto per il deploy")
     check("memoria: filtro segreti (api_key=)", not ok, msg)
     ok, msg = m.add("x" * 300)
-    check("memoria: nota troppo lunga rifiutata", not ok and "troppo lunga" in msg, msg)
+    check("memoria: note too long rifiutata", not ok and "too long" in msg, msg)
     piccolo = SessionMemory(max_chars=200)
     piccolo.add("nota uno abbastanza lunga da occupare spazio nel tetto totale qui")
     piccolo.add("nota due abbastanza lunga da occupare spazio nel tetto totale qui")
     ok, msg = piccolo.add("nota tre che non deve entrare perché il tetto è stato raggiunto")
-    check("memoria: tetto totale → rifiuto azionabile", not ok and "piena" in msg, msg)
+    check("memoria: tetto totale → rifiuto azionabile", not ok and "full" in msg, msg)
 
     # ── blocco per il prompt ─────────────────────────────────────────────────
     check("memoria: vuota → blocco vuoto (zero token)", SessionMemory().block() == "")
     blk = m.block()
     check("memoria: blocco con header e note",
-          "## Memoria di sessione" in blk and "test_smoke.py" in blk, blk[:80])
+          "## Session memory" in blk and "test_smoke.py" in blk, blk[:80])
 
     # ── serializzazione: roundtrip, dedup difensivo, manomissioni ────────────
     m.add("In questo repo i file devono essere LF")
@@ -2389,7 +2389,7 @@ def test_session_memory():
     cli2 = CLI(cfg2)
     cli2.console = Console(file=_io.StringIO())
     check("cli: sessione nuova → memoria vuota, prompt base", cli2.memory.notes == []
-          and "## Memoria di sessione" not in cli2.agents["coding"].system_prompt)
+          and "## Session memory" not in cli2.agents["coding"].system_prompt)
     check("cli: /load ripristina la memoria", cli2._load_session("memtest") and
           cli2.memory.notes == ["Il comando di build è `make all`"])
     check("cli: dopo /load il prompt contiene il blocco (entrambi gli agenti)",
@@ -2423,7 +2423,7 @@ def test_grep_context_and_move():
     check("grep ctx: intervalli adiacenti fusi (riga 4 una sola volta)",
           out.count("quattro") == 1 and out.count("-5-") == 1, out)
     check("grep ctx: separatore tra blocchi/file", "--" in out)
-    check("grep ctx: conteggio dei MATCH (non delle righe emesse)", out.startswith("3 corrispondenze"), out[:30])
+    check("grep ctx: conteggio dei MATCH (non delle righe emesse)", out.startswith("3 matches"), out[:30])
     # coercion da stringa + clamp
     out2 = coding.grep(ctx, pattern="BERSAGLIO", path="a.py", context="1")
     check("grep ctx: context come stringa coercito", "a.py-2- due" in out2)
@@ -2433,7 +2433,7 @@ def test_grep_context_and_move():
     outf = coding.grep(ctx, pattern="BERSAGLIO", files_only=True)
     check("grep files_only: elenca file con conteggio", "a.py (2)" in outf and "b.py (1)" in outf, outf)
     check("grep files_only: nessuna riga di testo", "qui" not in outf and ":3:" not in outf, outf)
-    check("grep files_only: etichetta corretta", outf.startswith("2 file con corrispondenze"), outf[:40])
+    check("grep files_only: etichetta corretta", outf.startswith("2 files with matches"), outf[:40])
     outfc = coding.grep(ctx, pattern="BERSAGLIO", files_only="true", context=3)
     check("grep files_only: vince su context (e coercion stringa)", "a.py (2)" in outfc and "-2-" not in outfc)
 
@@ -2445,13 +2445,13 @@ def test_grep_context_and_move():
     ok = coding.move_path(ctx, src="renamed.py", dst="nuova/dir/pro.py")
     check("move: crea cartelle intermedie", ok.startswith("✓") and (root / "nuova" / "dir" / "pro.py").exists(), ok)
     out = coding.move_path(ctx, src="sub/b.py", dst="nuova/dir/pro.py")
-    check("move: destinazione esistente → rifiuto", out.startswith("❌") and "esiste già" in out, out)
+    check("move: destinazione esistente → rifiuto", out.startswith("❌") and "already exists" in out, out)
     out = coding.move_path(ctx, src="fantasma.py", dst="x.py")
     check("move: origine mancante → errore pulito", out.startswith("❌"), out)
     out = coding.move_path(ctx, src="sub", dst="sub2")
     check("move: sposta cartelle", out.startswith("✓") and (root / "sub2" / "b.py").exists(), out)
     out = coding.move_path(ctx, src="sub2", dst="sub2/dentro")
-    check("move: destinazione dentro l'origine → rifiuto", out.startswith("❌"), out)
+    check("move: destinazione inside the source → rifiuto", out.startswith("❌"), out)
     try:
         coding.move_path(ctx, src="renamed.py", dst="../fuori.py")
         escaped = False
@@ -2479,54 +2479,54 @@ def test_honest_reads_and_inventory():
     big.write_text("\n".join(f"riga_{i} = {i}" for i in range(1, 2001)))
     out = fs.read_file_impl(None, str(big), offset=1, limit=None, max_chars=2000)
     import re as _re
-    m = _re.search(r"\(righe (\d+)-(\d+) di (\d+)\)", out)
+    m = _re.search(r"\(lines (\d+)-(\d+) of (\d+)\)", out)
     lo, hi, tot = int(m.group(1)), int(m.group(2)), int(m.group(3))
     check("read onesto: header dichiara meno del totale", lo == 1 and hi < tot and tot == 2000, m.group(0))
     body_lines = [x for x in out.splitlines()[1:] if _re.match(r"\s*\d+ \| ", x)]
     check("read onesto: header == righe davvero consegnate", len(body_lines) == hi, f"{len(body_lines)} vs {hi}")
     check("read onesto: hint di continuazione presente e corretto",
-          f"continua con read_file(path, offset={hi + 1})" in out, out[-90:])
+          f"continue with read_file(path, offset={hi + 1})" in out, out[-90:])
     check("read onesto: budget rispettato", len(out) <= 2000, str(len(out)))
     out2 = fs.read_file_impl(None, str(big), offset=hi + 1, limit=None, max_chars=2000)
-    check("read onesto: la continuazione riparte dal punto giusto", f"(righe {hi + 1}-" in out2, out2[:60])
+    check("read onesto: la continuazione riparte dal punto giusto", f"(lines {hi + 1}-" in out2, out2[:60])
     # file piccolo: comportamento invariato, nessun hint
     small = d / "s.py"
     small.write_text("a = 1\nb = 2\n")
     outs = fs.read_file_impl(None, str(small), offset=1, limit=None, max_chars=12000)
-    check("read onesto: file piccolo integro senza hint", "(righe 1-2 di 2)" in outs and "restano" not in outs, outs)
+    check("read onesto: file piccolo integro senza hint", "(lines 1-2 of 2)" in outs and " more lines;" not in outs, outs)
     # riga singola enorme: consegna comunque qualcosa, con la rete _trunc
     mono = d / "min.js"
     mono.write_text("x" * 9000)
     outm = fs.read_file_impl(None, str(mono), offset=1, limit=None, max_chars=1000)
     check("read onesto: riga enorme → rete _trunc, nessun crash",
-          outm.startswith(str(mono)[:0] + fs.display(None, mono)) and "troncato" in outm, outm[:60])
+          outm.startswith(str(mono)[:0] + fs.display(None, mono)) and "truncated" in outm, outm[:60])
 
-    # ── inventario meccanico dal transcript potato ────────────────────────────
+    # ── mechanical inventory dal transcript potato ────────────────────────────
     def rf_call(cid, path):
         return {"role": "assistant", "tool_calls": [{"id": cid, "type": "function",
                 "function": {"name": "read_file", "arguments": json_module.dumps({"path": path})}}]}
     msgs = [
         rf_call("1", "pyproject.toml"),
-        {"role": "tool", "tool_call_id": "1", "content": "pyproject.toml (righe 1-49 di 49)\n..."},
+        {"role": "tool", "tool_call_id": "1", "content": "pyproject.toml (lines 1-49 of 49)\n..."},
         rf_call("2", "tests/test_smoke.py"),
-        {"role": "tool", "tool_call_id": "2", "content": "...\n...[restano 2241 righe; continua con read_file(path, offset=301)]"},
+        {"role": "tool", "tool_call_id": "2", "content": "...\n...[2241 more lines; continue with read_file(path, offset=301)]"},
         rf_call("3", "pyproject.toml"),   # riletto: resta completo
-        {"role": "tool", "tool_call_id": "3", "content": "pyproject.toml (righe 1-49 di 49)"},
+        {"role": "tool", "tool_call_id": "3", "content": "pyproject.toml (lines 1-49 of 49)"},
         {"role": "assistant", "tool_calls": [{"id": "4", "type": "function",
             "function": {"name": "grep", "arguments": "{\"pattern\": \"x\"}"}}]},
         {"role": "tool", "tool_call_id": "4", "content": "1 corrispondenza"},
     ]
     inv = Agent._read_inventory(msgs)
     check("inventario: path in ordine di prima lettura, dedup", inv.startswith("pyproject.toml, tests/test_smoke.py"), inv)
-    check("inventario: parziale marcato", "tests/test_smoke.py (parziale)" in inv, inv)
-    check("inventario: completo non marcato", "pyproject.toml (parziale)" not in inv, inv)
+    check("inventario: parziale marcato", "tests/test_smoke.py (partial)" in inv, inv)
+    check("inventario: completo non marcato", "pyproject.toml (partial)" not in inv, inv)
     check("inventario: tool non-read ignorati", "grep" not in inv, inv)
     many = []
     for i in range(80):
         many.append(rf_call(f"m{i}", f"cartella/file_{i:03}.py"))
-        many.append({"role": "tool", "tool_call_id": f"m{i}", "content": "ok (righe 1-3 di 3)"})
+        many.append({"role": "tool", "tool_call_id": f"m{i}", "content": "ok (lines 1-3 of 3)"})
     invm = Agent._read_inventory(many)
-    check("inventario: tetto con conteggio dei rimanenti", len(invm) < 1000 and "… e altri" in invm, invm[-30:])
+    check("inventario: tetto con conteggio dei rimanenti", len(invm) < 1000 and "… and" in invm, invm[-30:])
     check("inventario: vuoto se nessuna read_file", Agent._read_inventory(msgs[-2:]) == "")
 
 

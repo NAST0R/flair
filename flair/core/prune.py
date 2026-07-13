@@ -41,8 +41,8 @@ _PRUNABLE = {
 # Sotto questa dimensione lo stub non ripaga (e i messaggi d'errore restano leggibili).
 _MIN_CHARS = 200
 
-STUB = ("[output superato: lo stesso target è stato riletto o riscritto più avanti — "
-        "fai riferimento alla versione più recente nella conversazione]")
+STUB = ("[superseded output: the same target was re-read or rewritten later — "
+        "refer to the most recent version in the conversation]")
 
 
 def _norm_path(p) -> str | None:

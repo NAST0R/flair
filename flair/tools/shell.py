@@ -96,7 +96,7 @@ def run_command_impl(command: str, timeout: int, cwd: str | None, max_chars: int
     try:
         proc = run_shell(command, timeout, cwd=cwd)
     except subprocess.TimeoutExpired:
-        return f"❌ Comando andato in timeout dopo {timeout}s: {command}"
+        return f"❌ Command timed out after {timeout}s: {command}"
     except Exception as exc:  # noqa: BLE001
-        return f"❌ Errore eseguendo il comando: {exc}"
-    return format_command_output(proc, command, max_chars, hint="filtra o reindirizza l'output")
+        return f"❌ Error running the command: {exc}"
+    return format_command_output(proc, command, max_chars, hint="filter or redirect the output")

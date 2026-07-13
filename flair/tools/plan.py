@@ -25,20 +25,20 @@ _MAX_TITLE = 200
 
 # Stati canonici e sinonimi tollerati (il modello mescola le lingue).
 _STATUS = {
-    "da_fare": "da_fare", "todo": "da_fare", "pending": "da_fare", "aperto": "da_fare",
-    "in_corso": "in_corso", "in_progress": "in_corso", "doing": "in_corso", "wip": "in_corso",
-    "fatto": "fatto", "done": "fatto", "completed": "fatto", "completato": "fatto", "ok": "fatto",
+    "todo": "todo", "da_fare": "todo", "pending": "todo", "aperto": "todo",
+    "in_progress": "in_progress", "in_corso": "in_progress", "doing": "in_progress", "wip": "in_progress",
+    "done": "done", "fatto": "done", "completed": "done", "completato": "done", "ok": "done",
 }
-_ICON = {"da_fare": "○", "in_corso": "▸", "fatto": "✔"}
+_ICON = {"todo": "○", "in_progress": "▸", "done": "✔"}
 
 
 def _normalize(step) -> tuple[str, str] | None:
     """(titolo, status) da una voce; None se la voce è inutilizzabile."""
     if isinstance(step, str):
-        title, status = step, "da_fare"
+        title, status = step, "todo"
     elif isinstance(step, dict):
         title = step.get("title") or step.get("titolo") or step.get("content") or ""
-        status = str(step.get("status") or step.get("stato") or "da_fare")
+        status = str(step.get("status") or step.get("stato") or "todo")
     else:
         return None
     title = " ".join(str(title).split())
@@ -46,14 +46,14 @@ def _normalize(step) -> tuple[str, str] | None:
         return None
     if len(title) > _MAX_TITLE:
         title = title[: _MAX_TITLE - 1] + "…"
-    return title, _STATUS.get(status.strip().lower(), "da_fare")
+    return title, _STATUS.get(status.strip().lower(), "todo")
 
 
 @tool(
     "plan",
     ("Scrive o aggiorna la scaletta dei passi per il task corrente. Usalo all'inizio "
      "dei task multi-step (3+ passi distinti) e RIscrivilo man mano che procedi, "
-     "marcando ogni passo come da_fare, in_corso o fatto e aggiungendo/rimuovendo passi "
+     "marking each step as todo, in_progress or done, adding/removing steps "
      "se il piano cambia. Ti tiene focalizzato e evita passi sprecati. Per i task "
      "semplici (1-2 passi) non serve."),
     {
@@ -66,8 +66,8 @@ def _normalize(step) -> tuple[str, str] | None:
                     "type": "object",
                     "properties": {
                         "title": {"type": "string", "description": "Il passo, breve e concreto."},
-                        "status": {"type": "string", "enum": ["da_fare", "in_corso", "fatto"],
-                                   "description": "Stato del passo (default: da_fare)."},
+                        "status": {"type": "string", "enum": ["todo", "in_progress", "done"],
+                                   "description": "Step status (default: todo)."},
                     },
                     "required": ["title"],
                 },
@@ -78,17 +78,17 @@ def _normalize(step) -> tuple[str, str] | None:
 )
 def plan(ctx: ToolContext, steps: list) -> str:
     if not isinstance(steps, list) or not steps:
-        return "❌ Scaletta vuota: passa `steps` con almeno un passo ({title, status})."
+        return "❌ Empty plan: pass `steps` with at least one step ({title, status})."
     norm = [n for n in (_normalize(s) for s in steps) if n]
     if not norm:
-        return "❌ Nessun passo valido: ogni voce deve avere un `title`."
+        return "❌ No valid steps: each entry must have a `title`."
     extra = ""
     if len(norm) > _MAX_STEPS:
         extra = f"\n…[{len(norm) - _MAX_STEPS} passi oltre il limite di {_MAX_STEPS}: accorpa la scaletta]"
         norm = norm[:_MAX_STEPS]
-    done = sum(1 for _, st in norm if st == "fatto")
-    lines = [f"📋 Piano ({done}/{len(norm)} fatti)"]
+    done = sum(1 for _, st in norm if st == "done")
+    lines = [f"📋 Plan ({done}/{len(norm)} done)"]
     for title, st in norm:
-        suffix = " (in corso)" if st == "in_corso" else ""
+        suffix = " (in progress)" if st == "in_progress" else ""
         lines.append(f"  {_ICON[st]} {title}{suffix}")
     return "\n".join(lines) + extra

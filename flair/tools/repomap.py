@@ -317,15 +317,15 @@ def build_repo_map(root: Path | None, rel_path: str, max_chars: int) -> str:
             continue
         shown = syms[:_MAX_SYMBOLS]
         if len(syms) > _MAX_SYMBOLS:
-            shown.append(f"… (+{len(syms) - _MAX_SYMBOLS} altri)")
+            shown.append(f"… (+{len(syms) - _MAX_SYMBOLS} more)")
         body = "\n".join("    " + s for s in shown)
         blocks.append(f"{display(root, full)}\n{body}")
 
     if not blocks:
-        return (f"Nessuna definizione sorgente mappabile sotto {display(root, base)}. "
-                "Usa list_directory/glob per vedere i file.")
+        return (f"No mappable source definitions under {display(root, base)}. "
+                "Use list_directory/glob to see the files.")
 
-    header = f"Mappa del progetto ({len(blocks)} file con definizioni):\n\n"
+    header = f"Project map ({len(blocks)} files with definitions):\n\n"
     note = "\n\n[Scansione limitata ai primi file per sicurezza.]" if capped else ""
     return _trunc(header + "\n\n".join(blocks) + note, max_chars,
                   hint="mappa una sottocartella con `path` per restringere")

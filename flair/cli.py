@@ -163,7 +163,7 @@ class CLI:
         try:
             os.chdir(self.cfg.root)
         except OSError as exc:
-            self.console.print(f"[yellow]⚠ non riesco a spostarmi in {self.cfg.root}: {exc}[/yellow]")
+            self.console.print(f"[yellow]⚠ could not change directory to {self.cfg.root}: {exc}[/yellow]")
 
     def _apply_root(self, new_root: Path) -> None:
         """Cambia la root a runtime (comando /root): aggiorna cfg.root, allinea la
@@ -222,8 +222,8 @@ class CLI:
         if self.cfg.memory_enabled:
             _, truncated = self.memory.load_text(self.session.load_memory(name))
             if truncated:
-                self.console.print("[yellow]⚠ memoria oltre il tetto: caricata troncata "
-                                   f"({self.memory.used_chars()}/{self.memory.max_chars} caratteri).[/yellow]")
+                self.console.print("[yellow]⚠ memory over the cap: loaded truncated "
+                                   f"({self.memory.used_chars()}/{self.memory.max_chars} chars).[/yellow]")
             self._refresh_memory_prompts()
         return True
 
@@ -276,20 +276,20 @@ class CLI:
         if self.output_mode != "human":
             return
         self._newline_if_needed()
-        self.console.print(f"[dim]  ✂ contesto: potati {count} output di tool superati[/dim]")
+        self.console.print(f"[dim]  ✂ context: pruned {count} superseded tool outputs[/dim]")
 
     def _on_reasoning(self, text: str) -> None:
         if self.output_mode != "human":
             return
         self._newline_if_needed()
         self.console.print(Panel(Text(text.strip(), style="italic dim"),
-                                 title="[dim]ragionamento[/dim]", border_style="dim", padding=(0, 1)))
+                                 title="[dim]reasoning[/dim]", border_style="dim", padding=(0, 1)))
 
     def _on_compact(self, before: int, after: int) -> None:
         if self.output_mode != "human":
             return
         self._newline_if_needed()
-        self.console.print(f"[dim]  ⟳ contesto compattato: {before} → {after} messaggi[/dim]")
+        self.console.print(f"[dim]  ⟳ context compacted: {before} → {after} messages[/dim]")
 
     # ── approvazione + anteprima diff ─────────────────────────────────────────
 
@@ -303,11 +303,11 @@ class CLI:
             self.console.print(preview)
         else:
             target = args.get("command") or args.get("path") or args.get("name") or args.get("script") or ""
-            self.console.print(f"  [yellow]⚠ conferma[/yellow] [bold]{name}[/bold] → {_short(target, 80)}")
+            self.console.print(f"  [yellow]⚠ confirm[/yellow] [bold]{name}[/bold] → {_short(target, 80)}")
 
         try:
             # Le parentesi quadre sono escape-ate: Rich le interpreterebbe come markup.
-            ans = self.console.input(r"    procedo? \[y]es / \[n]o / \[a]lways / \[s]top ").strip().lower()
+            ans = self.console.input(r"    proceed? \[y]es / \[n]o / \[a]lways / \[s]top ").strip().lower()
         except (EOFError, KeyboardInterrupt):
             self.console.print()
             return "stop"   # Ctrl-C/EOF al prompt = ferma il flusso
@@ -315,7 +315,7 @@ class CLI:
             return "stop"
         if ans in ("a", "always", "sempre"):
             self._always_allow.add(name)
-            self.console.print(f"[dim]  ok: non chiederò più conferma per «{name}» in questa sessione.[/dim]")
+            self.console.print(f"[dim]  ok: I won't ask again for «{name}» in this session.[/dim]")
             return True
         # NB: 's' è riservato a stop; per il sì in italiano si usa 'si'/'sì'.
         return ans in ("y", "yes", "si", "sì")
@@ -338,7 +338,7 @@ class CLI:
                                            args.get("replace_all", False))
                 except ToolError as exc:
                     return Panel(
-                        Text(f"⚠ {exc}\nL'edit probabilmente fallirà (old_string non trovato o ambiguo).",
+                        Text(f"⚠ {exc}\nThe edit will likely fail (old_string not found or ambiguous).",
                              style="yellow"),
                         title=f"[yellow]{name}[/yellow] · {fs.display(self.cfg.root, p)}",
                         border_style="yellow", padding=(0, 1))
@@ -379,12 +379,12 @@ class CLI:
             self.run_task(task, agent_key=agent_key, think=think)
         except KeyboardInterrupt:
             self._newline_if_needed()
-            self.console.print("[yellow]⏹ Turno interrotto. Sei tornato al prompt.[/yellow]\n")
+            self.console.print("[yellow]⏹ Turn interrupted. You're back at the prompt.[/yellow]\n")
         except Exception as exc:  # noqa: BLE001
             self._newline_if_needed()
-            self.console.print(f"[red]⚠ Il turno è fallito: {type(exc).__name__}: {exc}[/red]")
-            self.console.print("[dim]Puoi riprovare. Se è un timeout di rete del modello, "
-                               "riprova tra poco o abbassa FLAIR_TIMEOUT.[/dim]\n")
+            self.console.print(f"[red]⚠ The turn failed: {type(exc).__name__}: {exc}[/red]")
+            self.console.print("[dim]You can retry. If it is a model network timeout, "
+                               "try again shortly or lower FLAIR_TIMEOUT.[/dim]\n")
 
     def _emit_json(self, obj: dict) -> None:
         # Una sola riga JSON su stdout (JSONL-friendly), nient'altro in modalità json.
@@ -404,7 +404,7 @@ class CLI:
                 self._emit_json({"ok": False, "agent": self.last_agent, "stopped_reason": "interrupted",
                                  "response": "", "error": "interrotto"})
             elif self.output_mode == "human":
-                self.console.print("[yellow]⏹ Interrotto.[/yellow]")
+                self.console.print("[yellow]⏹ Interrupted.[/yellow]")
             return 130
         except Exception as exc:  # noqa: BLE001
             self._newline_if_needed()
@@ -412,7 +412,7 @@ class CLI:
                 self._emit_json({"ok": False, "agent": self.last_agent, "stopped_reason": "error",
                                  "response": "", "error": f"{type(exc).__name__}: {exc}"})
             elif self.output_mode == "human":
-                self.console.print(f"[red]⚠ Errore: {type(exc).__name__}: {exc}[/red]")
+                self.console.print(f"[red]⚠ Error: {type(exc).__name__}: {exc}[/red]")
             return 1
 
         if self.output_mode == "json":
@@ -433,7 +433,7 @@ class CLI:
         human = self.output_mode == "human"
 
         if human:
-            self.console.print(f"[dim]→ agente: {agent_key}[/dim]")
+            self.console.print(f"[dim]→ agent: {agent_key}[/dim]")
         if human and self.cfg.stream:
             self.console.print(f"[bold cyan]flair · {agent_key}[/bold cyan]")
             result = agent.run(task, think=think)
@@ -443,27 +443,27 @@ class CLI:
             result = agent.run(task, think=think)
             if human and result.stopped_reason not in ("stopped", "budget"):
                 self.console.print(Panel(
-                    Markdown(result.content or "(vuoto)"),
+                    Markdown(result.content or "(empty)"),
                     title=f"[bold cyan]flair · {agent_key}[/bold cyan]",
                     border_style="cyan", padding=(1, 2),
                 ))
 
         if human and result.stopped_reason == "stopped":
-            self.console.print("[yellow]⏹ Flusso interrotto: hai ripreso il controllo. Dimmi come procedere.[/yellow]\n")
+            self.console.print("[yellow]⏹ Flow stopped: you're back in control. Tell me how to proceed.[/yellow]\n")
         if human and result.stopped_reason == "budget":
-            self.console.print("[yellow]⏹ Interrotto: raggiunto il tetto di costo "
+            self.console.print("[yellow]⏹ Stopped: cost cap reached "
                                "(--max-cost / FLAIR_MAX_COST).[/yellow]\n")
         if human and result.truncated:
             if (result.content or "").strip():
-                self.console.print("[yellow]⚠ Risposta troncata: raggiunto il limite di token in output. "
-                                   "Chiedi di continuare, o aumenta FLAIR_MAX_TOKENS.[/yellow]")
+                self.console.print("[yellow]⚠ Response truncated: output token limit reached. "
+                                   "Ask to continue, or raise FLAIR_MAX_TOKENS.[/yellow]")
             else:
                 # Tutto il budget è finito nel ragionamento, prima di produrre una risposta:
                 # "continuare" non aiuta (il ragionamento non si riporta). Indica il fix vero.
-                self.console.print("[yellow]⚠ Nessuna risposta: il budget di output (FLAIR_MAX_TOKENS) "
-                                   "si è esaurito durante il ragionamento. Con un modello 'thinking' "
-                                   "serve molto più di 8000: alza FLAIR_MAX_TOKENS, oppure usa il modello "
-                                   "veloce (senza --think) per il lavoro coi tool.[/yellow]")
+                self.console.print("[yellow]⚠ No answer: the output budget (FLAIR_MAX_TOKENS) "
+                                   "was exhausted during reasoning. A 'thinking' model needs "
+                                   "far more than 8000: raise FLAIR_MAX_TOKENS, or use the fast "
+                                   "model (without --think) for tool work.[/yellow]")
 
         if self.logger:
             self.logger.log_turn(agent_key, task, result, self._turn_tools)
@@ -486,16 +486,16 @@ class CLI:
                 f"| cache hit {cache_pct}% | ~${cost:.4f}")
 
     def _print_turn(self, usage: Usage, steps: int, reason: str) -> None:
-        labels = {"max_steps": "max step", "loop": "loop rilevato", "stopped": "interrotto", "budget": "budget"}
+        labels = {"max_steps": "max steps", "loop": "loop detected", "stopped": "stopped", "budget": "budget"}
         flag = f" | [yellow]{labels[reason]}[/yellow]" if reason in labels else ""
-        self.console.print(f"[dim]  questo turno · step {steps} · {self._cost_line(usage)}{flag}[/dim]")
+        self.console.print(f"[dim]  this turn · step {steps} · {self._cost_line(usage)}{flag}[/dim]")
 
     def _print_session(self) -> None:
-        self.console.print(f"[dim]  sessione     · {self._cost_line(self._session_usage())}[/dim]")
+        self.console.print(f"[dim]  session   · {self._cost_line(self._session_usage())}[/dim]")
         if self.last_agent:
             tokens, frac = self.agents[self.last_agent].context_fill()
             self.console.print(
-                f"[dim]  contesto     · {self.last_agent}: {round(frac * 100)}% "
+                f"[dim]  context   · {self.last_agent}: {round(frac * 100)}% "
                 f"({_kfmt(tokens)}/{_kfmt(self.cfg.context_window)})[/dim]")
         self._maybe_cost_warn()
         self.console.print()
@@ -505,7 +505,7 @@ class CLI:
             cost = self.provider.estimate_cost(self._session_usage(), self.cfg)
             if cost >= self.cfg.cost_warn:
                 self.console.print(
-                    f"[yellow]  ⚠ costo sessione ~${cost:.4f}: superata la soglia di "
+                    f"[yellow]  ⚠ session cost ~${cost:.4f}: over the warning threshold of "
                     f"${self.cfg.cost_warn:.2f} (FLAIR_COST_WARN)[/yellow]")
                 self._cost_warned = True
 
@@ -514,26 +514,26 @@ class CLI:
     def _print_help(self) -> None:
         table = Table(box=box.SIMPLE_HEAD, show_header=True, header_style="bold cyan",
                       padding=(0, 3, 0, 0), border_style="dim")
-        table.add_column("comando", style="bold", no_wrap=True)
-        table.add_column("cosa fa", style="dim")
+        table.add_column("command", style="bold", no_wrap=True)
+        table.add_column("what it does", style="dim")
         for cmd, desc in (
-            ("/code <task>", "forza l'agente di coding"),
-            ("/do <task>", "forza l'agente generico"),
-            ("/think <task>", "primo passo col modello thinking"),
-            ("/agent", "mostra l'agente corrente (sticky)"),
-            ("/tools", "elenca i tool dell'agente attivo"),
-            ("/provider [nome]", "mostra o cambia provider (deepseek|openai)"),
-            ("/model <nome>", "cambia il modello veloce a runtime"),
-            ("/think-model <nome>", "cambia il modello thinking a runtime"),
-            ("/compact", "compatta subito il contesto dell'agente attivo"),
-            ("/cost", "riepilogo token/costo della sessione"),
-            ("/save [nome]", "salva la sessione (default: nome corrente)"),
-            ("/load <nome>", "riprende una sessione salvata"),
-            ("/sessions", "elenca le sessioni salvate"),
-            ("/memory [clear]", "mostra (o svuota) la memoria di sessione"),
-            ("/reset", "azzera la conversazione condivisa"),
-            ("/root <path>", "cambia la cartella di lavoro (coding + general; ricarica le istruzioni)"),
-            ("/help", "questo aiuto"),
+            ("/code <task>", "force the coding agent"),
+            ("/do <task>", "force the general agent"),
+            ("/think <task>", "first step with the thinking model"),
+            ("/agent", "show the current (sticky) agent"),
+            ("/tools", "list the active agent's tools"),
+            ("/provider [name]", "show or switch provider (deepseek|openai)"),
+            ("/model <name>", "switch the fast model at runtime"),
+            ("/think-model <name>", "switch the thinking model at runtime"),
+            ("/compact", "compact the active agent's context now"),
+            ("/cost", "token/cost summary for the session"),
+            ("/save [name]", "save the session (default: current name)"),
+            ("/load <name>", "resume a saved session"),
+            ("/sessions", "list saved sessions"),
+            ("/memory [clear]", "show (or clear) the session memory"),
+            ("/reset", "reset the shared conversation"),
+            ("/root <path>", "change the working folder (coding + general; reloads instructions)"),
+            ("/help", "this help"),
             ("exit | quit", "esci"),
         ):
             table.add_row(Text(cmd), desc)
@@ -547,7 +547,7 @@ class CLI:
         table = Table(box=box.SIMPLE_HEAD, show_header=True, header_style="bold cyan",
                       padding=(0, 3, 0, 0), border_style="dim")
         table.add_column("tool", style="bold", no_wrap=True)
-        table.add_column("cosa fa", style="dim")
+        table.add_column("what it does", style="dim")
         for name, desc in self.agents[key].toolset.catalog():
             icon = _TOOL_ICON.get(name, "🔧")
             line = " ".join(desc.split())                  # normalizza gli spazi
@@ -556,36 +556,36 @@ class CLI:
             table.add_row(Text(f"{icon} {name}"), line)
         self.console.print(table)
         self.console.print(
-            f"[dim]Tool dell'agente «{key}»"
-            f"{' (sticky)' if self.last_agent else ' (default; nessun turno ancora)'}. "
-            "Cambia agente con /code, /do.[/dim]\n")
+            f"[dim]Tools of the «{key}» agent"
+            f"{' (sticky)' if self.last_agent else ' (default; no turn yet)'}. "
+            "Switch agent with /code, /do.[/dim]\n")
 
     def repl(self) -> None:
         pc = self.cfg.active
         log_note = f"\nlog: {self.logger.path}" if self.logger else ""
-        sess_note = f" | sessione: {self.session_name}" if self.session_name else ""
+        sess_note = f" | session: {self.session_name}" if self.session_name else ""
         self.console.print(Panel(
             Text.from_markup(
-                f"[bold cyan]flair {__version__}[/bold cyan] [dim]— assistente AI (coding + generico)[/dim]\n"
-                f"[dim]provider: {self.cfg.provider} | modello: {pc.model} | thinking: {pc.think_model}{sess_note}\n"
+                f"[bold cyan]flair {__version__}[/bold cyan] [dim]— AI assistant (coding + general)[/dim]\n"
+                f"[dim]provider: {self.cfg.provider} | model: {pc.model} | thinking: {pc.think_model}{sess_note}\n"
                 f"root: {self.cfg.root}{log_note}[/dim]"
             ),
             border_style="cyan", padding=(1, 2),
         ))
-        self.console.print("[dim]/help per i comandi. Scrivi una richiesta (coding o generica).[/dim]\n")
+        self.console.print("[dim]/help for commands. Type a request (coding or general).[/dim]\n")
 
         while True:
             try:
                 line = self.console.input("[bold green]▶[/bold green] ").strip()
             except (EOFError, KeyboardInterrupt):
-                self.console.print("\n[dim]ciao![/dim]")
+                self.console.print("\n[dim]bye![/dim]")
                 return
             if not line:
                 continue
             low = line.lower()
 
             if low in ("exit", "quit", "q"):
-                self.console.print("[dim]ciao![/dim]")
+                self.console.print("[dim]bye![/dim]")
                 return
             if low == "/help":
                 self._print_help()
@@ -599,30 +599,30 @@ class CLI:
                 self.console.print("[yellow]conversazione azzerata.[/yellow]\n")
                 continue
             if low == "/cost":
-                self.console.print(f"[dim]  sessione · {self._cost_line(self._session_usage())}[/dim]\n")
+                self.console.print(f"[dim]  session · {self._cost_line(self._session_usage())}[/dim]\n")
                 continue
             if low == "/agent":
-                self.console.print(f"[dim]agente corrente (sticky): {self.last_agent or 'nessuno'}[/dim]\n")
+                self.console.print(f"[dim]current agent (sticky): {self.last_agent or 'none'}[/dim]\n")
                 continue
             if low == "/sessions":
                 items = self.session.list()
                 if not items:
-                    self.console.print("[dim]nessuna sessione salvata.[/dim]\n")
+                    self.console.print("[dim]no saved sessions.[/dim]\n")
                 else:
                     body = "\n".join(f"  • {n}  [dim]{ts}[/dim]" for n, ts in items)
-                    self.console.print(f"[dim]sessioni salvate:[/dim]\n{body}\n")
+                    self.console.print(f"[dim]saved sessions:[/dim]\n{body}\n")
                 continue
             if low.startswith("/memory"):
                 if not self.cfg.memory_enabled:
-                    self.console.print("[dim]memoria disabilitata (FLAIR_MEMORY=false).[/dim]\n")
+                    self.console.print("[dim]memory disabled (FLAIR_MEMORY=false).[/dim]\n")
                     continue
                 arg = line.split(maxsplit=1)[1].strip().lower() if len(line.split(maxsplit=1)) == 2 else ""
                 if arg == "clear":
                     if not self.memory.notes:
-                        self.console.print("[dim]memoria già vuota.[/dim]\n")
+                        self.console.print("[dim]memory already empty.[/dim]\n")
                         continue
                     try:
-                        ans = self.console.input(f"    svuoto {len(self.memory.notes)} note? \\[y]es / \\[n]o ").strip().lower()
+                        ans = self.console.input(f"    clear {len(self.memory.notes)} notes? \\[y]es / \\[n]o ").strip().lower()
                     except (EOFError, KeyboardInterrupt):
                         self.console.print()
                         continue
@@ -630,49 +630,49 @@ class CLI:
                         self.memory.clear()
                         self._refresh_memory_prompts()   # confine esplicito: il prompt perde il blocco
                         self._save_session()             # se la sessione è salvata, rimuove anche il sidecar
-                        self.console.print("[yellow]memoria svuotata.[/yellow]\n")
+                        self.console.print("[yellow]memory cleared.[/yellow]\n")
                     continue
                 if arg:
-                    self.console.print("[dim]uso: /memory  oppure  /memory clear[/dim]\n")
+                    self.console.print("[dim]usage: /memory  or  /memory clear[/dim]\n")
                     continue
                 if not self.memory.notes:
-                    self.console.print("[dim]memoria vuota. L'agente vi appunta fatti durevoli col tool "
-                                       "`remember`; le note seguono la sessione (/save, /load).[/dim]\n")
+                    self.console.print("[dim]memory is empty. The agent jots durable facts here with the "
+                                       "`remember` tool; notes follow the session (/save, /load).[/dim]\n")
                     continue
                 body = "\n".join(f"  {i}. {n}" for i, n in enumerate(self.memory.notes, 1))
-                self.console.print(f"[dim]memoria di sessione "
-                                   f"({self.memory.used_chars()}/{self.memory.max_chars} caratteri):[/dim]\n{body}\n")
+                self.console.print(f"[dim]session memory "
+                                   f"({self.memory.used_chars()}/{self.memory.max_chars} chars):[/dim]\n{body}\n")
                 continue
             if low.startswith("/save"):
                 parts = line.split(maxsplit=1)
                 name = parts[1].strip() if len(parts) == 2 else (self.session_name or "default")
                 self.session_name = name
                 path = self.session.save(name, self._session_state())
-                msg = f"[green]sessione salvata: {name}[/green]" if path else "[red]salvataggio fallito (vedi log).[/red]"
+                msg = f"[green]session saved: {name}[/green]" if path else "[red]save failed (see the log).[/red]"
                 self.console.print(msg + "\n")
                 continue
             if low.startswith("/load"):
                 parts = line.split(maxsplit=1)
                 if len(parts) != 2:
-                    self.console.print("[dim]uso: /load <nome>[/dim]\n")
+                    self.console.print("[dim]usage: /load <name>[/dim]\n")
                 elif self._load_session(parts[1].strip()):
-                    self.console.print(f"[green]sessione ripresa: {self.session_name}[/green]\n")
+                    self.console.print(f"[green]session resumed: {self.session_name}[/green]\n")
                 else:
-                    self.console.print(f"[yellow]sessione '{parts[1].strip()}' non trovata.[/yellow]\n")
+                    self.console.print(f"[yellow]session '{parts[1].strip()}' not found.[/yellow]\n")
                 continue
             if low == "/compact":
                 if self.last_agent:
                     if not self.agents[self.last_agent].compact():
-                        self.console.print("[dim]niente da compattare.[/dim]\n")
+                        self.console.print("[dim]nothing to compact.[/dim]\n")
                 else:
-                    self.console.print("[dim]nessuna conversazione attiva.[/dim]\n")
+                    self.console.print("[dim]no active conversation.[/dim]\n")
                 continue
             if low.startswith("/provider"):
                 parts = line.split(maxsplit=1)
                 if len(parts) == 2:
                     target = parts[1].strip().lower()
                     if target not in ("deepseek", "openai"):
-                        self.console.print("[yellow]provider non valido (deepseek|openai).[/yellow]\n")
+                        self.console.print("[yellow]invalid provider (deepseek|openai).[/yellow]\n")
                     else:
                         self.cfg.provider = target
                         self.cfg.refresh_pricing()
@@ -680,27 +680,27 @@ class CLI:
                         for a in self.agents.values():
                             a.provider = self.provider
                         pc = self.cfg.active
-                        self.console.print(f"[yellow]provider → {target} | modello: {pc.model} | thinking: {pc.think_model}[/yellow]\n")
+                        self.console.print(f"[yellow]provider → {target} | model: {pc.model} | thinking: {pc.think_model}[/yellow]\n")
                 else:
                     pc = self.cfg.active
-                    self.console.print(f"[dim]provider: {self.cfg.provider} | modello: {pc.model} | thinking: {pc.think_model}[/dim]\n")
+                    self.console.print(f"[dim]provider: {self.cfg.provider} | model: {pc.model} | thinking: {pc.think_model}[/dim]\n")
                 continue
             if low.startswith("/think-model"):
                 parts = line.split(maxsplit=1)
                 if len(parts) == 2:
                     self.cfg.active.think_model = parts[1].strip()
-                    self.console.print(f"[yellow]modello thinking → {self.cfg.active.think_model}[/yellow]\n")
+                    self.console.print(f"[yellow]thinking model → {self.cfg.active.think_model}[/yellow]\n")
                 else:
-                    self.console.print("[dim]uso: /think-model <nome>[/dim]\n")
+                    self.console.print("[dim]usage: /think-model <name>[/dim]\n")
                 continue
             if low.startswith("/model"):
                 parts = line.split(maxsplit=1)
                 if len(parts) == 2:
                     self.cfg.active.model = parts[1].strip()
                     self.cfg.refresh_pricing()
-                    self.console.print(f"[yellow]modello → {self.cfg.active.model}[/yellow]\n")
+                    self.console.print(f"[yellow]model → {self.cfg.active.model}[/yellow]\n")
                 else:
-                    self.console.print("[dim]uso: /model <nome>[/dim]\n")
+                    self.console.print("[dim]usage: /model <name>[/dim]\n")
                 continue
             if low.startswith("/root"):
                 parts = line.split(maxsplit=1)
@@ -759,26 +759,26 @@ def _build_config(args) -> Config:
 
 
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(prog="flair", description="Assistente AI agentico (coding + generico) su DeepSeek/OpenAI.")
+    ap = argparse.ArgumentParser(prog="flair", description="Agentic AI assistant (coding + general) on DeepSeek/OpenAI.")
     ap.add_argument("--version", action="version", version=f"flair {__version__}")
-    ap.add_argument("-p", "--prompt", help="esegue un singolo task e esce (usa '-' per leggere da stdin)")
-    ap.add_argument("--provider", choices=["deepseek", "openai"], help="provider LLM")
-    ap.add_argument("--agent", choices=["coding", "general", "auto"], default="auto", help="forza un agente (default: auto)")
-    ap.add_argument("--root", help="radice di lavoro per l'agente coding")
-    ap.add_argument("--think", action="store_true", help="usa il modello thinking al primo passo")
-    ap.add_argument("--yes", action="store_true", help="auto-approva i tool distruttivi")
+    ap.add_argument("-p", "--prompt", help="run a single task and exit (use '-' to read from stdin)")
+    ap.add_argument("--provider", choices=["deepseek", "openai"], help="LLM provider")
+    ap.add_argument("--agent", choices=["coding", "general", "auto"], default="auto", help="force an agent (default: auto)")
+    ap.add_argument("--root", help="working root for the coding agent")
+    ap.add_argument("--think", action="store_true", help="use the thinking model for the first step")
+    ap.add_argument("--yes", action="store_true", help="auto-approve destructive tools")
     ap.add_argument("--read-only", dest="read_only", action="store_true",
-                    help="esecuzione non presidiata: disabilita i tool distruttivi (write/edit/comandi)")
+                    help="unattended execution: disables destructive tools (writes/edits/commands)")
     ap.add_argument("--max-cost", dest="max_cost", type=float, default=None,
-                    help="tetto HARD di costo della sessione in USD: oltre, il task si ferma")
-    ap.add_argument("--json", action="store_true", help="con -p: emette un oggetto JSON (per automazioni)")
-    ap.add_argument("-q", "--quiet", action="store_true", help="con -p: stampa solo la risposta finale")
-    ap.add_argument("--no-stream", dest="no_stream", action="store_true", help="disabilita lo streaming")
-    ap.add_argument("--log", help="cartella in cui scrivere il log di sessione (JSONL)")
-    ap.add_argument("--model", help="override del modello veloce")
-    ap.add_argument("--think-model", dest="think_model", help="override del modello thinking")
-    ap.add_argument("--session", help="usa/crea una sessione con questo nome (autosalvataggio)")
-    ap.add_argument("--continue", dest="continue_", action="store_true", help="riprende l'ultima sessione salvata")
+                    help="HARD session cost cap in USD: past it, the task stops")
+    ap.add_argument("--json", action="store_true", help="with -p: emit a JSON object (for automation)")
+    ap.add_argument("-q", "--quiet", action="store_true", help="with -p: print only the final answer")
+    ap.add_argument("--no-stream", dest="no_stream", action="store_true", help="disable streaming")
+    ap.add_argument("--log", help="folder to write the session log to (JSONL)")
+    ap.add_argument("--model", help="override the fast model")
+    ap.add_argument("--think-model", dest="think_model", help="override the thinking model")
+    ap.add_argument("--session", help="use/create a session with this name (autosave)")
+    ap.add_argument("--continue", dest="continue_", action="store_true", help="resume the latest saved session")
     args = ap.parse_args(argv)
 
     # Modalità di output one-shot: json/quiet valgono solo con -p (la REPL resta human).
@@ -797,7 +797,7 @@ def main(argv: list[str] | None = None) -> int:
             sys.stdout.write(json.dumps(
                 {"ok": False, "stopped_reason": "config_error", "response": "", "error": str(exc)}) + "\n")
         else:
-            console.print(f"[bold red]Configurazione non valida:[/bold red] {exc}")
+            console.print(f"[bold red]Invalid configuration:[/bold red] {exc}")
         return 1
 
     cli = CLI(cfg)
@@ -811,15 +811,15 @@ def main(argv: list[str] | None = None) -> int:
     if args.session:
         cli.session_name = args.session
         if cli._load_session(args.session):
-            console.print(f"[dim]sessione ripresa: {args.session}[/dim]")
+            console.print(f"[dim]session resumed: {args.session}[/dim]")
         else:
-            console.print(f"[dim]nuova sessione: {args.session}[/dim]")
+            console.print(f"[dim]new session: {args.session}[/dim]")
     elif args.continue_:
         latest = cli.session.latest()
         if latest and cli._load_session(latest):
-            console.print(f"[dim]ripresa ultima sessione: {latest}[/dim]")
+            console.print(f"[dim]resumed latest session: {latest}[/dim]")
         else:
-            console.print("[dim]nessuna sessione da riprendere.[/dim]")
+            console.print("[dim]no session to resume.[/dim]")
 
     if args.prompt is not None:
         prompt = sys.stdin.read() if args.prompt == "-" else args.prompt

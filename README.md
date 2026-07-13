@@ -277,7 +277,7 @@ python tests/evals/run_evals.py --list       # list tasks
 python tests/evals/run_evals.py --self-test  # exercise the runner with no network
 ```
 
-> Note: code, runtime messages, system prompts and the CLI are intentionally in Italian; this README and the repository framing are in English.
+> Note: comments, docstrings and test labels are intentionally in Italian (a documented maintainer choice); everything user- and model-facing — system prompts, tool schemas and outputs, the CLI and runtime messages — is in English. The agent always replies in the user's language.
 
 ---
 

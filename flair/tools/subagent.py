@@ -15,17 +15,16 @@ from ..core.tool import ToolContext, tool
 
 @tool(
     "explore",
-    ("Delega una domanda di esplorazione/ricerca sul codice a un sub-agente in sola "
-     "lettura, con contesto separato. Utile per indagini che richiederebbero molte "
-     "letture (es. \"dove e come è implementato X?\", \"quali file gestiscono Y?\"): il "
-     "sub-agente legge per conto tuo e ti restituisce solo una sintesi concisa, senza "
-     "riempire il tuo contesto. Non modifica nulla. Formula una domanda precisa e "
-     "autosufficiente; per leggere/modificare un file specifico che già conosci usa "
-     "direttamente read_file/edit_file."),
+    ("Delegate an exploration/research question about the code to a read-only sub-agent "
+     "with a separate context. Useful for investigations that would require many reads "
+     "(e.g. \"where and how is X implemented?\", \"which files handle Y?\"): the sub-agent "
+     "reads on your behalf and returns only a concise synthesis, without filling your "
+     "context. It modifies nothing. Ask a precise, self-contained question; to read/edit "
+     "a specific file you already know, use read_file/edit_file directly."),
     {
         "type": "object",
         "properties": {
-            "task": {"type": "string", "description": "La domanda/obiettivo di ricerca, precisa e autosufficiente."},
+            "task": {"type": "string", "description": "The research question/goal, precise and self-contained."},
         },
         "required": ["task"],
     },
@@ -36,7 +35,7 @@ def explore(ctx: ToolContext, task: str) -> str:
     from ..core.agent import Conversation
 
     if ctx.provider is None:
-        return "❌ explore non disponibile in questo contesto (provider mancante)."
+        return "❌ explore is not available in this context (provider missing)."
 
     # Sub-agente FRESCO con conversazione isolata: è il senso dell'isolamento di
     # contesto (le sue letture non entrano nel contesto del genitore).
@@ -49,6 +48,6 @@ def explore(ctx: ToolContext, task: str) -> str:
     # centralizzata, niente doppi conteggi). Il costo delegato è reale e va contato.
     ctx.delegated_usage = result.usage if ctx.delegated_usage is None else ctx.delegated_usage + result.usage
 
-    answer = result.content.strip() or "(nessun risultato dall'esplorazione)"
+    answer = result.content.strip() or "(no result from the exploration)"
     n = result.steps
     return f"{answer}\n\n— 🔭 esplorato in {n} pass{'o' if n == 1 else 'i'} (contesto isolato)"

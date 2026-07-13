@@ -60,7 +60,7 @@ class SessionStore:
                     os.unlink(tmp)
                 raise
         except OSError as exc:
-            log.warning("Salvataggio memoria di '%s' fallito: %s", name, exc)
+            log.warning("Saving memory for '%s' failed: %s", name, exc)
 
     def load_memory(self, name: str) -> str:
         """Contenuto del sidecar della memoria, o '' se assente/illeggibile."""
@@ -90,7 +90,7 @@ class SessionStore:
                 raise
             return target
         except OSError as exc:
-            log.warning("Salvataggio sessione '%s' fallito: %s", name, exc)
+            log.warning("Saving session '%s' failed: %s", name, exc)
             return None
 
     def load(self, name: str) -> dict | None:
@@ -100,7 +100,7 @@ class SessionStore:
         try:
             return json.loads(p.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
-            log.warning("Caricamento sessione '%s' fallito: %s", name, exc)
+            log.warning("Loading session '%s' failed: %s", name, exc)
             return None
 
     def exists(self, name: str) -> bool:

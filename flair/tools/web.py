@@ -149,7 +149,7 @@ def _search_instant(query: str, k: int, timeout: int) -> list[dict]:
 
 
 def _format(query: str, backend: str, results: list[dict]) -> str:
-    lines = [f"Risultati per '{query}' ({backend}):"]
+    lines = [f"Results for '{query}' ({backend}):"]
     for i, r in enumerate(results, 1):
         lines.append(f"{i}. {r['title']}\n   {r['url']}"
                      + (f"\n   {r['snippet']}" if r["snippet"] else ""))
@@ -158,14 +158,14 @@ def _format(query: str, backend: str, results: list[dict]) -> str:
 
 @tool(
     "web_search",
-    ("Cerca informazioni sul web e restituisce i risultati principali (titolo, URL, "
-     "estratto). Usalo per domande su fatti attuali, notizie, riferimenti. Dopo, puoi "
-     "aprire un risultato con open_url."),
+    ("Search the web and return the top results (title, URL, snippet). Use it for "
+     "questions about current facts, news, references. Afterwards you can open a "
+     "result with open_url."),
     {
         "type": "object",
         "properties": {
-            "query": {"type": "string", "description": "La query di ricerca."},
-            "max_results": {"type": "integer", "description": "Quanti risultati (default da configurazione)."},
+            "query": {"type": "string", "description": "The search query."},
+            "max_results": {"type": "integer", "description": "How many results (default from configuration)."},
         },
         "required": ["query"],
     },
@@ -195,13 +195,13 @@ def web_search(ctx: ToolContext, query: str, max_results: int | None = None) -> 
     # Nessun backend ha prodotto risultati: spiega causa e rimedio.
     hints = []
     if DDGS is None:
-        hints.append("installa la ricerca senza chiave con `pip install ddgs`")
+        hints.append("install keyless search with `pip install ddgs`")
     if not ctx.cfg.tavily_api_key:
-        hints.append("imposta TAVILY_API_KEY per una ricerca affidabile")
-    rimedio = (" Per risolvere: " + "; oppure ".join(hints) + ".") if hints else ""
+        hints.append("set TAVILY_API_KEY for reliable search")
+    rimedio = (" To fix: " + "; or ".join(hints) + ".") if hints else ""
     dettagli = (" [" + ", ".join(errors) + "]") if errors else ""
-    return (f"❌ Nessun risultato per '{query}'. I motori senza chiave possono limitare o "
-            f"bloccare le richieste automatiche (anti-bot)." + rimedio + dettagli)
+    return (f"❌ No results for '{query}'. Keyless engines may throttle or "
+            f"block automated requests (anti-bot)." + rimedio + dettagli)
 
 
 _SCRIPT_STYLE = re.compile(r"<(script|style|noscript)\b[^>]*>.*?</\1>", re.IGNORECASE | re.DOTALL)
@@ -219,13 +219,13 @@ def _html_to_text(page: str) -> str:
 
 @tool(
     "web_fetch",
-    ("Scarica una pagina web e ne restituisce il testo leggibile (HTML rimosso). "
-     "Usalo dopo web_search per leggere il contenuto di un risultato, o su un URL noto."),
+    ("Download a web page and return its readable text (HTML stripped). Use it after "
+     "web_search to read a result's content, or on a known URL."),
     {
         "type": "object",
         "properties": {
-            "url": {"type": "string", "description": "L'URL da scaricare (http/https)."},
-            "max_chars": {"type": "integer", "description": "Lunghezza massima del testo (default: limite di lettura)."},
+            "url": {"type": "string", "description": "The URL to fetch (http/https)."},
+            "max_chars": {"type": "integer", "description": "Maximum text length (default: the read limit)."},
         },
         "required": ["url"],
     },
@@ -238,13 +238,13 @@ def web_fetch(ctx: ToolContext, url: str, max_chars: int | None = None) -> str:
     try:
         page = _http(url, None, timeout)
     except Exception as exc:  # noqa: BLE001
-        return f"❌ Impossibile scaricare {url}: {type(exc).__name__}: {exc}"
+        return f"❌ Could not fetch {url}: {type(exc).__name__}: {exc}"
     text = _html_to_text(page)
     if not text:
-        return f"(nessun testo estraibile da {url})"
+        return f"(no extractable text from {url})"
     if len(text) > limit:
-        text = text[:limit] + f"\n…[troncato a {limit} caratteri]"
-    return f"Contenuto di {url}:\n\n{text}"
+        text = text[:limit] + f"\n…[truncated at {limit} chars]"
+    return f"Content of {url}:\n\n{text}"
 
 
 TOOLS = [web_search, web_fetch]

@@ -68,7 +68,7 @@ def add_line_numbers(text: str, start: int = 1) -> str:
 def _trunc(text: str, limit: int, hint: str = "") -> str:
     if len(text) <= limit:
         return text
-    extra = f"\n...[output troncato a {limit} caratteri{'; ' + hint if hint else ''}]"
+    extra = f"\n...[output truncated at {limit} chars{'; ' + hint if hint else ''}]"
     return text[:limit] + extra
 
 
@@ -108,8 +108,8 @@ def _unique_window(text_lines: list[str], old_lines: list[str], key) -> int | No
         return matches[0]
     if len(matches) > 1:
         raise ToolError(
-            f"old_string corrisponde a {len(matches)} blocchi (a meno di spazi). "
-            "Aggiungi contesto per renderlo univoco."
+            f"old_string matches {len(matches)} blocks (up to whitespace). "
+            "Add context to make it unique."
         )
     return None
 
@@ -135,26 +135,26 @@ def apply_edit(text: str, old: str, new: str, replace_all: bool = False) -> tupl
     """
     replace_all = as_bool(replace_all)   # il modello può inviare "true"/"false" come stringa
     if not old:
-        raise ToolError("old_string vuoto: specifica il testo da sostituire.")
+        raise ToolError("old_string is empty: specify the text to replace.")
 
     # 1. Match esatto.
     n = text.count(old)
     if n >= 1:
         if n > 1 and not replace_all:
             raise ToolError(
-                f"old_string compare {n} volte. Aggiungi contesto per renderlo "
-                "univoco, oppure usa replace_all=true."
+                f"old_string occurs {n} times. Add context to make it "
+                "unique, or use replace_all=true."
             )
         count = -1 if replace_all else 1
-        return text.replace(old, new, count), "esatto"
+        return text.replace(old, new, count), "exact"
 
     if replace_all:
-        raise ToolError("old_string non trovato (con replace_all serve il match esatto).")
+        raise ToolError("old_string not found (replace_all requires an exact match).")
 
     # 2. Spazi esterni dell'intero blocco ignorati.
     stripped = old.strip()
     if stripped and text.count(stripped) == 1:
-        return text.replace(stripped, new, 1), "spazi esterni ignorati"
+        return text.replace(stripped, new, 1), "outer whitespace ignored"
 
     # 3/4. Match per riga: prima ignorando il fine-riga, poi l'indentazione.
     text_lines = text.split("\n")
@@ -162,10 +162,10 @@ def apply_edit(text: str, old: str, new: str, replace_all: bool = False) -> tupl
     if old_lines and old_lines[-1] == "":
         old_lines = old_lines[:-1]  # ignora newline finale dell'old_string
     if not old_lines:
-        raise ToolError("old_string non trovato.")
+        raise ToolError("old_string not found.")
 
-    for key, label in ((lambda s: s.rstrip(), "fine-riga tollerato"),
-                       (lambda s: s.strip(), "indentazione tollerata")):
+    for key, label in ((lambda s: s.rstrip(), "line-ending tolerant"),
+                       (lambda s: s.strip(), "indentation tolerant")):
         idx = _unique_window(text_lines, old_lines, key)
         if idx is None:
             continue
@@ -198,24 +198,24 @@ def move_path_impl(root: Path | None, src: str, dst: str) -> str:
     p_src = resolve(root, src)
     p_dst = resolve(root, dst)
     if not p_src.exists():
-        return f"❌ Il percorso di origine non esiste: {display(root, p_src)}"
+        return f"❌ Source path does not exist: {display(root, p_src)}"
     if p_dst.exists():
-        return (f"❌ La destinazione esiste già: {display(root, p_dst)}. "
-                "Scegli un nome diverso o rimuovi prima il file esistente.")
+        return (f"❌ Destination already exists: {display(root, p_dst)}. "
+                "Choose a different name or remove the existing file first.")
     if p_src == p_dst:
-        return "⚠️ Origine e destinazione coincidono: niente da fare."
+        return "⚠️ Source and destination are the same: nothing to do."
     try:
         if p_dst.is_relative_to(p_src):  # es. spostare una cartella dentro sé stessa
-            return "❌ La destinazione è dentro l'origine: spostamento impossibile."
+            return "❌ Destination is inside the source: cannot move."
     except AttributeError:  # pragma: no cover - Python < 3.9 non supportato comunque
         pass
     p_dst.parent.mkdir(parents=True, exist_ok=True)
     try:
         shutil.move(str(p_src), str(p_dst))
     except OSError as exc:
-        return f"❌ Spostamento fallito: {exc}"
-    kind = "cartella" if p_dst.is_dir() else "file"
-    return f"✓ Spostato ({kind}): {display(root, p_src)} → {display(root, p_dst)}"
+        return f"❌ Move failed: {exc}"
+    kind = "directory" if p_dst.is_dir() else "file"
+    return f"✓ Moved ({kind}): {display(root, p_src)} → {display(root, p_dst)}"
 
 
 def _atomic_write(p: Path, content: str) -> None:
@@ -241,11 +241,11 @@ def _atomic_write(p: Path, content: str) -> None:
 def read_file_impl(root: Path | None, path: str, offset: int, limit: int | None, max_chars: int) -> str:
     p = resolve(root, path)
     if not p.exists():
-        return f"❌ Il file non esiste: {display(root, p)}"
+        return f"❌ File does not exist: {display(root, p)}"
     if p.is_dir():
-        return f"❌ È una directory, non un file: {display(root, p)} (usa list_directory)"
+        return f"❌ It is a directory, not a file: {display(root, p)} (use list_directory)"
     if p.suffix.lower() in _BINARY_EXT:
-        return f"❌ File binario non leggibile come testo: {display(root, p)}"
+        return f"❌ Binary file, not readable as text: {display(root, p)}"
 
     text = p.read_text(encoding="utf-8", errors="replace")
     lines = text.splitlines()
@@ -270,26 +270,26 @@ def read_file_impl(root: Path | None, path: str, offset: int, limit: int | None,
         real_end = min(offset, total)
 
     chunk = "\n".join(lines[offset - 1:real_end])
-    header = f"{display(root, p)}  (righe {offset}-{real_end} di {total})\n"
+    header = f"{display(root, p)}  (lines {offset}-{real_end} of {total})\n"
     out = header + add_line_numbers(chunk, start=offset)
     if real_end < total:
-        out += f"\n...[restano {total - real_end} righe; continua con read_file(path, offset={real_end + 1})]"
+        out += f"\n...[{total - real_end} more lines; continue with read_file(path, offset={real_end + 1})]"
     # _trunc resta solo come rete per il caso patologico della riga singola enorme.
-    return _trunc(out, max_chars, hint="leggi un range più piccolo con offset/limit")
+    return _trunc(out, max_chars, hint="read a smaller range with offset/limit")
 
 
 def list_dir_impl(root: Path | None, path: str, max_entries: int) -> str:
     p = resolve(root, path)
     if not p.exists():
-        return f"❌ La directory non esiste: {display(root, p)}"
+        return f"❌ Directory does not exist: {display(root, p)}"
     if not p.is_dir():
-        return f"❌ Non è una directory: {display(root, p)}"
+        return f"❌ Not a directory: {display(root, p)}"
 
     entries: list[str] = []
     try:
         children = sorted(p.iterdir(), key=lambda c: (c.is_file(), c.name.lower()))
     except PermissionError:
-        return f"❌ Permesso negato: {display(root, p)}"
+        return f"❌ Permission denied: {display(root, p)}"
     for child in children:
         if child.name in NOISE_DIRS:
             continue
@@ -318,19 +318,19 @@ def write_file_impl(root: Path | None, path: str, content: str, append: bool = F
     file grandi in più parti, restando sotto il limite di token per chiamata."""
     p = resolve(root, path)
     if p.is_dir():
-        return f"❌ È una directory: {display(root, p)}"
+        return f"❌ It is a directory: {display(root, p)}"
     existed = p.exists()
     p.parent.mkdir(parents=True, exist_ok=True)
     if append and existed:
         with p.open("a", encoding="utf-8") as fh:
             fh.write(content)
-        return f"✓ Aggiunto in coda a {display(root, p)} ({len(content)} caratteri)."
+        return f"✓ Appended to {display(root, p)} ({len(content)} chars)."
     if existed:
         _atomic_write(p, content)   # sovrascrittura ATOMICA: protegge il contenuto preesistente
     else:
         p.write_text(content, encoding="utf-8")  # file nuovo: nessun dato pregresso a rischio
-    verb = "Sovrascritto" if existed else "Creato"
-    return f"✓ {verb} {display(root, p)} ({len(content)} caratteri)."
+    verb = "Overwrote" if existed else "Created"
+    return f"✓ {verb} {display(root, p)} ({len(content)} chars)."
 
 
 def edit_file_impl(root: Path | None, path: str, old_string: str, new_string: str,
@@ -340,13 +340,13 @@ def edit_file_impl(root: Path | None, path: str, old_string: str, new_string: st
     gestita a monte come messaggio pulito."""
     p = resolve(root, path)
     if not p.exists():
-        return f"❌ Il file non esiste: {display(root, p)} (usa write_file per crearlo)"
+        return f"❌ File does not exist: {display(root, p)} (use write_file to create it)"
     if p.is_dir():
-        return f"❌ È una directory: {display(root, p)}"
+        return f"❌ It is a directory: {display(root, p)}"
     text = p.read_text(encoding="utf-8", errors="replace")
     new_text, strategy = apply_edit(text, old_string, new_string, replace_all)
     if new_text == text:
-        return f"⚠️ Nessuna modifica: il risultato è identico a {display(root, p)}."
+        return f"⚠️ No change: the result is identical to {display(root, p)}."
     _atomic_write(p, new_text)   # il file esiste: scrittura atomica, così un crash non lo corrompe
-    note = "" if strategy == "esatto" else f" [match: {strategy}]"
-    return f"✓ Modificato {display(root, p)}{note}."
+    note = "" if strategy == "exact" else f" [match: {strategy}]"
+    return f"✓ Edited {display(root, p)}{note}."

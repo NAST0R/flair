@@ -33,9 +33,9 @@ def _missing_args_message(tool_name: str, missing: list[str], unknown: list[str]
     """Messaggio azionabile per argomenti obbligatori mancanti: nomina cosa manca, le
     eventuali chiavi ignorate, e — se una di esse somiglia a un argomento mancante (es.
     `filename` per `path`) — lo suggerisce. NON inizia con ❌ (lo antepone il chiamante)."""
-    parts = [f"A «{tool_name}» mancano argomenti obbligatori: {', '.join(missing)}."]
+    parts = [f"«{tool_name}» is missing required arguments: {', '.join(missing)}."]
     if unknown:
-        parts.append(f"Ho ignorato chiavi non previste: {', '.join(unknown)}.")
+        parts.append(f"Ignored unknown keys: {', '.join(unknown)}.")
         hints: list[str] = []
         for miss in missing:
             aliases = _ARG_ALIASES.get(miss, set())
@@ -44,9 +44,9 @@ def _missing_args_message(tool_name: str, missing: list[str], unknown: list[str]
                 if (ul in aliases or miss in ul or ul in miss) and f"«{unk}»→«{miss}»" not in hints:
                     hints.append(f"«{unk}»→«{miss}»")
         if hints:
-            parts.append("Forse: " + ", ".join(hints) + "?")
-    parts.append("Gli strumenti sono stateless: a ogni chiamata includi sempre TUTTI gli "
-                 "argomenti obbligatori, coi nomi esatti dello schema.")
+            parts.append("Maybe: " + ", ".join(hints) + "?")
+    parts.append("Tools are stateless: include ALL required arguments, with the exact "
+                 "schema names, on every call.")
     return " ".join(parts)
 
 
@@ -170,7 +170,7 @@ class Tool:
             raise ToolError(_missing_args_message(self.name, missing, unknown))
         out = self.func(ctx, **clean)
         if unknown:
-            out = f"ℹ️ Argomenti ignorati (non previsti da {self.name}): {', '.join(unknown)}.\n" + out
+            out = f"ℹ️ Ignored arguments (not accepted by {self.name}): {', '.join(unknown)}.\n" + out
         return out
 
     def schema(self) -> dict:

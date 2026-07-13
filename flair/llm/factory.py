@@ -15,5 +15,5 @@ _REGISTRY = {
 def create_provider(cfg) -> LLMProvider:
     cls = _REGISTRY.get(cfg.provider)
     if cls is None:
-        raise ValueError(f"Provider sconosciuto: {cfg.provider}. Disponibili: {list(_REGISTRY)}")
+        raise ValueError(f"Unknown provider: {cfg.provider}. Available: {list(_REGISTRY)}")
     return cls(cfg)

@@ -296,7 +296,7 @@ class OpenAICompatProvider(LLMProvider):
                 last = exc
                 if attempt < _MAX_RETRIES - 1:
                     wait = _BACKOFF[attempt] + random.uniform(0, 0.5)
-                    log.warning("Chiamata LLM transitoria fallita (%d/%d): %s — retry tra %.1fs",
+                    log.warning("Transient LLM call failed (%d/%d): %s — retrying in %.1fs",
                                 attempt + 1, _MAX_RETRIES, type(exc).__name__, wait)
                     time.sleep(wait)
             except Exception:

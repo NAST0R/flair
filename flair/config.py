@@ -44,12 +44,13 @@ def _float(name: str, default: float) -> float:
 MODEL_PRICING: dict[str, tuple[float, float, float]] = {
     # DeepSeek (USD/1M: cache-hit, input, output). V4-flash è il workhorse;
     # V4-pro il reasoner di punta. Gli alias chat/reasoner mappano su V4-flash.
-    "deepseek-v4-flash": (0.014, 0.14, 0.28),
-    "deepseek-v4-pro": (0.0435, 0.435, 0.87),
-    "deepseek-chat": (0.014, 0.14, 0.28),
-    "deepseek-reasoner": (0.014, 0.14, 0.28),
-    "deepseek-v4": (0.014, 0.14, 0.28),
-    # OpenAI (approssimati, USD/1M; aggiornati ~2026, sovrascrivibili via env)
+    # Fonte: api-docs.deepseek.com/quick_start/pricing (verificati 2026-07-13).
+    "deepseek-v4-flash": (0.0028, 0.14, 0.28),
+    "deepseek-v4-pro": (0.003625, 0.435, 0.87),
+    "deepseek-chat": (0.0028, 0.14, 0.28),
+    "deepseek-reasoner": (0.0028, 0.14, 0.28),
+    "deepseek-v4": (0.0028, 0.14, 0.28),
+    # OpenAI (approssimati, USD/1M; verificati 2026-07, sovrascrivibili via env)
     "gpt-4.1-nano": (0.025, 0.10, 0.40),
     "gpt-4.1-mini": (0.10, 0.40, 1.60),
     "gpt-4.1": (0.50, 2.00, 8.00),
@@ -60,7 +61,7 @@ MODEL_PRICING: dict[str, tuple[float, float, float]] = {
     "gpt-5.4-nano": (0.02, 0.20, 1.25),
     "gpt-5.4-mini": (0.075, 0.75, 4.50),
     "gpt-5.4": (0.25, 2.50, 15.0),
-    "gpt-5.5-pro": (0.50, 5.00, 30.0),
+    "gpt-5.5-pro": (30.0, 30.0, 180.0),   # nessuno sconto cache sul tier Pro
     "gpt-5.5": (0.50, 5.00, 30.0),
     "gpt-5": (0.125, 1.25, 10.0),
     "o4-mini": (0.275, 1.10, 4.40),
@@ -68,7 +69,7 @@ MODEL_PRICING: dict[str, tuple[float, float, float]] = {
     "o3": (0.50, 2.00, 8.00),
 }
 _PROVIDER_FALLBACK = {
-    "deepseek": (0.014, 0.14, 0.28),
+    "deepseek": (0.0028, 0.14, 0.28),
     "openai": (0.075, 0.15, 0.60),
 }
 

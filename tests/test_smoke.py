@@ -2530,6 +2530,49 @@ def test_honest_reads_and_inventory():
     check("inventario: vuoto se nessuna read_file", Agent._read_inventory(msgs[-2:]) == "")
 
 
+def test_deepseek_reasoning_effort():
+    import os as _os
+
+    from flair.config import load_config
+    from flair.llm.deepseek import DeepSeekProvider
+
+    def mk(effort=None):
+        _os.environ["DEEPSEEK_API_KEY"] = "sk-test"
+        if effort is None:
+            _os.environ.pop("DEEPSEEK_REASONING_EFFORT", None)
+        else:
+            _os.environ["DEEPSEEK_REASONING_EFFORT"] = effort
+        cfg = load_config()
+        cfg.provider = "deepseek"
+        return DeepSeekProvider(cfg)
+
+    # --think senza effort configurato: solo il parametro thinking, nessun effort
+    prov = mk()
+    params = prov._build_params([], None, think=True, max_tokens=100)
+    check("effort ds: --think attiva thinking", params.get("extra_body") == {"thinking": {"type": "enabled"}}, params)
+    check("effort ds: senza env nessun reasoning_effort", "reasoning_effort" not in params, params)
+    # fast mode: comportamento invariato (nessun parametro thinking/effort → default server)
+    params = prov._build_params([], None, think=False, max_tokens=100)
+    check("effort ds: fast mode intatto (no thinking param)", "extra_body" not in params, params)
+    check("effort ds: fast mode intatto (no effort)", "reasoning_effort" not in params, params)
+    check("effort ds: fast mode manda temperature", params.get("temperature") == 0.0, params)
+    # env configurata: pass-through verbatim col --think
+    prov = mk("max")
+    params = prov._build_params([], None, think=True, max_tokens=100)
+    check("effort ds: env letta e inviata verbatim", params.get("reasoning_effort") == "max", params)
+    check("effort ds: thinking sempre presente col --think", params.get("extra_body") == {"thinking": {"type": "enabled"}}, params)
+    # ...ma MAI sul fast, anche se configurata (proprietà del --think)
+    params = prov._build_params([], None, think=False, max_tokens=100)
+    check("effort ds: env configurata ma fast pulito", "reasoning_effort" not in params and "extra_body" not in params, params)
+    # alias legacy: niente parametro thinking (modalità nel nome), niente effort
+    _os.environ["DEEPSEEK_THINK_MODEL"] = "deepseek-reasoner"
+    prov = mk("max")
+    params = prov._build_params([], None, think=True, max_tokens=100)
+    _os.environ.pop("DEEPSEEK_THINK_MODEL", None)
+    check("effort ds: alias legacy senza thinking param", "extra_body" not in params and "reasoning_effort" not in params, params)
+    _os.environ.pop("DEEPSEEK_REASONING_EFFORT", None)
+
+
 def main():
     test_arg_parse()
     test_usage_normalization()
@@ -2550,6 +2593,7 @@ def main():
     test_session_memory()
     test_grep_context_and_move()
     test_honest_reads_and_inventory()
+    test_deepseek_reasoning_effort()
     test_parallel_tools()
     test_cli_session_roundtrip()
     test_shared_memory()

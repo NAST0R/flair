@@ -198,6 +198,7 @@ def load_config() -> Config:
         model=os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash"),
         think_model=os.getenv("DEEPSEEK_THINK_MODEL", "deepseek-v4-pro"),
         temperature=_float("DEEPSEEK_TEMPERATURE", 0.0),
+        reasoning_effort=os.getenv("DEEPSEEK_REASONING_EFFORT") or None,
     )
     openai = ProviderConfig(
         api_key=os.getenv("OPENAI_API_KEY", ""),

@@ -89,8 +89,9 @@ cp .env.example .env
 FLAIR_PROVIDER=deepseek            # or: openai
 
 DEEPSEEK_API_KEY=sk-...
-DEEPSEEK_MODEL=deepseek-v4-flash       # fast workhorse (non-thinking)
+DEEPSEEK_MODEL=deepseek-v4-flash       # fast workhorse for the tool loop
 DEEPSEEK_THINK_MODEL=deepseek-v4-pro   # reasoner used for --think
+DEEPSEEK_REASONING_EFFORT=max          # thinking depth for --think (ships enabled: measured best)
 
 OPENAI_API_KEY=sk-...
 OPENAI_MODEL=gpt-4.1-mini          # fast, non-reasoning, cheap
@@ -105,7 +106,7 @@ All parameters (token limits, output caps, prices for cost estimation) are in `.
 
 > Model names are only **defaults** and can be overridden from `.env` or the CLI.
 >
-> **DeepSeek** (primary provider): with the **V4** models the thinking mode is enabled by a *parameter*, not by a separate model name — Flair sends `thinking: {type: enabled}` automatically only on the `--think` step, on `deepseek-v4-pro` (a genuine reasoner). The fast loop stays on `deepseek-v4-flash` (non-thinking). The legacy aliases `deepseek-chat`/`deepseek-reasoner` still work but map to V4-flash (chat = non-thinking, reasoner = thinking) and **retire on 2026-07-24**, so the defaults use the V4 names. Note: because the old `deepseek-reasoner` was just V4-flash in thinking mode, its spend appeared under V4-flash — with `deepseek-v4-pro` as the think model you'll see it as a distinct line.
+> **DeepSeek** (primary provider): with the **V4** models the thinking mode is a *parameter*, not a separate model name — and it is **enabled by default server-side**, so even the fast loop on `deepseek-v4-flash` reasons at the server's default depth. On `--think` steps Flair makes it explicit on `deepseek-v4-pro` (a genuine reasoner) and sends `DEEPSEEK_REASONING_EFFORT` (ships as `max`: field-measured to be both the cheapest and the most precise setting). Flair follows the **V4 thinking protocol** for tool calls: the reasoning of tool-call turns is passed back to the API in subsequent requests, so the model resumes its chain of thought across steps instead of re-deriving it (providers that don't accept the field get it stripped at request time). Two opt-in deep regimes exist: `FLAIR_THINK_STEPS=all` keeps the reasoner for **every** step of a `--think` turn, and `DEEPSEEK_FAST_REASONING_EFFORT` raises the depth of the fast loop itself. The legacy aliases `deepseek-chat`/`deepseek-reasoner` still work but map to V4-flash (chat = non-thinking, reasoner = thinking) and **retire on 2026-07-24**, so the defaults use the V4 names. Note: because the old `deepseek-reasoner` was just V4-flash in thinking mode, its spend appeared under V4-flash — with `deepseek-v4-pro` as the think model you'll see it as a distinct line.
 >
 > **OpenAI**: reasoning models (the `o` series and the **GPT-5** family) are detected by name, so Flair omits `temperature` (which they reject) and sets `reasoning_effort` (default `medium` with `--think`). Prefer `gpt-5`/`gpt-5-mini`/`gpt-5.1` or `o3` as the think model: from **gpt-5.4 onward** reasoning + tools is offered only on the Responses API, not the Chat Completions API used here.
 
@@ -214,7 +215,7 @@ For unattended runs prefer **stateless** invocations (no `--session`): two sched
 
 **Session logging.** With `--log <folder>` (or `FLAIR_LOG_DIR`) every turn is written to `session-<timestamp>.jsonl` (task, response, tools used, usage) and internal events to `flair.log` — useful to analyze where tokens go.
 
-**Per-model cost estimate + budget warning.** The displayed cost uses a per-model price table (DeepSeek/OpenAI), overridable via `FLAIR_PRICE_*`. Set `FLAIR_COST_WARN=<usd>` to get a one-time warning when a session's estimated cost crosses that threshold.
+**Model-aware cost tracking + budget warning.** Every request is priced with the rates of the model that actually served it (fast and thinking steps in the same turn are each billed correctly — validated against the provider dashboard) and accumulated into the displayed cost; the price table is overridable via `FLAIR_PRICE_*`, and the `FLAIR_MAX_COST` hard cap brakes on this real spend. Set `FLAIR_COST_WARN=<usd>` to get a one-time warning when a session's estimated cost crosses that threshold.
 
 ---
 
@@ -222,7 +223,7 @@ For unattended runs prefer **stateless** invocations (no `--session`): two sched
 
 - **Prefix cache** always active (append-only history) → repeated input costs ~1/10 on both providers. The status line shows the cache-hit %.
 - **Context compaction**: when the context exceeds a threshold (a fraction of the model window, default 75%), the older part is summarized into **one** message and the run continues with a new, stable prefix. You pay the cache miss **once per compaction**, not every turn — unlike naive agent loops that invalidate the cache every turn. Context size is measured exactly from the API's `prompt_tokens` (no tokenizer to install). Before summarizing, a free deterministic **stage 0** prunes provably-superseded tool outputs — duplicates of identical calls, reads of files later overwritten by a full `write_file`, and partial reads covered by a later full read — replacing them with a short stub (tool-call pairing stays intact, the freshest occurrence always survives). If pruning alone brings the context back under the threshold, the LLM summary is skipped entirely: space is reclaimed **without** trading detail for a summary. Disable with `FLAIR_COMPACT_PRUNE=false`. If the provider still reports an overflow, Flair prunes, compacts aggressively and retries once.
-- **Targeted thinking**: with `--think`, the reasoning model is used on the **first** step (planning); the tool loop continues with the fast, cheap model.
+- **Targeted thinking**: with `--think`, the reasoning model is used on the **first** step (planning); the tool loop continues with the fast, cheap model, **inheriting the preserved reasoning chain** (V4 passback) instead of re-deriving it. Opt-in: `FLAIR_THINK_STEPS=all` keeps the reasoner for the whole turn.
 - **Targeted tool output**: files read with `offset`/`limit`, grep/commands truncated with a hint to narrow down.
 - **Near-free router**: bare continuations ("procedi", "ok", "go ahead"…) stick to the current mode **deterministically, with zero LLM calls** — a contentless message carries no routing signal, and letting a model decide it can switch agent mid-task (different sandbox, prompt and tools) and invalidate the cached prefix. Everything else is decided by one tiny LLM call (response capped to **a few tokens**), with a keyword+sticky heuristic as offline fallback.
 - **Resilient edit_file**: no "old_string not found" loops caused by whitespace/indentation (see above) → fewer wasted attempts.

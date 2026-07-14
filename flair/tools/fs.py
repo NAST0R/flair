@@ -183,8 +183,8 @@ def apply_edit(text: str, old: str, new: str, replace_all: bool = False) -> tupl
         return text[:start_off] + replacement + text[end_off:], label
 
     raise ToolError(
-        "old_string non trovato. Rileggi il file con read_file e copia il testo "
-        "esatto da sostituire (inclusa l'indentazione)."
+        "old_string not found. Re-read the file with read_file and copy the exact "
+        "text to replace (indentation included)."
     )
 
 
@@ -303,7 +303,7 @@ def list_dir_impl(root: Path | None, path: str, max_entries: int) -> str:
             entries.append(f"{child.name}  ({size} B)")
 
     if not entries:
-        return f"{display(root, p)}/  (vuota)"
+        return f"{display(root, p)}/  (empty)"
     shown = entries[:max_entries]
     out = f"{display(root, p)}/\n" + "\n".join(shown)
     if len(entries) > len(shown):

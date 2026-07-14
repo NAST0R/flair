@@ -13,7 +13,7 @@ _MAX_PROJECT_CHARS = 8000
 def load(name: str) -> str:
     path = _DIR / f"{name}.md"
     if not path.exists():
-        raise FileNotFoundError(f"Prompt non trovato: {path}")
+        raise FileNotFoundError(f"Prompt not found: {path}")
     return path.read_text(encoding="utf-8")
 
 
@@ -29,6 +29,6 @@ def project_instructions(root: Path) -> str:
             if not text:
                 continue
             if len(text) > _MAX_PROJECT_CHARS:
-                text = text[:_MAX_PROJECT_CHARS] + "\n…[istruzioni troncate]"
+                text = text[:_MAX_PROJECT_CHARS] + "\n…[instructions truncated]"
             return f"\n\n## Istruzioni specifiche del progetto (da {name})\n\n{text}"
     return ""

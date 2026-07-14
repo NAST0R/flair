@@ -1889,7 +1889,7 @@ def test_plan_tool():
     check("plan: vuoto → errore pulito", plan_mod.plan(ctx, steps=[]).startswith("❌"))
     check("plan: voci senza titolo → errore pulito", plan_mod.plan(ctx, steps=[{"status": "fatto"}]).startswith("❌"))
     over = plan_mod.plan(ctx, steps=[f"passo {i}" for i in range(40)])
-    check("plan: tetto sui passi", "oltre il limite" in over and over.count("○") == 30, over)
+    check("plan: tetto sui passi", "over the" in over and "consolidate" in over and over.count("○") == 30, over)
 
     # Cablaggio: plan nel coding agent, NON in explorer/general.
     from flair.agents import coding as ca
@@ -2793,6 +2793,29 @@ def test_cost_attribution():
           and turn.cost_usd > 2 * step_flash.cost_usd)
 
 
+def test_english_surface():
+    import json as _json
+    import re as _re
+    import tempfile as _tf
+
+    from flair.prompts import load as load_prompt
+
+    # Guardia anti-regressione della migrazione inglese: NIENTE italiano nella
+    # superficie che il modello legge (schemi tool, prompt, testi iniettati).
+    rx = _re.compile(r"[àèéìòù]|\b(?:scaletta|scrive|aggiorna|usalo|rileggi|troncat\w|vuot[oa]\b|"
+                     r"riassunto|risultato|passi|occorrenze|contenuto completo|comando da)\b", _re.I)
+    root = Path(_tf.mkdtemp(prefix="flair_en_")).resolve()
+    cfg = cfg_for(root)
+    for build in (coding_agent.build, general_agent.build):
+        agent = build(cfg, FakeProvider([]))
+        blob = _json.dumps(agent.toolset.schemas(), ensure_ascii=False)
+        bad = rx.findall(blob)
+        check(f"superficie inglese: schemi {build.__module__}", not bad, bad[:5])
+    for name in ("coding", "general", "explorer"):
+        bad = rx.findall(load_prompt(name))
+        check(f"superficie inglese: prompt {name}", not bad, bad[:5])
+
+
 def main():
     test_arg_parse()
     test_usage_normalization()
@@ -2817,6 +2840,7 @@ def main():
     test_reasoning_passback()
     test_reasoning_regimes()
     test_cost_attribution()
+    test_english_surface()
     test_parallel_tools()
     test_cli_session_roundtrip()
     test_shared_memory()

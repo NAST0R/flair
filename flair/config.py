@@ -108,7 +108,7 @@ class ProviderConfig:
     think_model: str      # modello "thinking" usato quando serve ragionare
     base_url: str | None = None
     temperature: float = 0.0
-    reasoning_effort: str | None = None  # solo reasoning model (low|medium|high)
+    reasoning_effort: str | None = None  # profondità per --think (deepseek: high|max; openai: low|medium|high)
     # Opt-in: profondità del ragionamento di DEFAULT del modello veloce (il flash
     # V4 pensa già a 'high' lato server anche senza parametri). None = intatto.
     fast_reasoning_effort: str | None = None

@@ -57,7 +57,7 @@ def _norm_path(p) -> str | None:
 def _is_full_read(args: dict) -> bool:
     """True se la read_file copre l'intero file (offset assente/1, limit assente)."""
     off = args.get("offset", 1)
-    lim = args.get("limit", None)
+    lim = args.get("limit")
     try:
         off = int(off)
     except (TypeError, ValueError):
@@ -107,10 +107,9 @@ def prune_superseded(messages: list[dict]) -> int:
     to_prune: set[int] = set()
 
     # Regola 1 — duplicati: pota tutte le occorrenze TRANNE l'ultima della stessa firma.
-    last_by_sig: dict[str, int] = {}
-    for idx, name, _args, sig in entries:
-        if name in _PRUNABLE:
-            last_by_sig[sig] = idx
+    last_by_sig: dict[str, int] = {
+        sig: idx for idx, name, _args, sig in entries if name in _PRUNABLE
+    }
     for idx, name, _args, sig in entries:
         if name in _PRUNABLE and idx != last_by_sig.get(sig):
             to_prune.add(idx)

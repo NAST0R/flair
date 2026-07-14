@@ -310,7 +310,7 @@ class OpenAICompatProvider(LLMProvider):
                     # Contenuto già a video: un fallback rigenererebbe da capo →
                     # output sdoppiato. Propaga l'originale (il chiamante lo segnala).
                     raise si.original from None
-                log.warning("Streaming fallito (%s) prima di emettere contenuto — fallback senza streaming",
+                log.warning("Streaming failed (%s) before emitting content — falling back to non-streaming",
                             type(si.original).__name__)
             # i non-transitori (es. BadRequest) escono da _complete_stream non incapsulati
 

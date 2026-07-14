@@ -218,7 +218,7 @@ def list_directory(ctx: ToolContext, path: str = "~") -> str:
         "type": "object",
         "properties": {
             "path": {"type": "string", "description": "File path (absolute or ~)."},
-            "offset": {"type": "integer", "description": "Prima riga (1-based). Default 1."},
+            "offset": {"type": "integer", "description": "First line (1-based). Default 1."},
             "limit": {"type": "integer", "description": "Maximum number of lines."},
         },
         "required": ["path"],
@@ -240,7 +240,7 @@ def read_file(ctx: ToolContext, path: str, offset: int = 1, limit: int | None = 
         "type": "object",
         "properties": {
             "path": {"type": "string", "description": "File path (absolute or ~)."},
-            "content": {"type": "string", "description": "Contenuto completo del file."},
+            "content": {"type": "string", "description": "Full file content."},
             "append": {"type": "boolean", "description": "Append instead of overwriting (to write a large file in parts). Default false."},
         },
         "required": ["path", "content"],
@@ -261,8 +261,8 @@ def write_file(ctx: ToolContext, path: str, content: str, append: bool = False) 
         "properties": {
             "path": {"type": "string", "description": "File path (absolute or ~)."},
             "old_string": {"type": "string", "description": "Exact text to replace."},
-            "new_string": {"type": "string", "description": "Testo nuovo."},
-            "replace_all": {"type": "boolean", "description": "Sostituire tutte le occorrenze (default false)."},
+            "new_string": {"type": "string", "description": "New text."},
+            "replace_all": {"type": "boolean", "description": "Replace all occurrences (default false)."},
         },
         "required": ["path", "old_string", "new_string"],
     },
@@ -280,7 +280,7 @@ def edit_file(ctx: ToolContext, path: str, old_string: str, new_string: str, rep
     {
         "type": "object",
         "properties": {
-            "command": {"type": "string", "description": "Comando da eseguire."},
+            "command": {"type": "string", "description": "Command to run."},
             "timeout": {"type": "integer", "description": "Timeout in seconds. Default 60."},
         },
         "required": ["command"],

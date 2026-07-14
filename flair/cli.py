@@ -354,7 +354,7 @@ class CLI:
         shown = 0
         for line in diff:
             if shown >= 60:
-                body.append("…[diff troncata]\n", style="dim")
+                body.append("…[diff truncated]\n", style="dim")
                 break
             if line.startswith("+"):
                 body.append(line + "\n", style="green")
@@ -366,7 +366,7 @@ class CLI:
                 body.append(line + "\n", style="dim")
             shown += 1
         if not diff:
-            body.append("(nessuna differenza testuale rilevata)\n", style="dim")
+            body.append("(no textual difference detected)\n", style="dim")
         return Panel(body, title=f"[yellow]{name}[/yellow] · {path}", border_style="yellow", padding=(0, 1))
 
     # ── esecuzione ──────────────────────────────────────────────────────────
@@ -707,12 +707,12 @@ class CLI:
                 if len(parts) == 2:
                     new_root = Path(parts[1]).expanduser().resolve()
                     if not new_root.is_dir():
-                        self.console.print(f"[yellow]cartella inesistente: {new_root}[/yellow]\n")
+                        self.console.print(f"[yellow]nonexistent folder: {new_root}[/yellow]\n")
                     else:
                         self._apply_root(new_root)
                         self.console.print(
                             f"[yellow]root → {self.cfg.root} "
-                            "(cartella di lavoro per coding e general)[/yellow]\n")
+                            "(working folder for coding and general)[/yellow]\n")
                 continue
             if low.startswith("/code"):
                 task = line[len("/code"):].strip()
@@ -827,9 +827,9 @@ def main(argv: list[str] | None = None) -> int:
         if not prompt:
             if json_mode:
                 cli._emit_json({"ok": False, "agent": None, "stopped_reason": "error",
-                                "response": "", "error": "prompt vuoto"})
+                                "response": "", "error": "empty prompt"})
             else:
-                console.print("[red]Prompt vuoto.[/red]")
+                console.print("[red]Empty prompt.[/red]")
             return 1
         key = None if args.agent == "auto" else args.agent
         return cli.run_once(prompt, agent_key=key, think=args.think)

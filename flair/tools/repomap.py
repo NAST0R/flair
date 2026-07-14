@@ -218,9 +218,9 @@ _C_PROTO = re.compile(
 
 
 def _c_symbols(text: str) -> list[str]:
-    found: list[tuple[int, str]] = []
-    for m in _C_TYPE.finditer(text):
-        found.append((m.start(), f"{m.group('kind')} {m.group('name')}"))
+    found: list[tuple[int, str]] = [
+        (m.start(), f"{m.group('kind')} {m.group('name')}") for m in _C_TYPE.finditer(text)
+    ]
     for rx in (_C_FUNC, _C_PROTO):
         for m in rx.finditer(text):
             ret = m.group("ret").split()

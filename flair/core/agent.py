@@ -256,9 +256,9 @@ class Agent:
                     return AgentResult(content, turn_usage + delta, step, "loop")
                 if any(c == 3 for c in recent.values()):
                     self.convo.messages.append({"role": "user", "content": (
-                        "Stai ripetendo la stessa chiamata senza progredire. Fermati e "
-                        "rispondi con quanto hai raccolto finora, indicando cosa non sei "
-                        "riuscito a determinare."
+                        "You are repeating the same call without making progress. Stop "
+                        "and answer with what you have gathered so far, stating what you "
+                        "could not determine."
                     )})
         except KeyboardInterrupt:
             # Ctrl-C in qualsiasi punto (anche a metà di un tool): manteniamo valida la
@@ -426,7 +426,7 @@ class Agent:
             max_tokens=self.cfg.compact_summary_max_tokens,
         )
         self.convo.total_usage = self.convo.total_usage + resp.usage
-        return resp.content or "(riassunto non disponibile)"
+        return resp.content or "(summary unavailable)"
 
     @staticmethod
     def _read_inventory(msgs: list[dict], cap: int = 900) -> str:
@@ -485,8 +485,8 @@ class Agent:
             elif role == "tool":
                 content = m.get("content") or ""
                 if len(content) > 800:
-                    content = content[:800] + " …[troncato]"
-                parts.append(f"[risultato tool] {content}")
+                    content = content[:800] + " …[truncated]"
+                parts.append(f"[tool result] {content}")
             else:
                 parts.append(f"[{role}] {m.get('content') or ''}")
         return "\n".join(parts)
@@ -559,7 +559,7 @@ class Agent:
             out, ok = f"❌ Invalid arguments for {name}: {exc}", False
         except Exception as exc:  # noqa: BLE001
             out, ok = f"❌ Error in {name}: {type(exc).__name__}: {exc}", False
-            log.exception("Errore inatteso nel tool %s", name)
+            log.exception("Unexpected error in tool %s", name)
         return out, ok, (ctx.delegated_usage or Usage())
 
     def _should_parallelize(self, tcs: list[ToolCall]) -> bool:
@@ -686,7 +686,7 @@ class Agent:
             out, ok = f"❌ Invalid arguments for {name}: {exc}", False
         except Exception as exc:  # noqa: BLE001
             out, ok = f"❌ Error in {name}: {type(exc).__name__}: {exc}", False
-            log.exception("Errore inatteso nel tool %s", name)
+            log.exception("Unexpected error in tool %s", name)
 
         if self.on_result:
             self.on_result(name, out, ok)

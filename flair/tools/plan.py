@@ -51,21 +51,21 @@ def _normalize(step) -> tuple[str, str] | None:
 
 @tool(
     "plan",
-    ("Scrive o aggiorna la scaletta dei passi per il task corrente. Usalo all'inizio "
-     "dei task multi-step (3+ passi distinti) e RIscrivilo man mano che procedi, "
+    ("Write or update the step-by-step plan for the current task. Use it at the "
+     "start of multi-step tasks (3+ distinct steps) and REwrite it as you go, "
      "marking each step as todo, in_progress or done, adding/removing steps "
-     "se il piano cambia. Ti tiene focalizzato e evita passi sprecati. Per i task "
-     "semplici (1-2 passi) non serve."),
+     "if the plan changes. It keeps you focused and avoids wasted steps. Skip "
+     "it for simple tasks (1-2 steps)."),
     {
         "type": "object",
         "properties": {
             "steps": {
                 "type": "array",
-                "description": "La scaletta COMPLETA e aggiornata, in ordine.",
+                "description": "The COMPLETE, up-to-date plan, in order.",
                 "items": {
                     "type": "object",
                     "properties": {
-                        "title": {"type": "string", "description": "Il passo, breve e concreto."},
+                        "title": {"type": "string", "description": "The step, short and concrete."},
                         "status": {"type": "string", "enum": ["todo", "in_progress", "done"],
                                    "description": "Step status (default: todo)."},
                     },
@@ -84,7 +84,7 @@ def plan(ctx: ToolContext, steps: list) -> str:
         return "❌ No valid steps: each entry must have a `title`."
     extra = ""
     if len(norm) > _MAX_STEPS:
-        extra = f"\n…[{len(norm) - _MAX_STEPS} passi oltre il limite di {_MAX_STEPS}: accorpa la scaletta]"
+        extra = f"\n…[{len(norm) - _MAX_STEPS} steps over the {_MAX_STEPS} limit: consolidate the plan]"
         norm = norm[:_MAX_STEPS]
     done = sum(1 for _, st in norm if st == "done")
     lines = [f"📋 Plan ({done}/{len(norm)} done)"]

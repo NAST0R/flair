@@ -30,15 +30,25 @@ class DeepSeekProvider(OpenAICompatProvider):
     # thinking è controllata dal parametro, non dal nome.
     reasoning_regex = re.compile(r"reasoner", re.IGNORECASE)
 
+    # Protocollo thinking V4: il reasoning dei turni con tool call torna all'API.
+    keeps_reasoning_history = True
+
     def _apply_reasoning(self, params, model: str, think: bool) -> None:
         params["temperature"] = self.cfg.active.temperature
         # V4 (deepseek-v4-flash / deepseek-v4-pro): thinking via parametro. NB: lato
         # API il thinking è attivo di default anche senza parametro; qui lo rendiamo
         # esplicito con --think e, se configurato, regoliamo l'effort (high|max —
         # l'API mappa low/medium→high e xhigh→max per compatibilità).
-        if think and model.startswith("deepseek-v4"):
-            params["extra_body"] = {"thinking": {"type": "enabled"}}
-            effort = self.cfg.active.reasoning_effort
-            if effort:
-                params["reasoning_effort"] = effort
+        if model.startswith("deepseek-v4"):
+            if think:
+                params["extra_body"] = {"thinking": {"type": "enabled"}}
+                if self.cfg.active.reasoning_effort:
+                    params["reasoning_effort"] = self.cfg.active.reasoning_effort
+            elif self.cfg.active.fast_reasoning_effort:
+                # Opt-in "via di mezzo": il flash pensa già di default (effort high
+                # lato server); qui alziamo la profondità del loop veloce senza
+                # cambiare modello. Variabile non impostata = richiesta identica
+                # a prima (nessun parametro: default server intatto).
+                params["extra_body"] = {"thinking": {"type": "enabled"}}
+                params["reasoning_effort"] = self.cfg.active.fast_reasoning_effort
         # Alias legacy: la modalità è già nel nome del modello, niente da aggiungere.

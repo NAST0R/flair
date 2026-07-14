@@ -8,7 +8,10 @@ model, endpoint).
 Principi:
 - I messaggi sono dict in formato OpenAI e NON vengono mai mutati dal provider:
   è l'agente a garantire la crescita append-only (cache del prefisso).
-- Il `reasoning_content` (DeepSeek) è restituito a parte e NON va re-inviato.
+- Il `reasoning_content` (DeepSeek) è restituito a parte; dal protocollo V4, nei
+  turni CON tool call va RE-INVIATO nelle richieste successive (l'agente lo mette
+  nel messaggio assistant). I provider che non lo accettano lo spogliano qui, a
+  request-time, senza mai mutare la cronologia (keeps_reasoning_history).
 - Parsing robusto degli argomenti delle tool call (path Windows, doppia codifica).
 - Retry con backoff SOLO sugli errori transitori; i 4xx (es. richiesta troppo
   lunga) vengono rilanciati subito perché ritentarli è inutile.
@@ -34,6 +37,8 @@ from openai import (
     OpenAI,
     RateLimitError,
 )
+
+from flair.config import price_for
 
 try:  # presente in openai>=1.x
     from openai import BadRequestError
@@ -132,6 +137,10 @@ class Usage:
     cache_hit_tokens: int = 0
     cache_miss_tokens: int = 0
     reasoning_tokens: int = 0
+    # Costo USD accumulato per-richiesta, coi prezzi del modello che ha davvero
+    # servito ogni chiamata (v. OpenAICompatProvider.complete). 0.0 = nessuna
+    # attribuzione (provider di test): estimate_cost ricade sull'aggregato.
+    cost_usd: float = 0.0
 
     def __add__(self, other: Usage) -> Usage:
         return Usage(
@@ -141,7 +150,24 @@ class Usage:
             self.cache_hit_tokens + other.cache_hit_tokens,
             self.cache_miss_tokens + other.cache_miss_tokens,
             self.reasoning_tokens + other.reasoning_tokens,
+            self.cost_usd + other.cost_usd,
         )
+
+
+def _usage_cost(usage: Usage, price_hit: float, price_miss: float, price_out: float) -> float:
+    """Formula token→USD. A livello di modulo (non di classe) perché i test la
+    innestano su provider fittizi insieme a estimate_cost."""
+    # Se il provider riporta la suddivisione cache (anche con miss=0 perché tutto
+    # in cache), usa il miss reale; solo quando NESSUN campo è riportato ricadi su
+    # prompt_tokens — altrimenti un prompt interamente in cache verrebbe addebitato
+    # due volte (a prezzo hit E a prezzo miss).
+    reported = usage.cache_hit_tokens or usage.cache_miss_tokens
+    miss = usage.cache_miss_tokens if reported else usage.prompt_tokens
+    return (
+        usage.cache_hit_tokens / 1_000_000 * price_hit
+        + miss / 1_000_000 * price_miss
+        + usage.completion_tokens / 1_000_000 * price_out
+    )
 
 
 @dataclass
@@ -187,17 +213,13 @@ class LLMProvider(ABC):
         raise NotImplementedError
 
     def estimate_cost(self, usage: Usage, cfg) -> float:
-        # Se il provider riporta la suddivisione cache (anche con miss=0 perché tutto
-        # in cache), usa il miss reale; solo quando NESSUN campo è riportato ricadi su
-        # prompt_tokens — altrimenti un prompt interamente in cache verrebbe addebitato
-        # due volte (a prezzo hit E a prezzo miss).
-        reported = usage.cache_hit_tokens or usage.cache_miss_tokens
-        miss = usage.cache_miss_tokens if reported else usage.prompt_tokens
-        return (
-            usage.cache_hit_tokens / 1_000_000 * cfg.price_cache_hit
-            + miss / 1_000_000 * cfg.price_cache_miss
-            + usage.completion_tokens / 1_000_000 * cfg.price_output
-        )
+        # Preferisci il costo accumulato per-richiesta (listino del modello REALE
+        # di ogni chiamata: con --think / FLAIR_THINK_STEPS=all il turno alterna
+        # fast e thinking, e il listino unico sottostimava ~3x i token del pro).
+        # Fallback all'aggregato a listino unico per Usage senza attribuzione.
+        if usage.cost_usd:
+            return usage.cost_usd
+        return _usage_cost(usage, cfg.price_cache_hit, cfg.price_cache_miss, cfg.price_output)
 
 
 class _StreamInterrupted(Exception):
@@ -227,9 +249,21 @@ class OpenAICompatProvider(LLMProvider):
     def is_reasoning_model(self, model: str) -> bool:
         return bool(self.reasoning_regex and self.reasoning_regex.search(model))
 
+    # Il provider accetta `reasoning_content` nei messaggi assistant della
+    # cronologia? DeepSeek sì (protocollo thinking V4); default prudente: no —
+    # il campo viene rimosso a request-time (copiando SOLO i dict interessati:
+    # la cronologia condivisa non viene mai mutata).
+    keeps_reasoning_history: bool = False
+
     def _build_params(self, messages, tools, think, max_tokens) -> dict[str, Any]:
         pc = self.cfg.active
         model = pc.think_model if think else pc.model
+        if not self.keeps_reasoning_history:
+            messages = [
+                {k: v for k, v in m.items() if k != "reasoning_content"}
+                if isinstance(m, dict) and "reasoning_content" in m else m
+                for m in messages
+            ]
         params: dict[str, Any] = {"model": model, "messages": messages}
         params[self.token_param] = max_tokens if max_tokens is not None else self.cfg.max_tokens
         if tools:
@@ -268,7 +302,9 @@ class OpenAICompatProvider(LLMProvider):
 
         if stream and on_delta is not None:
             try:
-                return self._complete_stream(params, on_delta, on_reasoning)
+                resp = self._complete_stream(params, on_delta, on_reasoning)
+                resp.usage.cost_usd = self._request_cost(resp.usage, params["model"])
+                return resp
             except _StreamInterrupted as si:
                 if si.emitted:
                     # Contenuto già a video: un fallback rigenererebbe da capo →
@@ -283,7 +319,14 @@ class OpenAICompatProvider(LLMProvider):
         # mostrato (lo emette il provider, non il loop dell'agente).
         if stream and on_reasoning is not None and resp.reasoning:
             on_reasoning(resp.reasoning)
+        resp.usage.cost_usd = self._request_cost(resp.usage, params["model"])
         return resp
+
+    def _request_cost(self, usage: Usage, model: str) -> float:
+        """Costo della SINGOLA richiesta, coi prezzi del modello che l'ha servita
+        (gli override FLAIR_PRICE_* mantengono la precedenza, campo per campo)."""
+        hit, miss, out = price_for(self.cfg.provider, model)
+        return _usage_cost(usage, hit, miss, out)
 
     # ── interni ───────────────────────────────────────────────────────────
 

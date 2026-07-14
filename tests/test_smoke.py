@@ -2573,6 +2573,226 @@ def test_deepseek_reasoning_effort():
     _os.environ.pop("DEEPSEEK_REASONING_EFFORT", None)
 
 
+def test_reasoning_passback():
+    import tempfile as _tf
+
+    from flair.core.agent import Agent
+    from flair.llm.deepseek import DeepSeekProvider
+    from flair.llm.openai import OpenAIProvider
+
+    # ── _assistant_msg: il reasoning viaggia SOLO nei turni con tool call ────
+    resp = LLMResponse(reasoning="piano segreto", tool_calls=[tc("read_file", path="a.py")],
+                       usage=Usage(total_tokens=1))
+    msg = Agent._assistant_msg(None, resp)
+    check("passback: reasoning incluso nel turno con tool", msg.get("reasoning_content") == "piano segreto", msg)
+    resp = LLMResponse(tool_calls=[tc("read_file", path="a.py")], usage=Usage(total_tokens=1))
+    check("passback: senza reasoning niente campo", "reasoning_content" not in Agent._assistant_msg(None, resp))
+    resp = LLMResponse(content="fine", reasoning="pensieri finali", usage=Usage(total_tokens=1))
+    check("passback: turno finale senza tool → campo omesso (il server lo ignorerebbe)",
+          "reasoning_content" not in Agent._assistant_msg(None, resp))
+
+    # ── stima token: le tracce ora pesano nel contesto ───────────────────────
+    base_msgs = [{"role": "assistant", "content": "x" * 40}]
+    with_r = [{"role": "assistant", "content": "x" * 40, "reasoning_content": "r" * 400}]
+    check("passback: _estimate_tokens conta il reasoning",
+          Agent._estimate_tokens(with_r) - Agent._estimate_tokens(base_msgs) == 100)
+
+    # ── sanitizzazione per-provider (switch /provider a metà sessione) ───────
+    import os as _os
+    _os.environ["DEEPSEEK_API_KEY"] = "sk-test"
+    _os.environ["OPENAI_API_KEY"] = "sk-test"
+    cfg = load_config()
+    history = [
+        {"role": "user", "content": "ciao"},
+        {"role": "assistant", "content": "", "reasoning_content": "trace", "tool_calls": []},
+    ]
+    cfg.provider = "openai"
+    oai = OpenAIProvider(cfg)
+    sent = oai._build_params(history, None, think=False, max_tokens=64)["messages"]
+    check("passback: OpenAI spoglia il campo a request-time", "reasoning_content" not in sent[1], sent[1])
+    check("passback: la cronologia NON viene mutata", history[1]["reasoning_content"] == "trace")
+    check("passback: messaggi puliti passano per identità (zero copie inutili)", sent[0] is history[0])
+    cfg2 = load_config()
+    cfg2.provider = "deepseek"
+    ds = DeepSeekProvider(cfg2)
+    sent = ds._build_params(history, None, think=False, max_tokens=64)["messages"]
+    check("passback: DeepSeek conserva il campo", sent[1].get("reasoning_content") == "trace")
+    check("passback: DeepSeek passa la lista senza copie", sent is history)
+
+    # ── end-to-end: la traccia entra in cronologia e arriva al provider dopo ─
+    root = Path(_tf.mkdtemp(prefix="flair_rp_")).resolve()
+    (root / "a.py").write_text("x = 1\n")
+    cfg3 = cfg_for(root)
+    fake = FakeProvider([
+        LLMResponse(reasoning="prima leggo a.py, poi decido",
+                    tool_calls=[tc("read_file", path="a.py")], usage=Usage(total_tokens=1)),
+        LLMResponse(content="Fatto.", reasoning="ho visto abbastanza", usage=Usage(total_tokens=1)),
+    ])
+    agent = coding_agent.build(cfg3, fake)
+    out = agent.run("leggi a.py")
+    check("passback e2e: run completata", out.content == "Fatto.")
+    tool_turns = [m for m in agent.convo.messages
+                  if m.get("role") == "assistant" and m.get("tool_calls")]
+    check("passback e2e: la traccia è in cronologia sul turno con tool",
+          tool_turns and tool_turns[0].get("reasoning_content") == "prima leggo a.py, poi decido")
+    finals = [m for m in agent.convo.messages
+              if m.get("role") == "assistant" and not m.get("tool_calls")]
+    check("passback e2e: il turno finale resta senza campo",
+          finals and "reasoning_content" not in finals[-1])
+    second_call_msgs = fake.seen[1]
+    sent_tool_turn = [m for m in second_call_msgs
+                      if isinstance(m, dict) and m.get("role") == "assistant" and m.get("tool_calls")]
+    check("passback e2e: la richiesta successiva porta il reasoning al provider",
+          sent_tool_turn and sent_tool_turn[0].get("reasoning_content") == "prima leggo a.py, poi decido")
+
+
+def test_reasoning_regimes():
+    import os as _os
+    import tempfile as _tf
+
+    from flair.llm.deepseek import DeepSeekProvider
+
+    # ── FLAIR_THINK_STEPS: parsing e validazione ─────────────────────────────
+    _os.environ.pop("FLAIR_THINK_STEPS", None)
+    _os.environ["DEEPSEEK_API_KEY"] = "sk-test"
+    check("regimi: default think_steps=first", load_config().think_steps == "first")
+    _os.environ["FLAIR_THINK_STEPS"] = "ALL"
+    check("regimi: env 'ALL' normalizzata", load_config().think_steps == "all")
+    _os.environ["FLAIR_THINK_STEPS"] = "sempre"
+    try:
+        load_config()
+        check("regimi: valore invalido rifiutato", False)
+    except ValueError as exc:
+        check("regimi: valore invalido rifiutato", "FLAIR_THINK_STEPS" in str(exc), exc)
+    _os.environ.pop("FLAIR_THINK_STEPS", None)
+
+    # ── il knob modula il loop: first = solo step 0; all = tutti gli step ────
+    root = Path(_tf.mkdtemp(prefix="flair_ts_")).resolve()
+    (root / "a.py").write_text("x = 1\n")
+
+    def script():
+        return [
+            LLMResponse(tool_calls=[tc("read_file", path="a.py")], usage=Usage(total_tokens=1)),
+            LLMResponse(tool_calls=[tc("list_directory", path=".")], usage=Usage(total_tokens=1)),
+            LLMResponse(content="Fatto.", usage=Usage(total_tokens=1)),
+        ]
+
+    cfg1 = cfg_for(root)
+    fake1 = FakeProvider(script())
+    coding_agent.build(cfg1, fake1).run("task", think=True)
+    thinks = [c["think"] for c in fake1.calls]
+    check("regimi: first → think solo allo step 0", thinks == [True, False, False], thinks)
+
+    cfg2 = cfg_for(root)
+    cfg2.think_steps = "all"
+    fake2 = FakeProvider(script())
+    coding_agent.build(cfg2, fake2).run("task", think=True)
+    thinks = [c["think"] for c in fake2.calls]
+    check("regimi: all → think su ogni step del turno", thinks == [True, True, True], thinks)
+
+    cfg3 = cfg_for(root)
+    cfg3.think_steps = "all"
+    fake3 = FakeProvider(script())
+    coding_agent.build(cfg3, fake3).run("task", think=False)
+    thinks = [c["think"] for c in fake3.calls]
+    check("regimi: all senza --think non forza nulla", thinks == [False, False, False], thinks)
+
+    # ── DEEPSEEK_FAST_REASONING_EFFORT: la via di mezzo, opt-in ──────────────
+    _os.environ["DEEPSEEK_FAST_REASONING_EFFORT"] = "max"
+    _os.environ.pop("DEEPSEEK_REASONING_EFFORT", None)
+    c = load_config()
+    c.provider = "deepseek"
+    ds = DeepSeekProvider(c)
+    fast = ds._build_params([], None, think=False, max_tokens=64)
+    check("regimi: fast effort → thinking esplicito",
+          fast.get("extra_body") == {"thinking": {"type": "enabled"}}, fast)
+    check("regimi: fast effort → parametro inviato verbatim", fast.get("reasoning_effort") == "max", fast)
+    thinkp = ds._build_params([], None, think=True, max_tokens=64)
+    check("regimi: sul --think comanda l'altro knob (qui assente)", "reasoning_effort" not in thinkp, thinkp)
+    check("regimi: --think mantiene il thinking esplicito",
+          thinkp.get("extra_body") == {"thinking": {"type": "enabled"}})
+    _os.environ["DEEPSEEK_REASONING_EFFORT"] = "high"
+    c2 = load_config()
+    c2.provider = "deepseek"
+    both = DeepSeekProvider(c2)._build_params([], None, think=True, max_tokens=64)
+    check("regimi: knob indipendenti (think usa il suo, 'high')", both.get("reasoning_effort") == "high", both)
+    _os.environ.pop("DEEPSEEK_REASONING_EFFORT", None)
+    _os.environ.pop("DEEPSEEK_FAST_REASONING_EFFORT", None)
+    c3 = load_config()
+    c3.provider = "deepseek"
+    clean = DeepSeekProvider(c3)._build_params([], None, think=False, max_tokens=64)
+    check("regimi: senza knob il fast resta byte-identico",
+          "extra_body" not in clean and "reasoning_effort" not in clean, clean)
+    _os.environ["DEEPSEEK_FAST_REASONING_EFFORT"] = "max"
+    _os.environ["DEEPSEEK_MODEL"] = "deepseek-chat"
+    c4 = load_config()
+    c4.provider = "deepseek"
+    leg = DeepSeekProvider(c4)._build_params([], None, think=False, max_tokens=64)
+    check("regimi: alias legacy intatti anche col knob",
+          "extra_body" not in leg and "reasoning_effort" not in leg, leg)
+    _os.environ.pop("DEEPSEEK_FAST_REASONING_EFFORT", None)
+    _os.environ.pop("DEEPSEEK_MODEL", None)
+
+
+def test_cost_attribution():
+    import os as _os
+
+    from flair.config import price_for
+    from flair.llm.base import Usage, _usage_cost
+    from flair.llm.deepseek import DeepSeekProvider
+
+    _os.environ["DEEPSEEK_API_KEY"] = "sk-test"
+    for k in ("FLAIR_PRICE_CACHE_HIT", "FLAIR_PRICE_CACHE_MISS", "FLAIR_PRICE_OUTPUT"):
+        _os.environ.pop(k, None)
+
+    # ── price_for: listino del modello indicato, non del modello attivo ──────
+    check("costi: price_for distingue flash e pro",
+          price_for("deepseek", "deepseek-v4-flash") == (0.0028, 0.14, 0.28)
+          and price_for("deepseek", "deepseek-v4-pro") == (0.003625, 0.435, 0.87))
+    _os.environ["FLAIR_PRICE_CACHE_MISS"] = "9.9"
+    check("costi: override env vince campo per campo, su ogni modello",
+          price_for("deepseek", "deepseek-v4-pro")[1] == 9.9
+          and price_for("deepseek", "deepseek-v4-flash")[1] == 9.9
+          and price_for("deepseek", "deepseek-v4-pro")[2] == 0.87)
+    _os.environ.pop("FLAIR_PRICE_CACHE_MISS", None)
+
+    # ── Usage: il costo si somma come i token ────────────────────────────────
+    a = Usage(prompt_tokens=10, cost_usd=0.5)
+    b = Usage(prompt_tokens=5, cost_usd=0.25)
+    check("costi: __add__ somma cost_usd", (a + b).cost_usd == 0.75)
+    check("costi: default 0.0 (nessuna attribuzione)", Usage().cost_usd == 0.0)
+
+    # ── _request_cost: la stessa Usage costa diverso su flash e su pro ───────
+    cfgd = load_config()
+    cfgd.provider = "deepseek"
+    ds = DeepSeekProvider(cfgd)
+    u = Usage(prompt_tokens=1_000_000, completion_tokens=1_000_000,
+              cache_hit_tokens=0, cache_miss_tokens=1_000_000)
+    flash = ds._request_cost(u, "deepseek-v4-flash")
+    pro = ds._request_cost(u, "deepseek-v4-pro")
+    check("costi: richiesta prezzata col modello reale (flash)", abs(flash - (0.14 + 0.28)) < 1e-9, flash)
+    check("costi: richiesta prezzata col modello reale (pro)", abs(pro - (0.435 + 0.87)) < 1e-9, pro)
+
+    # ── estimate_cost: preferisce l'accumulato, ricade sull'aggregato ────────
+    attributed = Usage(prompt_tokens=1_000_000, cache_miss_tokens=1_000_000, cost_usd=1.234)
+    check("costi: estimate_cost usa l'accumulato quando c'è",
+          ds.estimate_cost(attributed, cfgd) == 1.234)
+    legacy = Usage(prompt_tokens=1_000_000, cache_miss_tokens=1_000_000)
+    expected = _usage_cost(legacy, cfgd.price_cache_hit, cfgd.price_cache_miss, cfgd.price_output)
+    check("costi: senza attribuzione ricade sul listino unico (retrocompat)",
+          abs(ds.estimate_cost(legacy, cfgd) - expected) < 1e-12)
+
+    # ── il caso che ha motivato il fix: turno misto flash+pro ────────────────
+    step_pro = Usage(cache_miss_tokens=100_000, completion_tokens=10_000)
+    step_pro.cost_usd = ds._request_cost(step_pro, "deepseek-v4-pro")
+    step_flash = Usage(cache_miss_tokens=100_000, completion_tokens=10_000)
+    step_flash.cost_usd = ds._request_cost(step_flash, "deepseek-v4-flash")
+    turn = step_pro + step_flash
+    check("costi: turno misto = somma dei listini reali (non 2x flash)",
+          abs(ds.estimate_cost(turn, cfgd) - (step_pro.cost_usd + step_flash.cost_usd)) < 1e-12
+          and turn.cost_usd > 2 * step_flash.cost_usd)
+
+
 def main():
     test_arg_parse()
     test_usage_normalization()
@@ -2594,6 +2814,9 @@ def main():
     test_grep_context_and_move()
     test_honest_reads_and_inventory()
     test_deepseek_reasoning_effort()
+    test_reasoning_passback()
+    test_reasoning_regimes()
+    test_cost_attribution()
     test_parallel_tools()
     test_cli_session_roundtrip()
     test_shared_memory()

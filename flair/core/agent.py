@@ -206,7 +206,12 @@ class Agent:
                 # freno che evita spese fuori controllo in esecuzione non presidiata.
                 if self._over_budget():
                     return AgentResult("", self._fold_delegated(turn_usage), step, "budget")
-                resp = self._complete(tools=schemas, think=think and step == 0)
+                # Con --think, di default il modello thinking guida solo la mossa
+                # d'apertura (step 0); con FLAIR_THINK_STEPS=all resta in cabina per
+                # tutto il turno. Il knob modula SOLO i turni --think: senza --think
+                # non forza mai nulla.
+                deep = think and (step == 0 or self.cfg.think_steps == "all")
+                resp = self._complete(tools=schemas, think=deep)
                 turn_usage = turn_usage + resp.usage
 
                 if resp.reasoning and self.on_reasoning and not self._streaming():
@@ -334,6 +339,7 @@ class Agent:
         chars = 0
         for m in msgs:
             chars += len(m.get("content") or "")
+            chars += len(m.get("reasoning_content") or "")   # tracce nei turni con tool
             for tc in (m.get("tool_calls") or []):
                 fn = tc.get("function", {})
                 chars += len(fn.get("arguments", "")) + len(fn.get("name", ""))
@@ -488,7 +494,7 @@ class Agent:
     # ── interni ─────────────────────────────────────────────────────────────
 
     def _assistant_msg(self, resp: LLMResponse) -> dict:
-        return {
+        msg: dict = {
             "role": "assistant",
             "content": resp.content or "",
             "tool_calls": [
@@ -500,6 +506,16 @@ class Agent:
                 for tc in resp.tool_calls
             ],
         }
+        # Protocollo thinking V4 (DeepSeek): nei turni CON tool call il reasoning
+        # dell'assistant deve tornare all'API nelle richieste successive, così il
+        # modello RIPRENDE il filo invece di ri-ragionare da zero sui soli artefatti
+        # visibili (e i doc minacciano un 400 se manca). Nei turni SENZA tool il
+        # server lo ignora: lo omettiamo per non pagare token inutili. I provider
+        # che non accettano il campo lo spogliano a request-time (mai mutando la
+        # cronologia: append-only e cache del prefisso restano intatti).
+        if resp.tool_calls and resp.reasoning:
+            msg["reasoning_content"] = resp.reasoning
+        return msg
 
     @staticmethod
     def _sig(name: str, args: dict) -> str:

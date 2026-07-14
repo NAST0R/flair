@@ -84,6 +84,19 @@ def resolve_pricing(provider: str, model: str) -> tuple[float, float, float]:
     return best or _PROVIDER_FALLBACK.get(provider, _PROVIDER_FALLBACK["deepseek"])
 
 
+def price_for(provider: str, model: str) -> tuple[float, float, float]:
+    """Prezzi effettivi per UNA richiesta: listino del modello indicato, con gli
+    override FLAIR_PRICE_* (anche parziali) sempre vincenti. Serve all'attribuzione
+    dei costi per-richiesta: in un turno --think (o con FLAIR_THINK_STEPS=all) si
+    alternano fast e thinking, e un listino unico sottostimerebbe il reasoner."""
+    hit, miss, out = resolve_pricing(provider, model)
+    return (
+        _float("FLAIR_PRICE_CACHE_HIT", hit),
+        _float("FLAIR_PRICE_CACHE_MISS", miss),
+        _float("FLAIR_PRICE_OUTPUT", out),
+    )
+
+
 # Nomi dei file di istruzioni di progetto caricati nel prompt dell'agente coding.
 PROJECT_INSTRUCTION_FILES = ("AGENTS.md", "FLAIR.md", "CLAUDE.md", ".flair.md")
 
@@ -96,6 +109,9 @@ class ProviderConfig:
     base_url: str | None = None
     temperature: float = 0.0
     reasoning_effort: str | None = None  # solo reasoning model (low|medium|high)
+    # Opt-in: profondità del ragionamento di DEFAULT del modello veloce (il flash
+    # V4 pensa già a 'high' lato server anche senza parametri). None = intatto.
+    fast_reasoning_effort: str | None = None
 
 
 @dataclass
@@ -112,6 +128,10 @@ class Config:
     # Loop agentico
     max_steps: int = 60
     explorer_max_steps: int = 20
+    # Con --think: 'first' (default) = modello thinking solo alla mossa d'apertura,
+    # poi il loop prosegue sul veloce; 'all' = thinking per TUTTO il turno (ha
+    # senso col passback del reasoning: ogni step eredita il filo). Opt-in.
+    think_steps: str = "first"
     # Esecuzione concorrente dei tool: quando il modello emette più tool call in un
     # turno e sono TUTTE non distruttive (read-only), vengono eseguite in parallelo
     # (latenza ridotta su letture/ricerche/explore). I batch con tool distruttivi, o
@@ -183,11 +203,18 @@ class Config:
         if not self.active.api_key:
             key_name = "DEEPSEEK_API_KEY" if self.provider == "deepseek" else "OPENAI_API_KEY"
             raise RuntimeError(
-                f"{key_name} mancante. Crea un file .env (vedi .env.example) "
-                "o esporta la variabile d'ambiente."
+                f"{key_name} missing. Create a .env file (see .env.example) "
+                "or export the environment variable."
             )
         if not self.root.exists():
             raise RuntimeError(f"FLAIR_ROOT does not exist: {self.root}")
+
+
+def _think_steps() -> str:
+    val = (os.getenv("FLAIR_THINK_STEPS") or "first").strip().lower()
+    if val not in ("first", "all"):
+        raise ValueError(f"Invalid FLAIR_THINK_STEPS: {val!r} (use 'first' or 'all').")
+    return val
 
 
 def load_config() -> Config:
@@ -200,6 +227,7 @@ def load_config() -> Config:
         think_model=os.getenv("DEEPSEEK_THINK_MODEL", "deepseek-v4-pro"),
         temperature=_float("DEEPSEEK_TEMPERATURE", 0.0),
         reasoning_effort=os.getenv("DEEPSEEK_REASONING_EFFORT") or None,
+        fast_reasoning_effort=os.getenv("DEEPSEEK_FAST_REASONING_EFFORT") or None,
     )
     openai = ProviderConfig(
         api_key=os.getenv("OPENAI_API_KEY", ""),
@@ -221,6 +249,7 @@ def load_config() -> Config:
         stream=_bool("FLAIR_STREAM", True),
         max_steps=_int("FLAIR_MAX_STEPS", 60),
         explorer_max_steps=_int("FLAIR_EXPLORER_MAX_STEPS", 20),
+        think_steps=_think_steps(),
         parallel_tools=_bool("FLAIR_PARALLEL_TOOLS", True),
         parallel_tools_max_workers=_int("FLAIR_PARALLEL_TOOLS_MAX", 8),
         context_window=_int("FLAIR_CONTEXT_WINDOW", 120_000),

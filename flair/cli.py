@@ -223,6 +223,29 @@ class CLI:
             "conversation": self.convo.dump(),
         }
 
+    def _remember_note(self, note: str) -> None:
+        # Porta manuale sulla memoria di sessione: stessa meccanica e stesse
+        # guardie del tool `remember` dell'agente (dedup, filtro segreti, tetto),
+        # ma deterministica e senza round-trip LLM. Prima di questo comando
+        # digitare "/remember X" cadeva al modello come prompt e funzionava solo
+        # per sua gentile interpretazione — ora è un contratto.
+        if not self.cfg.memory_enabled:
+            self.console.print("[dim]memory disabled (FLAIR_MEMORY=false).[/dim]\n")
+            return
+        if not note:
+            self.console.print("[dim]usage: /remember <note>[/dim]\n")
+            return
+        ok, msg = self.memory.add(note)
+        if ok:
+            # NIENTE _refresh_memory_prompts qui: stesso contratto del tool
+            # `remember` dell'agente — toccare il system prompt a metà sessione
+            # romperebbe il prefisso in cache. La nota entra nel prompt al
+            # prossimo confine di sessione (avvio, /load, /root, /memory clear).
+            self._save_session()             # sessione salvata → sidecar aggiornato
+            self.console.print(f"[green]✓ noted.[/green] [dim]({len(self.memory.notes)} in memory)[/dim]\n")
+        else:
+            self.console.print(f"[yellow]⚠ {msg}[/yellow]\n")
+
     def _save_session(self) -> None:
         if self.session_name:
             self.session.save(self.session_name, self._session_state())
@@ -588,6 +611,7 @@ class CLI:
             ("/load <name>", "resume a saved session"),
             ("/sessions", "list saved sessions"),
             ("/memory [clear]", "show (or clear) the session memory"),
+            ("/remember <note>", "jot a durable note into session memory yourself"),
             ("/reset", "reset the shared conversation"),
             ("/root <path>", "change the working folder (coding + general; reloads instructions)"),
             ("/help", "this help"),
@@ -668,6 +692,10 @@ class CLI:
                 else:
                     body = "\n".join(f"  • {n}  [dim]{ts}[/dim]" for n, ts in items)
                     self.console.print(f"[dim]saved sessions:[/dim]\n{body}\n")
+                continue
+            if low.startswith("/remember"):
+                parts = line.split(maxsplit=1)
+                self._remember_note(parts[1].strip() if len(parts) == 2 else "")
                 continue
             if low.startswith("/memory"):
                 if not self.cfg.memory_enabled:

@@ -2913,6 +2913,51 @@ def test_reasoning_stream_feedback():
           [k for k, _ in events] == ["r"], events)
 
 
+def test_remember_command():
+    import inspect as _inspect
+    import io as _io
+    import tempfile as _tf
+
+    from rich.console import Console as _Console
+
+    from flair.cli import CLI
+
+    root = Path(_tf.mkdtemp(prefix="flair_rm_")).resolve()
+    cfg = cfg_for(root)
+    cli = CLI(cfg)
+
+    def run(note: str) -> str:
+        cli.console = _Console(file=_io.StringIO(), force_terminal=False)
+        cli._remember_note(note)
+        return cli.console.file.getvalue()
+
+    out = run("build with make -j4")
+    check("/remember: nota inserita", "build with make -j4" in cli.memory.notes, cli.memory.notes)
+    check("/remember: conferma con conteggio", "✓ noted." in out and "1 in memory" in out, out)
+    check("/remember: prompt intatto a metà sessione (prefisso in cache preservato)",
+          "build with make -j4" not in cli.agents["coding"].system_prompt)
+    cli._refresh_memory_prompts()   # simula il confine di sessione
+    check("/remember: al confine la nota entra nel prompt",
+          "build with make -j4" in cli.agents["coding"].system_prompt)
+    out = run("build with make -j4")
+    check("/remember: dedup ereditato dalle guardie", "already in memory" in out, out)
+    out = run("api key = sk-abcdef1234567890abcdef")
+    check("/remember: filtro segreti ereditato", "credentials or secrets" in out
+          and len(cli.memory.notes) == 1, out)
+    out = run("")
+    check("/remember: senza argomento → usage", "usage: /remember <note>" in out, out)
+
+    cfg2 = cfg_for(root)
+    cfg2.memory_enabled = False
+    cli2 = CLI(cfg2)
+    cli2.console = _Console(file=_io.StringIO(), force_terminal=False)
+    cli2._remember_note("qualcosa")
+    check("/remember: memoria disattivata → messaggio, nessun crash",
+          "memory disabled" in cli2.console.file.getvalue())
+
+    check("/remember: presente nell'help", "/remember <note>" in _inspect.getsource(CLI._print_help))
+
+
 def main():
     test_arg_parse()
     test_usage_normalization()
@@ -2939,6 +2984,7 @@ def main():
     test_cost_attribution()
     test_english_surface()
     test_reasoning_stream_feedback()
+    test_remember_command()
     test_parallel_tools()
     test_cli_session_roundtrip()
     test_shared_memory()

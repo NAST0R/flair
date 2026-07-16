@@ -78,7 +78,7 @@ class _FakeProvider:
         self.i = 0
 
     def complete(self, messages, tools=None, think=False, max_tokens=None, stream=False,
-                 on_delta=None, on_reasoning=None):
+                 on_delta=None, on_reasoning=None, on_reasoning_delta=None):
         from flair.llm.base import LLMResponse, Usage
         if self.i >= len(self.script):
             return LLMResponse(content="FINE", usage=Usage(total_tokens=1))

@@ -12,12 +12,14 @@ import difflib
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 from rich import box
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
+from rich.status import Status
 from rich.table import Table
 from rich.text import Text
 
@@ -43,6 +45,27 @@ _TOOL_ICON = {
     "search_files": "🔦", "system_info": "🖥️ ", "get_datetime": "🕒",
     "clipboard_get": "📋", "clipboard_set": "📋", "web_search": "🌍", "web_fetch": "🌍",
 }
+
+
+def _pick_spinner(windows: bool, env: dict, encoding: str | None) -> str:
+    """Sceglie lo spinner in base alle capacità note del terminale: "dots" (Braille,
+    elegante) solo dove i glifi sono affidabili; altrimenti "line" (ASCII puro).
+    Su Windows il conhost classico (cmd.exe) spesso non ha i Braille nel font:
+    servono segnali espliciti di un terminale moderno. Su POSIX basta l'encoding."""
+    if windows:
+        modern = ("WT_SESSION" in env or env.get("ConEmuANSI") == "ON"
+                  or env.get("TERM_PROGRAM") == "vscode" or "ANSICON" in env)
+        return "dots" if modern else "line"
+    return "dots" if encoding and "utf" in encoding.lower() else "line"
+
+
+def _spinner_name() -> str:
+    return _pick_spinner(os.name == "nt", dict(os.environ), getattr(sys.stdout, "encoding", None))
+
+
+def _fmt_thinking(chars: int, secs: float) -> str:
+    volume = f"{chars / 1000:.1f}k" if chars >= 1000 else str(chars)
+    return f"{volume} chars · {int(secs)}s"
 
 
 def _short(v, n: int = 70) -> str:
@@ -139,6 +162,11 @@ class CLI:
         # iniettata nel system prompt SOLO ai confini di sessione (qui, /load,
         # /memory clear) così il prefisso in cache non si rompe mai a metà lavoro.
         self.memory = SessionMemory(max_chars=cfg.memory_max_chars)
+        # Status vivo durante le fasi di pensiero (spinner + contatore): parte al
+        # primo delta di reasoning, si ferma PRIMA di qualunque altra stampa.
+        self._think_status: Status | None = None
+        self._think_chars = 0
+        self._think_t0 = 0.0
         self._base_prompts = {k: ag.system_prompt for k, ag in self.agents.items()}
         for ag in self.agents.values():
             ag.ctx.memory = self.memory
@@ -149,6 +177,7 @@ class CLI:
             on_tool=self._on_tool,
             on_result=self._on_result,
             on_reasoning=self._on_reasoning,
+            on_reasoning_delta=self._on_reasoning_delta,
             on_delta=self._on_delta,
             on_compact=self._on_compact,
             on_prune=self._on_prune,
@@ -238,6 +267,7 @@ class CLI:
     def _on_delta(self, piece: str) -> None:
         if self.output_mode != "human":
             return
+        self._stop_thinking()   # mai scrivere su stdout con lo status attivo
         sys.stdout.write(piece)
         sys.stdout.flush()
         self._mid_line = not piece.endswith("\n")
@@ -247,6 +277,7 @@ class CLI:
         self._turn_tools.append({"name": name, "args": {k: _short(v, 200) for k, v in args.items()}})
         if self.output_mode != "human":
             return
+        self._stop_thinking()
         self._newline_if_needed()
         icon = _TOOL_ICON.get(name, "🔧")
         shown = {}
@@ -278,9 +309,32 @@ class CLI:
         self._newline_if_needed()
         self.console.print(f"[dim]  ✂ context: pruned {count} superseded tool outputs[/dim]")
 
+    def _on_reasoning_delta(self, piece: str) -> None:
+        # Le fasi di pensiero lunghe (effort max: anche 10k+ char) congelavano la
+        # CLI senza segni di vita fino al pannello. Qui: spinner + contatore che
+        # cresce coi delta; il pannello completo resta il render finale (leggibile),
+        # lo status è solo il battito cardiaco.
+        if self.output_mode != "human":
+            return
+        if self._think_status is None:
+            self._newline_if_needed()
+            self._think_chars = 0
+            self._think_t0 = time.monotonic()
+            self._think_status = self.console.status("[dim]reasoning…[/dim]", spinner=_spinner_name())
+            self._think_status.start()
+        self._think_chars += len(piece)
+        elapsed = time.monotonic() - self._think_t0
+        self._think_status.update(f"[dim]reasoning… {_fmt_thinking(self._think_chars, elapsed)}[/dim]")
+
+    def _stop_thinking(self) -> None:
+        status, self._think_status = self._think_status, None
+        if status is not None:
+            status.stop()
+
     def _on_reasoning(self, text: str) -> None:
         if self.output_mode != "human":
             return
+        self._stop_thinking()
         self._newline_if_needed()
         self.console.print(Panel(Text(text.strip(), style="italic dim"),
                                  title="[dim]reasoning[/dim]", border_style="dim", padding=(0, 1)))
@@ -436,7 +490,10 @@ class CLI:
             self.console.print(f"[dim]→ agent: {agent_key}[/dim]")
         if human and self.cfg.stream:
             self.console.print(f"[bold cyan]flair · {agent_key}[/bold cyan]")
-            result = agent.run(task, think=think)
+            try:
+                result = agent.run(task, think=think)
+            finally:
+                self._stop_thinking()   # rete di sicurezza: mai spinner orfani su errore
             self._newline_if_needed()
             self.console.print()
         else:

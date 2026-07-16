@@ -96,7 +96,7 @@ class FakeProvider:
         self.calls = []  # kwargs di ogni chiamata
 
     def complete(self, messages, tools=None, think=False, max_tokens=None, stream=False,
-                 on_delta=None, on_reasoning=None):
+                 on_delta=None, on_reasoning=None, on_reasoning_delta=None):
         self.seen.append([dict(m) for m in messages])
         self.calls.append({"think": think, "max_tokens": max_tokens, "stream": stream})
         if self.i >= len(self.script):
@@ -105,8 +105,12 @@ class FakeProvider:
         self.i += 1
         if isinstance(r, BaseException):
             raise r
+        if stream and on_reasoning_delta and r.reasoning:
+            mid = max(1, len(r.reasoning) // 2)   # come il reale: delta man mano...
+            on_reasoning_delta(r.reasoning[:mid])
+            on_reasoning_delta(r.reasoning[mid:])
         if stream and on_reasoning and r.reasoning:
-            on_reasoning(r.reasoning)  # come il provider reale: ragionamento prima del contenuto
+            on_reasoning(r.reasoning)  # ...poi il blocco intero al flush, prima del contenuto
         if stream and on_delta and r.content:
             for ch in r.content:  # simula lo streaming carattere per carattere
                 on_delta(ch)
@@ -2816,6 +2820,99 @@ def test_english_surface():
         check(f"superficie inglese: prompt {name}", not bad, bad[:5])
 
 
+def test_reasoning_stream_feedback():
+    import inspect as _inspect
+    import tempfile as _tf
+
+    from flair.cli import _fmt_thinking
+    from flair.llm.base import LLMProvider, OpenAICompatProvider
+
+    # ── contratto: il nuovo callback è additivo, presente in entrambe le firme ──
+    for cls in (LLMProvider, OpenAICompatProvider):
+        check(f"feedback: on_reasoning_delta nella firma di {cls.__name__}",
+              "on_reasoning_delta" in _inspect.signature(cls.complete).parameters)
+
+    # ── contatore umano ──
+    check("feedback: formato sotto il migliaio", _fmt_thinking(342, 3.7) == "342 chars · 3s")
+    check("feedback: formato in k", _fmt_thinking(4200, 61.9) == "4.2k chars · 61s")
+    check("feedback: bordo 1000", _fmt_thinking(1000, 0.2) == "1.0k chars · 0s")
+
+    # ── e2e: delta man mano, blocco intero al flush, ordine garantito ──
+    root = Path(_tf.mkdtemp(prefix="flair_fb_")).resolve()
+    (root / "a.py").write_text("x = 1\n")
+    events: list[tuple[str, str]] = []
+    cfg = cfg_for(root)
+    cfg.stream = True
+    fake = FakeProvider([
+        LLMResponse(reasoning="piano di lettura iniziale",
+                    tool_calls=[tc("read_file", path="a.py")], usage=Usage(total_tokens=1)),
+        LLMResponse(content="Fatto.", reasoning="chiusura", usage=Usage(total_tokens=1)),
+    ])
+    agent = coding_agent.build(
+        cfg, fake,
+        on_reasoning_delta=lambda p: events.append(("d", p)),
+        on_reasoning=lambda t: events.append(("r", t)),
+        on_delta=lambda p: None,
+    )
+    out = agent.run("leggi a.py")
+    check("feedback e2e: run completata", out.content == "Fatto.")
+    kinds = [k for k, _ in events]
+    check("feedback e2e: delta prima del blocco, per ogni fase",
+          kinds == ["d", "d", "r", "d", "d", "r"], kinds)
+    d1 = "".join(v for k, v in events[:2])
+    d2 = "".join(v for k, v in events[3:5])
+    check("feedback e2e: i delta ricompongono il blocco intero",
+          d1 == events[2][1] == "piano di lettura iniziale" and d2 == events[5][1] == "chiusura")
+
+    # ── audit cross-OS: scelta spinner per capacità del terminale ──
+    from flair.cli import _pick_spinner
+    check("spinner: Windows Terminal → dots", _pick_spinner(True, {"WT_SESSION": "1"}, "utf-8") == "dots")
+    check("spinner: VS Code su Windows → dots", _pick_spinner(True, {"TERM_PROGRAM": "vscode"}, None) == "dots")
+    check("spinner: ConEmu → dots", _pick_spinner(True, {"ConEmuANSI": "ON"}, None) == "dots")
+    check("spinner: cmd.exe classico → line (ASCII)", _pick_spinner(True, {}, "utf-8") == "line")
+    check("spinner: POSIX utf-8 → dots", _pick_spinner(False, {}, "UTF-8") == "dots")
+    check("spinner: POSIX LANG=C → line", _pick_spinner(False, {}, "ascii") == "line")
+    check("spinner: encoding ignoto → line", _pick_spinner(False, {}, None) == "line")
+
+    # ── audit non-tty: il ciclo start/update/stop non deve emettere ANSI né rompersi ──
+    import io as _io
+
+    from rich.console import Console as _Console
+    buf = _io.StringIO()
+    con = _Console(file=buf, force_terminal=False)
+    st = con.status("reasoning…", spinner="line")
+    st.start()
+    st.update("reasoning… 1.0k chars · 2s")
+    st.stop()
+    check("status su non-terminale: nessun crash, niente escape ANSI", "\x1b[" not in buf.getvalue())
+
+    # ── audit provider: il gancio dei delta è a valle di _reasoning_piece, che
+    #    accetta entrambi i campi → feedback provider-agnostico per costruzione ──
+    from flair.llm.base import _reasoning_piece
+
+    class _D:  # delta OpenAI-compat: solo campo `reasoning`
+        reasoning = "traccia compat"
+    class _DS:  # delta DeepSeek: `reasoning_content`
+        reasoning_content = "traccia deepseek"
+    check("provider-agnostico: campo `reasoning` (ecosistema OpenAI)", _reasoning_piece(_D()) == "traccia compat")
+    check("provider-agnostico: campo `reasoning_content` (DeepSeek)", _reasoning_piece(_DS()) == "traccia deepseek")
+
+    # ── regressione: senza streaming niente delta, pannello post-hoc intatto ──
+    events.clear()
+    cfg2 = cfg_for(root)
+    cfg2.stream = False
+    fake2 = FakeProvider([
+        LLMResponse(content="Fatto.", reasoning="pensiero", usage=Usage(total_tokens=1)),
+    ])
+    coding_agent.build(
+        cfg2, fake2,
+        on_reasoning_delta=lambda p: events.append(("d", p)),
+        on_reasoning=lambda t: events.append(("r", t)),
+    ).run("ciao")
+    check("feedback: non-stream → solo il blocco intero (post-hoc)",
+          [k for k, _ in events] == ["r"], events)
+
+
 def main():
     test_arg_parse()
     test_usage_normalization()
@@ -2841,6 +2938,7 @@ def main():
     test_reasoning_regimes()
     test_cost_attribution()
     test_english_surface()
+    test_reasoning_stream_feedback()
     test_parallel_tools()
     test_cli_session_roundtrip()
     test_shared_memory()

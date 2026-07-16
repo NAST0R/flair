@@ -209,6 +209,7 @@ class LLMProvider(ABC):
         stream: bool = False,
         on_delta: OnDelta | None = None,
         on_reasoning: OnDelta | None = None,
+        on_reasoning_delta: OnDelta | None = None,
     ) -> LLMResponse:
         raise NotImplementedError
 
@@ -297,12 +298,13 @@ class OpenAICompatProvider(LLMProvider):
         stream: bool = False,
         on_delta: OnDelta | None = None,
         on_reasoning: OnDelta | None = None,
+        on_reasoning_delta: OnDelta | None = None,
     ) -> LLMResponse:
         params = self._build_params(messages, tools, think, max_tokens)
 
         if stream and on_delta is not None:
             try:
-                resp = self._complete_stream(params, on_delta, on_reasoning)
+                resp = self._complete_stream(params, on_delta, on_reasoning, on_reasoning_delta)
                 resp.usage.cost_usd = self._request_cost(resp.usage, params["model"])
                 return resp
             except _StreamInterrupted as si:
@@ -348,7 +350,8 @@ class OpenAICompatProvider(LLMProvider):
         raise last
 
     def _complete_stream(self, params: dict, on_delta: OnDelta,
-                         on_reasoning: OnDelta | None = None) -> LLMResponse:
+                         on_reasoning: OnDelta | None = None,
+                         on_reasoning_delta: OnDelta | None = None) -> LLMResponse:
         params = {**params, "stream": True, "stream_options": {"include_usage": True}}
 
         content: list[str] = []
@@ -377,6 +380,12 @@ class OpenAICompatProvider(LLMProvider):
                 rc = _reasoning_piece(delta)
                 if rc:
                     reasoning.append(rc)
+                    # Feedback vivo: il pezzo appena arrivato, così la CLI può mostrare
+                    # progresso durante fasi di pensiero lunghe (effort max: anche 10k+
+                    # char). Il contratto di on_reasoning NON cambia: blocco intero,
+                    # una volta sola, al flush (i pannelli vogliono il testo completo).
+                    if on_reasoning_delta is not None:
+                        on_reasoning_delta(rc)
                 piece = getattr(delta, "content", None)
                 if piece:
                     _flush_reasoning()  # il ragionamento (arrivato prima) va mostrato prima della risposta

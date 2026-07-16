@@ -123,6 +123,7 @@ class Agent:
         on_tool: OnTool | None = None,
         on_result: OnResult | None = None,
         on_reasoning: OnReasoning | None = None,
+        on_reasoning_delta: OnReasoning | None = None,
         on_delta: OnDelta | None = None,
         on_compact: OnCompact | None = None,
         on_prune: OnPrune | None = None,
@@ -137,6 +138,7 @@ class Agent:
         self.on_tool = on_tool
         self.on_result = on_result
         self.on_reasoning = on_reasoning
+        self.on_reasoning_delta = on_reasoning_delta
         self.on_delta = on_delta
         self.on_compact = on_compact
         self.on_prune = on_prune
@@ -330,6 +332,7 @@ class Agent:
             stream=streaming,
             on_delta=self.on_delta if streaming else None,
             on_reasoning=self.on_reasoning if streaming else None,
+            on_reasoning_delta=self.on_reasoning_delta if streaming else None,
         )
 
     # ── compaction ────────────────────────────────────────────────────────────

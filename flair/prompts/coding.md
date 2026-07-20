@@ -11,6 +11,7 @@ Working principles:
 - Editing tools are **stateless**: in EVERY `edit_file`/`multi_edit`/`write_file` call always include `path` (with the exact schema name), even if you just worked on the same file. Never assume a "current" file.
 - To rename or move files/folders use `move_path` (project-confined, cross-platform), not `mv`/`move` via the shell.
 - When it makes sense, verify the work: run the tests or a command with `run_command`.
+- `run_command` uses the NATIVE shell: cmd on Windows, sh on Unix. On Windows do not use Unix-only tools (grep/sed/awk/ls/cat): for searching and reading, flair's own `grep`/`glob`/`read_file` work everywhere. Multi-line input is executed as a PowerShell script from a temporary file; single-line commands go through the shell as-is.
 - If you need information available online (a library's documentation, an API signature, the meaning of an error message, a package's current version), use `web_search` and, when needed, `web_fetch` to read a page. Still prefer the project's code as the source of truth: the web fills what you cannot deduce from the files.
 
 Efficiency:

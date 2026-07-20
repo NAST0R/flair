@@ -2839,6 +2839,9 @@ def test_english_surface():
     for label, text in runtime.items():
         bad = rx.findall(text)
         check(f"superficie inglese runtime: {label}", not bad, bad[:5])
+    from flair.tools import system as _sys_tools
+    src = __import__("inspect").getsource(_sys_tools)
+    check("superficie inglese runtime: search_files (overflow)", "ricerca interrotta" not in src)
     d = root / "en_dir"
     d.mkdir()
     for i in range(4):
@@ -2987,6 +2990,33 @@ def test_remember_command():
     check("/remember: presente nell'help", "/remember <note>" in _inspect.getsource(CLI._print_help))
 
 
+def test_think_session_default():
+    import inspect as _inspect
+    import tempfile as _tf
+
+    from flair.cli import CLI
+
+    root = Path(_tf.mkdtemp(prefix="flair_tk_")).resolve()
+    cli = CLI(cfg_for(root))
+    check("--think REPL: default di sessione spento di default", cli.default_think is False)
+
+    # _safe_run_task inoltra `think` a run_task (il ponte del default di sessione).
+    seen: dict = {}
+    cli.run_task = lambda task, agent_key=None, think=False: seen.update(think=think)  # type: ignore[method-assign]
+    cli._safe_run_task("x", think=True)
+    check("--think REPL: think inoltrato al turno", seen.get("think") is True, seen)
+
+    # Il dispatch del REPL usa il default di sessione su ogni via non-/think
+    # (task nudo, /code, /do) e forza True su /think: contratto ancorato al sorgente.
+    src = _inspect.getsource(CLI.repl)
+    check("--think REPL: task nudo eredita il default",
+          'self._safe_run_task(line, think=self.default_think)' in src)
+    check("--think REPL: /code e /do ereditano il default",
+          src.count("think=self.default_think") == 3)
+    check("--think REPL: /think resta rinforzo esplicito", "think=True" in src)
+    check("--think REPL: banner dichiara lo stato", "think: ON every turn" in src)
+
+
 def main():
     test_arg_parse()
     test_usage_normalization()
@@ -3014,6 +3044,7 @@ def main():
     test_english_surface()
     test_reasoning_stream_feedback()
     test_remember_command()
+    test_think_session_default()
     test_parallel_tools()
     test_cli_session_roundtrip()
     test_shared_memory()

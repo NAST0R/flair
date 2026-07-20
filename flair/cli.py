@@ -162,6 +162,10 @@ class CLI:
         # iniettata nel system prompt SOLO ai confini di sessione (qui, /load,
         # /memory clear) così il prefisso in cache non si rompe mai a metà lavoro.
         self.memory = SessionMemory(max_chars=cfg.memory_max_chars)
+        # --think in modalità interattiva: default di sessione per ogni turno.
+        # Prima veniva letto solo nel one-shot -p e nel REPL non faceva NULLA,
+        # in silenzio — l'ambiguità peggiore. /think resta il rinforzo per turno.
+        self.default_think = False
         # Status vivo durante le fasi di pensiero (spinner + contatore): parte al
         # primo delta di reasoning, si ferma PRIMA di qualunque altra stampa.
         self._think_status: Status | None = None
@@ -479,7 +483,7 @@ class CLI:
             self._newline_if_needed()
             if self.output_mode == "json":
                 self._emit_json({"ok": False, "agent": self.last_agent, "stopped_reason": "interrupted",
-                                 "response": "", "error": "interrotto"})
+                                 "response": "", "error": "interrupted"})
             elif self.output_mode == "human":
                 self.console.print("[yellow]⏹ Interrupted.[/yellow]")
             return 130
@@ -648,7 +652,8 @@ class CLI:
         self.console.print(Panel(
             Text.from_markup(
                 f"[bold cyan]flair {__version__}[/bold cyan] [dim]— AI assistant (coding + general)[/dim]\n"
-                f"[dim]provider: {self.cfg.provider} | model: {pc.model} | thinking: {pc.think_model}{sess_note}\n"
+                f"[dim]provider: {self.cfg.provider} | model: {pc.model} | thinking: {pc.think_model}"
+                f"{' | think: ON every turn' if self.default_think else ''}{sess_note}\n"
                 f"root: {self.cfg.root}{log_note}[/dim]"
             ),
             border_style="cyan", padding=(1, 2),
@@ -802,12 +807,12 @@ class CLI:
             if low.startswith("/code"):
                 task = line[len("/code"):].strip()
                 if task:
-                    self._safe_run_task(task, agent_key="coding")
+                    self._safe_run_task(task, agent_key="coding", think=self.default_think)
                 continue
             if low.startswith("/do"):
                 task = line[len("/do"):].strip()
                 if task:
-                    self._safe_run_task(task, agent_key="general")
+                    self._safe_run_task(task, agent_key="general", think=self.default_think)
                 continue
             if low.startswith("/think"):
                 task = line[len("/think"):].strip()
@@ -815,7 +820,7 @@ class CLI:
                     self._safe_run_task(task, think=True)
                 continue
 
-            self._safe_run_task(line)
+            self._safe_run_task(line, think=self.default_think)
 
 
 def _build_config(args) -> Config:
@@ -850,7 +855,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--provider", choices=["deepseek", "openai"], help="LLM provider")
     ap.add_argument("--agent", choices=["coding", "general", "auto"], default="auto", help="force an agent (default: auto)")
     ap.add_argument("--root", help="working root for the coding agent")
-    ap.add_argument("--think", action="store_true", help="use the thinking model for the first step")
+    ap.add_argument("--think", action="store_true", help="use the thinking model (one-shot: the task; REPL: every turn of the session)")
     ap.add_argument("--yes", action="store_true", help="auto-approve destructive tools")
     ap.add_argument("--read-only", dest="read_only", action="store_true",
                     help="unattended execution: disables destructive tools (writes/edits/commands)")
@@ -918,6 +923,7 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         key = None if args.agent == "auto" else args.agent
         return cli.run_once(prompt, agent_key=key, think=args.think)
+    cli.default_think = bool(args.think)
     cli.repl()
     return 0
 

@@ -191,7 +191,7 @@ def search_files(ctx: ToolContext, query: str = "", extensions: list[str] | None
         return f"No files found (query='{query}', extensions={sorted(exts) or 'any'}) in: {where}"
     out = f"{len(results)} files found:\n" + "\n".join(results)
     if truncated:
-        out += "\n...[ricerca interrotta al limite; restringi query/estensioni o indica 'locations']"
+        out += "\n...[search stopped at the limit; narrow query/extensions or set 'locations']"
     return out
 
 

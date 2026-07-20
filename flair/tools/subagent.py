@@ -13,6 +13,11 @@ from __future__ import annotations
 from ..core.tool import ToolContext, tool
 
 
+def _footer(steps: int) -> str:
+    # Suffisso del risultato (model-facing: asserito dalla guardia inglese).
+    return f"\n\n— 🔭 explored in {steps} step{'' if steps == 1 else 's'} (isolated context)"
+
+
 @tool(
     "explore",
     ("Delegate an exploration/research question about the code to a read-only sub-agent "
@@ -49,5 +54,4 @@ def explore(ctx: ToolContext, task: str) -> str:
     ctx.delegated_usage = result.usage if ctx.delegated_usage is None else ctx.delegated_usage + result.usage
 
     answer = result.content.strip() or "(no result from the exploration)"
-    n = result.steps
-    return f"{answer}\n\n— 🔭 esplorato in {n} pass{'o' if n == 1 else 'i'} (contesto isolato)"
+    return answer + _footer(result.steps)

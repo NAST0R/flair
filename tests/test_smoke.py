@@ -494,7 +494,8 @@ def test_compaction():
     check("compaction: termina done", res.stopped_reason == "done", res.stopped_reason)
     check("compaction: callback invocato", "before" in compacted and compacted["after"] < compacted["before"], str(compacted))
     joined = "\n".join(m.get("content") or "" for m in agent.messages)
-    check("compaction: riassunto inserito", "[Riassunto del lavoro svolto finora]" in joined and "RIASSUNTO DEL LAVORO" in joined)
+    from flair.core.agent import _SUMMARY_HEADER
+    check("compaction: riassunto inserito", _SUMMARY_HEADER in joined and "RIASSUNTO DEL LAVORO" in joined)
     check("compaction: nessun 'tool' orfano in testa", agent.messages[1]["role"] != "tool")
 
 
@@ -539,7 +540,8 @@ def test_overflow_retry():
     res = agent.run("nuovo task")
     check("overflow: recuperato senza crash", res.content == "ripreso dopo compaction", res.content)
     joined = "\n".join(m.get("content") or "" for m in agent.messages)
-    check("overflow: ha compattato", "[Riassunto del lavoro svolto finora]" in joined)
+    from flair.core.agent import _SUMMARY_HEADER as _hdr
+    check("overflow: ha compattato", _hdr in joined)
 
 
 # ── 15. ricerca web (cascata di backend, parser e gestione errori, offline) ───
@@ -1381,7 +1383,7 @@ def test_compaction_valid_pairing():
     ok = agent._compact(aggressive=True)
     check("compaction valida: ha compattato", ok)
     check("compaction valida: riassunto in testa",
-          agent.convo.messages[0]["content"].startswith("[Riassunto"))
+          agent.convo.messages[0]["content"].startswith("[Summary"))
     check("compaction valida: nessun 'tool' orfano in testa", agent.convo.messages[0]["role"] != "tool")
     check("compaction valida: conversazione API-valida (1)", _conversation_valid(agent.messages))
 
@@ -1395,7 +1397,7 @@ def test_compaction_valid_pairing():
     check("compaction valida: seconda compattazione", ok2)
     check("compaction valida: conversazione API-valida (2)", _conversation_valid(agent.messages))
     check("compaction valida: riassunto presente",
-          any("[Riassunto" in (m.get("content") or "") for m in agent.convo.messages))
+          any("[Summary" in (m.get("content") or "") for m in agent.convo.messages))
 
 
 # ── Robustezza dei tool: path mancanti, grep su file, kwarg sconosciuti ───────
@@ -1758,7 +1760,7 @@ def test_explore_subagent():
     ctx = ToolContext(cfg=cfg, provider=prov)
     out = subagent.explore(ctx, task="dove è definito X?")
     check("explore: restituisce la sintesi del sub-agente", "X è in foo.py:10" in out, out)
-    check("explore: footer del sub-agente", "🔭 esplorato" in out, out)
+    check("explore: footer del sub-agente", "🔭 explored" in out, out)
     check("explore: usage del sub-agente riportato (delegated_usage)",
           ctx.delegated_usage is not None and ctx.delegated_usage.total_tokens == 120, str(ctx.delegated_usage))
     check("explore: il sub-agente è stato eseguito (1 chiamata)", len(prov.calls) == 1, str(prov.calls))
@@ -2818,6 +2820,33 @@ def test_english_surface():
     for name in ("coding", "general", "explorer"):
         bad = rx.findall(load_prompt(name))
         check(f"superficie inglese: prompt {name}", not bad, bad[:5])
+
+    # Formati RUNTIME iniettati in conversazione: il punto cieco da cui sono
+    # sfuggiti i residui di bcfef91^ (header di compaction, overflow di list_dir,
+    # suffisso di explore). Si asseriscono le costanti/funzioni che li generano
+    # e un output prodotto davvero, così la classe di bug resta chiusa.
+    from flair.core.agent import _COMPACT_PROMPT, _SUMMARIZE_PREAMBLE, _SUMMARY_HEADER
+    from flair.core.prune import STUB
+    from flair.tools.subagent import _footer
+    runtime = {
+        "header compaction": _SUMMARY_HEADER,
+        "preambolo summarize": _SUMMARIZE_PREAMBLE,
+        "prompt compaction": _COMPACT_PROMPT,
+        "stub prune": STUB,
+        "footer explore (1)": _footer(1),
+        "footer explore (3)": _footer(3),
+    }
+    for label, text in runtime.items():
+        bad = rx.findall(text)
+        check(f"superficie inglese runtime: {label}", not bad, bad[:5])
+    d = root / "en_dir"
+    d.mkdir()
+    for i in range(4):
+        (d / f"f{i}.txt").write_text("x")
+    from flair.tools import fs as _fs
+    out = _fs.list_dir_impl(root, "en_dir", max_entries=2)
+    check("superficie inglese runtime: overflow list_directory",
+          "more entries]" in out and not rx.findall(out), out)
 
 
 def test_reasoning_stream_feedback():

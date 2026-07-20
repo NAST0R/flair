@@ -677,7 +677,7 @@ class CLI:
             if low == "/reset":
                 self.convo.reset()
                 self.last_agent = None
-                self.console.print("[yellow]conversazione azzerata.[/yellow]\n")
+                self.console.print("[yellow]conversation cleared.[/yellow]\n")
                 continue
             if low == "/cost":
                 self.console.print(f"[dim]  session · {self._cost_line(self._session_usage())}[/dim]\n")

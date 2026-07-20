@@ -311,7 +311,7 @@ def multi_edit(ctx: ToolContext, path: str, edits: list) -> str:
 
     if working == text:
         return f"⚠️ No change: the result is identical to {fs.display(ctx.cfg.root, p)}."
-    p.write_text(working, encoding="utf-8")
+    fs._atomic_write(p, working)   # il file esiste: stessa garanzia atomica di edit_file
     extra = [n for n in notes if n != "exact"]
     suffix = f" [match: {', '.join(extra)}]" if extra else ""
     return f"✓ Applied {len(edits)} edits to {fs.display(ctx.cfg.root, p)}{suffix}."

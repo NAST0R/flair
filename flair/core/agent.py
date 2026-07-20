@@ -47,6 +47,11 @@ class StoppedByUser(Exception):
     """Sollevata quando l'utente sceglie 'stop' al prompt di conferma: il flusso
     agentico si ferma subito e il controllo torna all'utente."""
 
+# Testi iniettati in conversazione dalla compaction (superficie model-facing:
+# la guardia test_english_surface li asserisce direttamente).
+_SUMMARY_HEADER = "[Summary of the work done so far]\n\n"
+_SUMMARIZE_PREAMBLE = "Conversation to summarize:\n\n"
+
 _COMPACT_PROMPT = (
     "You are a context compressor for an AI assistant. Summarize the conversation "
     "below in a self-sufficient way, so the assistant can continue the work without "
@@ -410,7 +415,7 @@ class Agent:
         # Il system prompt non è nella storia (lo antepone ogni agente): qui sostituiamo
         # solo la parte vecchia con UN messaggio di riassunto. La testa resta stabile.
         self.convo.messages = (
-            [{"role": "user", "content": "[Riassunto del lavoro svolto finora]\n\n" + summary}]
+            [{"role": "user", "content": _SUMMARY_HEADER + summary}]
             + tail
         )
         self.convo.last_prompt_tokens = 0
@@ -423,7 +428,7 @@ class Agent:
         blob = self._render_for_summary(msgs)
         resp = self.provider.complete(
             [{"role": "system", "content": _COMPACT_PROMPT},
-             {"role": "user", "content": "Conversazione da riassumere:\n\n" + blob}],
+             {"role": "user", "content": _SUMMARIZE_PREAMBLE + blob}],
             tools=None,
             think=False,
             max_tokens=self.cfg.compact_summary_max_tokens,

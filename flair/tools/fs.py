@@ -307,7 +307,7 @@ def list_dir_impl(root: Path | None, path: str, max_entries: int) -> str:
     shown = entries[:max_entries]
     out = f"{display(root, p)}/\n" + "\n".join(shown)
     if len(entries) > len(shown):
-        out += f"\n...[altre {len(entries) - len(shown)} voci]"
+        out += f"\n...[{len(entries) - len(shown)} more entries]"
     return out
 
 

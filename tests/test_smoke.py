@@ -3017,6 +3017,52 @@ def test_think_session_default():
     check("--think REPL: banner dichiara lo stato", "think: ON every turn" in src)
 
 
+def test_session_recap():
+    import inspect as _inspect
+    import io as _io
+    import tempfile as _tf
+
+    from rich.console import Console as _Console
+
+    from flair.cli import CLI, _recap_messages
+    from flair.core.agent import _SUMMARY_HEADER
+
+    msgs = [
+        {"role": "user", "content": "primo task"},
+        {"role": "assistant", "content": None, "tool_calls": [{"id": "1"}]},
+        {"role": "tool", "tool_call_id": "1", "content": "output rumoroso del tool"},
+        {"role": "assistant", "content": "prima risposta"},
+        {"role": "user", "content": _SUMMARY_HEADER + "sintesi del lavoro"},
+        {"role": "user", "content": "secondo   task\ncon a capo"},
+        {"role": "assistant", "content": "seconda risposta " + "x" * 500},
+    ]
+    lines, earlier = _recap_messages(msgs, max_msgs=4, max_chars=60)
+    check("recap: filtra tool e tool-call vuote", [r for r, _ in lines] == ["assistant", "summary", "user", "assistant"], lines)
+    check("recap: conta i precedenti non mostrati", earlier == 1, earlier)
+    check("recap: riassunto etichettato e spogliato dell'header",
+          lines[1] == ("summary", "sintesi del lavoro"), lines[1])
+    check("recap: testo compattato su una riga", lines[2][1] == "secondo task con a capo", lines[2])
+    check("recap: troncatura con ellissi",
+          len(lines[3][1]) == 60 and lines[3][1].endswith("…"), lines[3][1][-5:])
+    check("recap: vuoto → nessuna riga", _recap_messages([]) == ([], 0))
+
+    # Render: contenuti visibili, markup escapato, niente crash su non-tty.
+    root = Path(_tf.mkdtemp(prefix="flair_rc_")).resolve()
+    cli = CLI(cfg_for(root))
+    cli.convo.load({"messages": [
+        {"role": "user", "content": "task con [markup] rich"},
+        {"role": "assistant", "content": "risposta breve"},
+    ], "total_usage": {}})
+    cli.console = _Console(file=_io.StringIO(), force_terminal=False)
+    cli._print_session_recap()
+    out = cli.console.file.getvalue()
+    check("recap render: intestazione e contenuti", "where you left off" in out
+          and "task con [markup] rich" in out and "risposta breve" in out, out)
+
+    src = _inspect.getsource(CLI.repl)
+    check("recap: agganciato al /load", src.count("self._print_session_recap()") == 2, src.count("self._print_session_recap()"))
+
+
 def main():
     test_arg_parse()
     test_usage_normalization()
@@ -3045,6 +3091,7 @@ def main():
     test_reasoning_stream_feedback()
     test_remember_command()
     test_think_session_default()
+    test_session_recap()
     test_parallel_tools()
     test_cli_session_roundtrip()
     test_shared_memory()

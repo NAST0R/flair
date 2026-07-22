@@ -18,6 +18,7 @@ from pathlib import Path
 from rich import box
 from rich.console import Console
 from rich.markdown import Markdown
+from rich.markup import escape
 from rich.panel import Panel
 from rich.status import Status
 from rich.table import Table
@@ -28,7 +29,7 @@ from .agents import coding as coding_agent
 from .agents import general as general_agent
 from .config import Config, load_config
 from .core import router
-from .core.agent import Conversation
+from .core.agent import _SUMMARY_HEADER, Conversation
 from .core.tool import ToolError
 from .llm import Usage, create_provider
 from .memory import SessionMemory
@@ -66,6 +67,34 @@ def _spinner_name() -> str:
 def _fmt_thinking(chars: int, secs: float) -> str:
     volume = f"{chars / 1000:.1f}k" if chars >= 1000 else str(chars)
     return f"{volume} chars · {int(secs)}s"
+
+
+def _recap_messages(messages: list[dict], max_msgs: int = 4,
+                    max_chars: int = 400) -> tuple[list[tuple[str, str]], int]:
+    """Coda del dialogo per il recap post-load: solo turni user/assistant con del
+    testo (niente messaggi tool né tool-call vuote), ultimi `max_msgs`, ciascuno
+    compattato su una riga e troncato. Il riassunto di compaction (iniettato come
+    messaggio user) viene etichettato per quello che è. Ritorna (righe, quanti
+    messaggi di dialogo precedenti non vengono mostrati)."""
+    dialog: list[tuple[str, str]] = []
+    header = _SUMMARY_HEADER.strip()
+    for m in messages:
+        role = str(m.get("role") or "")
+        text = (m.get("content") or "").strip()
+        if role not in ("user", "assistant") or not text:
+            continue
+        if role == "user" and text.startswith(header):
+            role = "summary"
+            text = text[len(header):].strip()
+        dialog.append((role, text))
+    tail = dialog[-max_msgs:] if max_msgs > 0 else []
+    out: list[tuple[str, str]] = []
+    for role, text in tail:
+        t = " ".join(text.split())
+        if len(t) > max_chars:
+            t = t[: max_chars - 1] + "…"
+        out.append((role, t))
+    return out, len(dialog) - len(tail)
 
 
 def _short(v, n: int = 70) -> str:
@@ -584,6 +613,21 @@ class CLI:
         self._maybe_cost_warn()
         self.console.print()
 
+    def _print_session_recap(self) -> None:
+        """Dopo un load: mostra dove si era rimasti, così si riprende contestualmente
+        senza doversi ricordare a memoria cosa si stava facendo. Coda breve e dim:
+        orienta, non ristampa la sessione."""
+        lines, earlier = _recap_messages(self.convo.messages)
+        if not lines:
+            return
+        note = f" ({earlier} earlier messages not shown)" if earlier else ""
+        self.console.print(f"[dim]── where you left off{note} ──[/dim]")
+        labels = {"user": "[green]you ▶[/green]", "assistant": "[cyan]flair ·[/cyan]",
+                  "summary": "[yellow]⟳ summary[/yellow]"}
+        for role, text in lines:
+            self.console.print(f"{labels.get(role, role)} [dim]{escape(text)}[/dim]", highlight=False)
+        self.console.print()
+
     def _maybe_cost_warn(self) -> None:
         if self.cfg.cost_warn and not self._cost_warned:
             cost = self.provider.estimate_cost(self._session_usage(), self.cfg)
@@ -659,6 +703,9 @@ class CLI:
             border_style="cyan", padding=(1, 2),
         ))
         self.console.print("[dim]/help for commands. Type a request (coding or general).[/dim]\n")
+        if self.convo.messages:
+            # Sessione ripresa da --session/--continue: orienta subito.
+            self._print_session_recap()
 
         while True:
             try:
@@ -747,6 +794,7 @@ class CLI:
                     self.console.print("[dim]usage: /load <name>[/dim]\n")
                 elif self._load_session(parts[1].strip()):
                     self.console.print(f"[green]session resumed: {self.session_name}[/green]\n")
+                    self._print_session_recap()
                 else:
                     self.console.print(f"[yellow]session '{parts[1].strip()}' not found.[/yellow]\n")
                 continue

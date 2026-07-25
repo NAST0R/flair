@@ -3063,6 +3063,64 @@ def test_session_recap():
     check("recap: agganciato al /load", src.count("self._print_session_recap()") == 2, src.count("self._print_session_recap()"))
 
 
+def test_edit_invisible_chars():
+    import tempfile as _tf
+
+    from flair.core.tool import ToolError
+    from flair.tools.fs import apply_edit, edit_file_impl
+
+    # Il caso del campo: tabella Markdown con NBSP (U+00A0) dentro le celle;
+    # il modello copia spazi normali e prima falliva TUTTE le strategie.
+    nbsp = "\u00a0"
+    text = (f"| **No startup guard**{nbsp}| open |\n"
+            f"| **No pinning**{nbsp}| open |\n"
+            "fine\n")
+    out, strategy = apply_edit(text, "| **No pinning** | open |", "| **No pinning** | FIXED |")
+    check("invisibili: NBSP nel file, spazi normali nell'old → match", strategy == "invisible characters normalized", strategy)
+    check("invisibili: il blocco editato usa il testo del modello", "| **No pinning** | FIXED |" in out)
+    check("invisibili: il resto del file resta INTATTO (NBSP inclusi)", f"| **No startup guard**{nbsp}| open |" in out)
+
+    # Zero-width e soft hyphen: rimossi nella chiave di confronto.
+    zw = "riga con\u200bzero\u00adwidth qui\n"
+    out2, s2 = apply_edit(zw + "altra\n", "riga conzerowidth qui", "riga pulita")
+    check("invisibili: zero-width e soft hyphen ignorati nel match", s2 == "invisible characters normalized" and "riga pulita\n" in out2, s2)
+
+    # Combinazione con l'indentazione tollerante (la chiave fa .strip()).
+    ind = f"    valore ={nbsp}42\n"
+    out3, s3 = apply_edit(ind, "valore = 42", "valore = 43")
+    check("invisibili: combinato con indentazione, rientro del file preservato", out3 == "    valore = 43\n", out3)
+
+    # Ambiguità nello spazio normalizzato → errore, non un edit a caso.
+    dup = f"x ={nbsp}1\nx =\u20091\n"   # entrambe esotiche: solo la chiave normalizzata le vede
+    try:
+        apply_edit(dup, "x = 1", "x = 2")
+        check("invisibili: ambiguità normalizzata rifiutata", False)
+    except ToolError as exc:
+        check("invisibili: ambiguità normalizzata rifiutata", "matches 2 blocks" in str(exc), exc)
+
+    # Fallimento residuo su file con esotici: la diagnostica nomina i codepoint.
+    try:
+        apply_edit(f"c'è{nbsp}questo\n", "testo del tutto assente", "x")
+        check("invisibili: diagnostica sui fallimenti residui", False)
+    except ToolError as exc:
+        check("invisibili: diagnostica sui fallimenti residui",
+              "U+00A0" in str(exc) and "curly quotes" in str(exc), exc)
+    try:
+        apply_edit("solo ascii qui\n", "assente", "x")
+        check("invisibili: nessuna diagnostica se il file è pulito", False)
+    except ToolError as exc:
+        check("invisibili: nessuna diagnostica se il file è pulito", "U+" not in str(exc), exc)
+
+    # A livello di tool: edit_file_impl passa dalla stessa scala e dichiara la strategia.
+    root = Path(_tf.mkdtemp(prefix="flair_inv_")).resolve()
+    (root / "t.md").write_text(f"| cella{nbsp}| ok |\n", encoding="utf-8")
+    res = edit_file_impl(root, "t.md", "| cella | ok |", "| cella | done |")
+    check("invisibili: edit_file end-to-end con nota di strategia",
+          res.startswith("✓ Edited") and "invisible characters normalized" in res, res)
+    check("invisibili: file scritto col testo del modello",
+          (root / "t.md").read_text(encoding="utf-8") == "| cella | done |\n")
+
+
 def main():
     test_arg_parse()
     test_usage_normalization()
@@ -3092,6 +3150,7 @@ def main():
     test_remember_command()
     test_think_session_default()
     test_session_recap()
+    test_edit_invisible_chars()
     test_parallel_tools()
     test_cli_session_roundtrip()
     test_shared_memory()

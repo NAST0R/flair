@@ -72,6 +72,25 @@ def _trunc(text: str, limit: int, hint: str = "") -> str:
     return text[:limit] + extra
 
 
+# Caratteri che si MOSTRANO come spazi normali (o come nulla) ma hanno byte
+# diversi: NBSP e parenti (testo passato da HTML/word processor, tabelle
+# Markdown generate) e gli zero-width. Sono la causa classica del loop "leggo,
+# copio esattamente, il match fallisce lo stesso". Virgolette curve e trattini
+# tipografici restano ESCLUSI di proposito: normalizzarli cambierebbe testo
+# semanticamente diverso; la diagnostica in coda li indica come sospetti.
+_WS_EXOTIC = "\u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u202f\u205f\u3000"
+_ZERO_WIDTH = "\u200b\u200c\u200d\u2060\ufeff\u00ad"
+_INVISIBLE_MAP: dict[int, int | None] = {ord(c): ord(" ") for c in _WS_EXOTIC}
+_INVISIBLE_MAP.update({ord(c): None for c in _ZERO_WIDTH})
+
+
+def _normalize_invisible(s: str) -> str:
+    """Spazi Unicode esotici → " ", zero-width rimossi. Usata SOLO come chiave di
+    confronto per localizzare il blocco: il testo del file non viene mai riscritto
+    da questa funzione (il rimpiazzo è il new_string fornito dal modello)."""
+    return s.translate(_INVISIBLE_MAP)
+
+
 def _leading_ws(line: str) -> str:
     return line[: len(line) - len(line.lstrip())]
 
@@ -165,7 +184,8 @@ def apply_edit(text: str, old: str, new: str, replace_all: bool = False) -> tupl
         raise ToolError("old_string not found.")
 
     for key, label in ((lambda s: s.rstrip(), "line-ending tolerant"),
-                       (lambda s: s.strip(), "indentation tolerant")):
+                       (lambda s: s.strip(), "indentation tolerant"),
+                       (lambda s: _normalize_invisible(s).strip(), "invisible characters normalized")):
         idx = _unique_window(text_lines, old_lines, key)
         if idx is None:
             continue
@@ -182,9 +202,16 @@ def apply_edit(text: str, old: str, new: str, replace_all: bool = False) -> tupl
             replacement += "\n"
         return text[:start_off] + replacement + text[end_off:], label
 
+    hint = ""
+    exotic = sorted({ch for ch in text if ch in _WS_EXOTIC or ch in _ZERO_WIDTH})
+    if exotic:
+        names = ", ".join(f"U+{ord(c):04X}" for c in exotic[:5])
+        hint = (f" Note: the file contains invisible characters ({names}) that display like "
+                "normal spaces or nothing; matching already normalizes them, so the difference "
+                "is elsewhere — check typographic punctuation (curly quotes, en/em dashes).")
     raise ToolError(
         "old_string not found. Re-read the file with read_file and copy the exact "
-        "text to replace (indentation included)."
+        "text to replace (indentation included)." + hint
     )
 
 

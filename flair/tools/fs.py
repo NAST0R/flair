@@ -75,9 +75,12 @@ def _trunc(text: str, limit: int, hint: str = "") -> str:
 # Caratteri che si MOSTRANO come spazi normali (o come nulla) ma hanno byte
 # diversi: NBSP e parenti (testo passato da HTML/word processor, tabelle
 # Markdown generate) e gli zero-width. Sono la causa classica del loop "leggo,
-# copio esattamente, il match fallisce lo stesso". Virgolette curve e trattini
-# tipografici restano ESCLUSI di proposito: normalizzarli cambierebbe testo
-# semanticamente diverso; la diagnostica in coda li indica come sospetti.
+# copio esattamente, il match fallisce lo stesso". La punteggiatura TIPOGRAFICA
+# (em/en dash, virgolette curve, ellissi) ha un gradino DEDICATO di ultima
+# istanza più sotto: il modello la piega in ASCII quando compone l'old_string
+# (caso di campo: README con 100 em dash), ma piegarla è più invasivo della
+# normalizzazione degli invisibili, quindi arriva solo dopo, con l'univocità
+# della finestra a fare da rete.
 _WS_EXOTIC = "\u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u202f\u205f\u3000"
 _ZERO_WIDTH = "\u200b\u200c\u200d\u2060\ufeff\u00ad"
 _INVISIBLE_MAP: dict[int, int | None] = {ord(c): ord(" ") for c in _WS_EXOTIC}
@@ -89,6 +92,19 @@ def _normalize_invisible(s: str) -> str:
     confronto per localizzare il blocco: il testo del file non viene mai riscritto
     da questa funzione (il rimpiazzo è il new_string fornito dal modello)."""
     return s.translate(_INVISIBLE_MAP)
+
+
+_TYPOGRAPHIC_FOLD: dict[int, int | str] = {ord(c): ord("-") for c in "\u2010\u2011\u2012\u2013\u2014\u2015\u2212"}
+_TYPOGRAPHIC_FOLD.update({ord(c): ord("'") for c in "\u2018\u2019\u201a\u201b"})
+_TYPOGRAPHIC_FOLD.update({ord(c): ord('"') for c in "\u201c\u201d\u201e\u201f"})
+_TYPOGRAPHIC_FOLD[0x2026] = "..."
+
+
+def _fold_typographic(s: str) -> str:
+    """Chiave di ultima istanza: invisibili normalizzati, punteggiatura tipografica
+    piegata in ASCII (dash, virgolette curve, ellissi) e run di spazi collassati.
+    Come sopra: SOLO localizzazione, mai riscrittura del testo del file."""
+    return " ".join(s.translate(_INVISIBLE_MAP).translate(_TYPOGRAPHIC_FOLD).split())
 
 
 def _leading_ws(line: str) -> str:
@@ -185,7 +201,8 @@ def apply_edit(text: str, old: str, new: str, replace_all: bool = False) -> tupl
 
     for key, label in ((lambda s: s.rstrip(), "line-ending tolerant"),
                        (lambda s: s.strip(), "indentation tolerant"),
-                       (lambda s: _normalize_invisible(s).strip(), "invisible characters normalized")):
+                       (lambda s: _normalize_invisible(s).strip(), "invisible characters normalized"),
+                       (_fold_typographic, "typographic punctuation folded")):
         idx = _unique_window(text_lines, old_lines, key)
         if idx is None:
             continue
@@ -206,9 +223,10 @@ def apply_edit(text: str, old: str, new: str, replace_all: bool = False) -> tupl
     exotic = sorted({ch for ch in text if ch in _WS_EXOTIC or ch in _ZERO_WIDTH})
     if exotic:
         names = ", ".join(f"U+{ord(c):04X}" for c in exotic[:5])
-        hint = (f" Note: the file contains invisible characters ({names}) that display like "
-                "normal spaces or nothing; matching already normalizes them, so the difference "
-                "is elsewhere — check typographic punctuation (curly quotes, en/em dashes).")
+        hint = (f" Note: the file contains invisible characters ({names}); matching already "
+                "normalizes them and folds typographic punctuation (dashes, curly quotes, "
+                "ellipsis), so the difference is elsewhere: re-read the exact lines and build "
+                "a shorter old_string from a smaller unique span.")
     raise ToolError(
         "old_string not found. Re-read the file with read_file and copy the exact "
         "text to replace (indentation included)." + hint

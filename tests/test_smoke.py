@@ -3104,7 +3104,7 @@ def test_edit_invisible_chars():
         check("invisibili: diagnostica sui fallimenti residui", False)
     except ToolError as exc:
         check("invisibili: diagnostica sui fallimenti residui",
-              "U+00A0" in str(exc) and "curly quotes" in str(exc), exc)
+              "U+00A0" in str(exc) and "smaller unique span" in str(exc), exc)
     try:
         apply_edit("solo ascii qui\n", "assente", "x")
         check("invisibili: nessuna diagnostica se il file è pulito", False)
@@ -3119,6 +3119,57 @@ def test_edit_invisible_chars():
           res.startswith("✓ Edited") and "invisible characters normalized" in res, res)
     check("invisibili: file scritto col testo del modello",
           (root / "t.md").read_text(encoding="utf-8") == "| cella | done |\n")
+
+
+def test_edit_typographic_fold():
+    import tempfile as _tf
+
+    from flair.core.tool import ToolError
+    from flair.tools.fs import apply_edit, edit_file_impl
+
+    # Il caso di campo (cloak-messenger/README.md): tabella con EM DASH (U+2014);
+    # il modello compone l'old_string piegandola in ASCII ("-").
+    em, nbh = "\u2014", "\u2011"
+    text = (f"| **No startup guard for `JWT_SECRET_KEY` (SEC-01)** {em} the placeholder secret. | high |\n"
+            f"| **No certificate pinning (SEC-03)** {em} `CertificatePinner` ships empty. | high |\n"
+            "coda\n")
+    old_model = text.split("coda")[0].replace(em, "-")
+    out, strategy = apply_edit(text, old_model.rstrip("\n"), "| **SEC-03 only** | high |")
+    check("fold: em dash del file vs '-' del modello → match", strategy == "typographic punctuation folded", strategy)
+    check("fold: rimpiazzo col testo del modello", out == "| **SEC-03 only** | high |\ncoda\n", out)
+
+    # Virgolette curve, ellissi, non-breaking hyphen, run di spazi collassati.
+    t2 = "l\u2019era dell\u2019oro\u2026 met\u00e0\n"
+    out2, s2 = apply_edit(t2, "l'era dell'oro... met\u00e0", "sostituito")
+    check("fold: virgolette curve ed ellissi", s2 == "typographic punctuation folded" and out2 == "sostituito\n", (s2, out2))
+    t3 = f"config{nbh}file  =   valore\n"
+    out3, s3 = apply_edit(t3, "config-file = valore", "config = x")
+    check("fold: non-breaking hyphen e run di spazi", s3 == "typographic punctuation folded" and out3 == "config = x\n", (s3, out3))
+
+    # Le lettere accentate NON vengono piegate: 'metà' ≠ 'meta'.
+    try:
+        apply_edit("solo met\u00e0 qui\n", "solo meta qui", "x")
+        check("fold: niente fold sulle lettere (metà ≠ meta)", False)
+    except ToolError:
+        check("fold: niente fold sulle lettere (metà ≠ meta)", True)
+
+    # Ambiguità nello spazio piegato → rifiutata.
+    dup = f"a {em} b\na \u2013 b\n"
+    try:
+        apply_edit(dup, "a - b", "x")
+        check("fold: ambiguità piegata rifiutata", False)
+    except ToolError as exc:
+        check("fold: ambiguità piegata rifiutata", "matches 2 blocks" in str(exc), exc)
+
+    # I gradini precedenti mantengono la precedenza: match esatto → "exact".
+    outp, sp = apply_edit(f"riga {em} vera\n", f"riga {em} vera", "nuova")
+    check("fold: l'esatto vince ancora", sp == "exact" and outp == "nuova\n", sp)
+
+    # End-to-end a livello di tool, con nota di strategia.
+    root = Path(_tf.mkdtemp(prefix="flair_fold_")).resolve()
+    (root / "t.md").write_text(f"| titolo {em} nota |\n", encoding="utf-8")
+    res = edit_file_impl(root, "t.md", "| titolo - nota |", "| ok |")
+    check("fold: edit_file end-to-end", res.startswith("✓ Edited") and "typographic punctuation folded" in res, res)
 
 
 def main():
@@ -3151,6 +3202,7 @@ def main():
     test_think_session_default()
     test_session_recap()
     test_edit_invisible_chars()
+    test_edit_typographic_fold()
     test_parallel_tools()
     test_cli_session_roundtrip()
     test_shared_memory()

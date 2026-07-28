@@ -1,20 +1,20 @@
 """Estrazione testo dai formati documento più diffusi — SOLO stdlib.
 
-Il criterio del "fattibile senza dipendenze": DOCX/XLSX/PPTX/ODT sono ZIP+XML e
-si estraggono con `zipfile` + ElementTree a qualità piena; il PDF ha un
-estrattore best-effort (gli stream FlateDecode si aprono con `zlib`, gli
-operatori di testo Tj/TJ si leggono direttamente) protetto da un CANCELLO DI
-QUALITÀ: i PDF scansionati, cifrati o a encoding CID producono spazzatura, e
-in quel caso si restituisce un errore onesto invece di darla in pasto al
-modello. L'estrazione ALIMENTA la pipeline di read_file (offset/limit/budget/
-header onesto): qui si produce solo il testo.
+DOCX/XLSX/PPTX/ODT sono ZIP+XML e si estraggono con `zipfile` + ElementTree a
+qualità piena, in stdlib. Il PDF passa da `pypdf` (puro Python, zero dipendenze
+transitive): il formato è un campo minato di casi limite — un parser fatto a
+mano qui è crashato sul campo al primo PDF vero (escape ottali) — e reinventare
+problemi già risolti non vale la candela. Resta il CANCELLO DI QUALITÀ: i PDF
+scansionati/solo-immagine o dall'output inaffidabile producono un errore onesto
+e azionabile invece di spazzatura nel contesto del modello. L'estrazione
+ALIMENTA la pipeline di read_file (offset/limit/budget/header onesto): qui si
+produce solo il testo.
 """
 
 from __future__ import annotations
 
 import re
 import zipfile
-import zlib
 from pathlib import Path
 from xml.etree import ElementTree
 
@@ -40,7 +40,10 @@ def extract_text(p: Path) -> tuple[str, str]:
             return _from_pdf(p), "PDF"
     except ToolError:
         raise
-    except (zipfile.BadZipFile, KeyError, ElementTree.ParseError) as exc:
+    except Exception as exc:
+        # Rete al confine: l'estrazione è best-effort PER DESIGN, quindi qualunque
+        # imprevisto (file malformato, caso limite del formato) deve degradare in
+        # un errore di tool onesto — mai in uno stack trace (lezione di campo).
         raise ToolError(
             f"Cannot extract text from {p.name}: not a valid {ext[1:].upper()} "
             f"or an unsupported variant ({type(exc).__name__})."
@@ -119,80 +122,31 @@ def _from_xlsx(p: Path) -> str:
     return "\n".join(out).strip() or _empty(p)
 
 
-# ── PDF best-effort ───────────────────────────────────────────────────────────
-
-_PDF_TOKEN = re.compile(
-    r"\((?:\\.|[^\\()])*\)"      # stringa letterale (con escape)
-    r"|<[0-9A-Fa-f\s]+>"         # stringa esadecimale
-    r"|T[dD*]|ET|Tj|TJ"          # operatori di posizionamento/uscita testo
-)
-_PDF_ESCAPES = {"n": "\n", "r": "\r", "t": "\t", "b": "\b", "f": "\f",
-                "(": "(", ")": ")", "\\": "\\"}
-
-
-def _pdf_unescape(s: str) -> str:
-    out: list[str] = []
-    i = 0
-    while i < len(s):
-        ch = s[i]
-        if ch != "\\":
-            out.append(ch)
-            i += 1
-            continue
-        i += 1
-        if i >= len(s):
-            break
-        nxt = s[i]
-        if nxt in _PDF_ESCAPES:
-            out.append(_PDF_ESCAPES[nxt])
-            i += 1
-        elif nxt.isdigit():                     # ottale \d{1,3}
-            j = i
-            while j < len(s) and j - i < 3 and s[j].isdigit():
-                j += 1
-            out.append(chr(int(s[i:j], 8) & 0xFF))
-            i = j
-        elif nxt == "\n":                       # continuazione di riga
-            i += 1
-        else:
-            out.append(nxt)
-            i += 1
-    return "".join(out)
-
+# ── PDF (pypdf) ───────────────────────────────────────────────────────────────
 
 def _from_pdf(p: Path) -> str:
-    raw = p.read_bytes()
-    if b"/Encrypt" in raw:
-        raise ToolError(f"{p.name} is an encrypted PDF: decrypt it (or export to text) first.")
-    pieces: list[str] = []
-    for m in re.finditer(rb"stream\r?\n(.*?)endstream", raw, re.DOTALL):
-        data = m.group(1)
+    try:
+        from pypdf import PdfReader
+    except ImportError as exc:                     # ambiente incompleto: dillo chiaro
+        raise ToolError(
+            "PDF support needs the `pypdf` package (a flair dependency): "
+            "reinstall with `pip install -e .` or `pip install pypdf`."
+        ) from exc
+    reader = PdfReader(p)
+    if reader.is_encrypted:
         try:
-            data = zlib.decompress(data)
-        except zlib.error:
-            pass                                # stream non compresso (o non Flate)
-        content = data.decode("latin-1", errors="replace")
-        if "BT" not in content:
-            continue
-        buf: list[str] = []
-        for tok in _PDF_TOKEN.finditer(content):
-            t = tok.group(0)
-            if t.startswith("("):
-                buf.append(_pdf_unescape(t[1:-1]))
-            elif t.startswith("<"):
-                hexs = re.sub(r"\s", "", t[1:-1])
-                if len(hexs) % 2:
-                    hexs += "0"
-                try:
-                    buf.append(bytes.fromhex(hexs).decode("latin-1"))
-                except ValueError:
-                    pass
-            elif t in ("Td", "TD", "T*", "ET"):
-                buf.append("\n")
-        piece = "".join(buf)
-        if piece.strip():
-            pieces.append(piece)
-    text = re.sub(r"\n{3,}", "\n\n", "\n".join(pieces)).strip()
+            if not reader.decrypt(""):             # molti PDF: cifrati con password vuota
+                raise ToolError("empty-password decrypt failed")
+        except ToolError:
+            raise ToolError(f"{p.name} is an encrypted PDF: decrypt it (or export to text) first.") from None
+        except Exception as exc:
+            raise ToolError(f"{p.name} is an encrypted PDF: decrypt it (or export to text) first.") from exc
+    pages: list[str] = []
+    for i, page in enumerate(reader.pages, 1):
+        t = (page.extract_text() or "").strip()
+        if t:
+            pages.append(f"── page {i} ──\n{t}")
+    text = "\n".join(pages).strip()
     _pdf_quality_gate(p, text)
     return text
 

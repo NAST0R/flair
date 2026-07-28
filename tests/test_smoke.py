@@ -3250,31 +3250,68 @@ def test_read_documents():
     out = read_file_impl(root, "doc.odt", 1, None, 4000)
     check("documenti: ODT estratto", "Titolo" in out and "Riga ODT" in out, out)
 
-    # PDF semplice (stream non compresso, operatori Tj/Td).
-    (root / "ok.pdf").write_bytes(
-        b"%PDF-1.4\n1 0 obj\n<< /Length 80 >>\nstream\n"
-        b"BT /F1 12 Tf (Hello from the flair PDF extractor) Tj 0 -14 Td (second line here) Tj ET\n"
-        b"endstream\nendobj\ntrailer\n%%EOF")
+    # PDF vero (minimale ma valido: catalog/pages/font/xref calcolato).
+    def build_pdf(text: str) -> bytes:
+        objs = [
+            b"<< /Type /Catalog /Pages 2 0 R >>",
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+            b"/Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>",
+            None,   # contenuto, costruito sotto
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        ]
+        stream = f"BT /F1 12 Tf 72 720 Td ({text}) Tj ET".encode()
+        objs[3] = b"<< /Length " + str(len(stream)).encode() + b" >>\nstream\n" + stream + b"\nendstream"
+        out = bytearray(b"%PDF-1.4\n")
+        offsets = []
+        for n, body in enumerate(objs, 1):
+            offsets.append(len(out))
+            out += f"{n} 0 obj\n".encode() + body + b"\nendobj\n"
+        xref = len(out)
+        out += b"xref\n0 " + str(len(objs) + 1).encode() + b"\n0000000000 65535 f \n"
+        for off in offsets:
+            out += f"{off:010d} 00000 n \n".encode()
+        out += (b"trailer\n<< /Size " + str(len(objs) + 1).encode() + b" /Root 1 0 R >>\n"
+                b"startxref\n" + str(xref).encode() + b"\n%%EOF")
+        return bytes(out)
+
+    (root / "ok.pdf").write_bytes(build_pdf("Hello from the flair PDF extractor"))
     out = read_file_impl(root, "ok.pdf", 1, None, 4000)
-    check("documenti: PDF best-effort estratto",
-          "PDF text ·" in out and "Hello from the flair PDF extractor" in out and "second line here" in out, out)
+    check("documenti: PDF estratto via pypdf con marcatore di pagina",
+          "PDF text ·" in out and "Hello from the flair PDF extractor" in out and "── page 1 ──" in out, out)
 
-    # PDF spazzatura (CID/scansione simulata) → cancello di qualità.
-    (root / "bad.pdf").write_bytes(
-        b"%PDF-1.4\nstream\nBT (" + bytes([0x82] * 60) + b") Tj ET\nendstream\n%%EOF")
+    # PDF solo-immagine (pagina senza testo) → cancello di qualità.
+    from pypdf import PdfWriter
+    w = PdfWriter()
+    w.add_blank_page(width=612, height=792)
+    with open(root / "blank.pdf", "wb") as fh:
+        w.write(fh)
     try:
-        read_file_impl(root, "bad.pdf", 1, None, 4000)
-        check("documenti: cancello di qualità sul PDF illeggibile", False)
+        read_file_impl(root, "blank.pdf", 1, None, 4000)
+        check("documenti: cancello di qualità sul PDF senza testo", False)
     except ToolError as exc:
-        check("documenti: cancello di qualità sul PDF illeggibile", "scanned" in str(exc), exc)
+        check("documenti: cancello di qualità sul PDF senza testo", "scanned" in str(exc), exc)
 
-    # PDF cifrato → errore onesto immediato.
-    (root / "enc.pdf").write_bytes(b"%PDF-1.4\n/Encrypt 1 0 R\n%%EOF")
+    # PDF cifrato VERO (PdfWriter.encrypt) → errore onesto.
+    w2 = PdfWriter()
+    w2.add_blank_page(width=612, height=792)
+    w2.encrypt("segretissima")
+    with open(root / "enc.pdf", "wb") as fh:
+        w2.write(fh)
     try:
         read_file_impl(root, "enc.pdf", 1, None, 4000)
         check("documenti: PDF cifrato rifiutato", False)
     except ToolError as exc:
         check("documenti: PDF cifrato rifiutato", "encrypted" in str(exc), exc)
+
+    # Non-PDF con estensione .pdf → la rete al confine degrada in errore onesto.
+    (root / "fake.pdf").write_bytes(b"this is not a pdf at all, just bytes")
+    try:
+        read_file_impl(root, "fake.pdf", 1, None, 4000)
+        check("documenti: file malformato → errore pulito, mai stack trace", False)
+    except ToolError as exc:
+        check("documenti: file malformato → errore pulito, mai stack trace",
+              "not a valid PDF" in str(exc), exc)
 
     # Gli edit sui documenti sono rifiutati (corromperebbero il binario).
     try:

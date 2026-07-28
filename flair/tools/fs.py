@@ -18,6 +18,7 @@ import tempfile
 from pathlib import Path
 
 from ..core.tool import ToolError
+from . import documents
 
 _BINARY_EXT = {
     ".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".pdf", ".zip", ".gz",
@@ -283,16 +284,34 @@ def _atomic_write(p: Path, content: str) -> None:
         raise
 
 
+def document_guard(p: Path) -> None:
+    """Gli edit testuali su un documento binario lo corromperebbero: read_file ne
+    ESTRAE il testo, ma la modifica va fatta sulla sorgente (o su un export)."""
+    if p.suffix.lower() in documents.DOCUMENT_EXTS:
+        raise ToolError(
+            f"{p.suffix} is a binary document format: read_file extracts its text, "
+            "but text edits would corrupt the file. Edit the source (or export to a "
+            "text format) instead."
+        )
+
+
 def read_file_impl(root: Path | None, path: str, offset: int, limit: int | None, max_chars: int) -> str:
     p = resolve(root, path)
     if not p.exists():
         return f"❌ File does not exist: {display(root, p)}"
     if p.is_dir():
         return f"❌ It is a directory, not a file: {display(root, p)} (use list_directory)"
-    if p.suffix.lower() in _BINARY_EXT:
+    suffix = p.suffix.lower()
+    kind = ""
+    if suffix in documents.DOCUMENT_EXTS:
+        # L'estrazione ALIMENTA la pipeline standard: offset/limit/budget/header
+        # onesto e hint di continuazione valgono anche per i documenti.
+        text, label = documents.extract_text(p)
+        kind = f"{label} text · "
+    elif suffix in _BINARY_EXT:
         return f"❌ Binary file, not readable as text: {display(root, p)}"
-
-    text = p.read_text(encoding="utf-8", errors="replace")
+    else:
+        text = p.read_text(encoding="utf-8", errors="replace")
     lines = text.splitlines()
     total = len(lines)
     offset = max(1, offset)
@@ -315,7 +334,7 @@ def read_file_impl(root: Path | None, path: str, offset: int, limit: int | None,
         real_end = min(offset, total)
 
     chunk = "\n".join(lines[offset - 1:real_end])
-    header = f"{display(root, p)}  (lines {offset}-{real_end} of {total})\n"
+    header = f"{display(root, p)}  ({kind}lines {offset}-{real_end} of {total})\n"
     out = header + add_line_numbers(chunk, start=offset)
     if real_end < total:
         out += f"\n...[{total - real_end} more lines; continue with read_file(path, offset={real_end + 1})]"
@@ -388,6 +407,7 @@ def edit_file_impl(root: Path | None, path: str, old_string: str, new_string: st
         return f"❌ File does not exist: {display(root, p)} (use write_file to create it)"
     if p.is_dir():
         return f"❌ It is a directory: {display(root, p)}"
+    document_guard(p)
     text = p.read_text(encoding="utf-8", errors="replace")
     new_text, strategy = apply_edit(text, old_string, new_string, replace_all)
     if new_text == text:

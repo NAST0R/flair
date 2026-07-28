@@ -1,6 +1,6 @@
 # flair 3.0
 
-An **agentic** AI assistant with two sides — **advanced coding** and **general desktop automation** — on **DeepSeek** *or* **OpenAI**, interchangeable. Runs on **Linux, macOS and Windows**.
+An **agentic** AI assistant with two sides — **advanced coding** and **general desktop automation** — on **DeepSeek**, **OpenAI** *or a local OpenAI-compatible server* (llama.cpp, vLLM, LM Studio), interchangeable. Runs on **Linux, macOS and Windows**.
 
 It is the professional rewrite of the original project: same idea (an LLM that uses tools to do real things), but with a clean, token-efficient and maintainable architecture.
 
@@ -31,6 +31,7 @@ flair/
 │   │                    errors only, normalized usage, overflow detector)
 │   ├── deepseek.py      DeepSeek specifics (V4 thinking via parameter, max_tokens)
 │   ├── openai.py        OpenAI specifics (o-series & GPT-5, max_completion_tokens)
+│   ├── local.py         Local OpenAI-compatible servers (llama.cpp, vLLM, LM Studio)
 │   └── factory.py       create_provider(cfg)
 ├── core/                Engine, independent of the concrete tools
 │   ├── tool.py          Tool, Toolset, ToolContext, ToolError, @tool
@@ -59,7 +60,7 @@ For complex/multi-line PowerShell on Windows, the agent uses `run_powershell`: t
 
 **Safety.** Destructive tools (`edit_file`, `multi_edit`, `write_file`, `run_command`, `run_powershell`) ask for confirmation interactively, with a **diff preview**. `--yes` / `FLAIR_AUTO_APPROVE=true` disables it.
 
-**Two providers, one interface.** DeepSeek and OpenAI both speak the OpenAI protocol; the differences (token parameter, reasoning models without `temperature`, cache fields, CoT) are isolated in two minimal subclasses. Adding a third provider = one file.
+**Three providers, one interface.** DeepSeek, OpenAI and any **local OpenAI-compatible server** all speak the same protocol; the differences (token parameter, reasoning models without `temperature`, cache fields, CoT) are isolated in minimal subclasses. The `local` provider is tuned for llama.cpp's `llama-server` and friends: no API key required, honest zero pricing, and `temperature` is **not sent** unless `LOCAL_TEMPERATURE` is set — so the server's own sampling flags (the ones recommended for the model you serve) stay in charge.
 
 ---
 
@@ -98,6 +99,12 @@ OPENAI_MODEL=gpt-4.1-mini          # fast, non-reasoning, cheap
 OPENAI_THINK_MODEL=gpt-5-mini      # reasoning for --think (Chat-Completions-compatible)
 # OPENAI_REASONING_EFFORT=medium   # already 'medium' by default with --think
 
+FLAIR_PROVIDER=local               # local inference (llama.cpp llama-server, ...)
+LOCAL_BASE_URL=http://127.0.0.1:8001/v1
+LOCAL_MODEL=qwen3.6-27b            # display name; llama-server ignores it
+# LOCAL_TEMPERATURE=               # unset = the server's sampling wins (recommended)
+# With a 64K server context, align flair: FLAIR_CONTEXT_WINDOW=60000
+
 FLAIR_ROOT=.                       # working root for the coding agent
 FLAIR_AUTO_APPROVE=false           # confirmation for destructive tools
 ```
@@ -130,7 +137,7 @@ REPL commands:
 | `/do <task>` | force the general agent |
 | `/think <task>` | use the thinking model on the first step |
 | `/agent` | show the current agent |
-| `/provider [name]` | show, or switch provider at runtime (`deepseek`/`openai`) |
+| `/provider [name]` | show, or switch provider at runtime (`deepseek`/`openai`/`local`) |
 | `/model <name>` | switch the fast model at runtime |
 | `/think-model <name>` | switch the thinking model at runtime |
 | `/compact` | compact the active agent's context now |
@@ -205,6 +212,8 @@ For unattended runs prefer **stateless** invocations (no `--session`): two sched
 
 **Resilient `edit_file` / `multi_edit`.** Matching `old_string` is not purely literal: it cascades through *exact → outer whitespace ignored → line-ending tolerant → indentation tolerant* (re-indenting the new block to the correct level automatically). If the match is not unique it returns a clear error inviting a re-read of the file, instead of failing opaquely. When it uses a fallback it says so (`[match: indentation tolerant]`). `multi_edit` applies several edits to one file in a single, **atomic** call (if any edit fails, the file is left untouched) — fewer round-trips and tokens.
 
+**Document reading.** `read_file` also extracts the text of the most common document formats — **DOCX, XLSX, PPTX, ODT** (full support, pure stdlib: they are ZIP+XML) and **PDF** (best-effort: FlateDecode streams and text operators are parsed directly; a quality gate refuses scanned, encrypted or CID-encoded PDFs with an honest, actionable message instead of feeding garbage to the model). Extraction feeds the standard `read_file` pipeline, so paging (`offset`/`limit`), the honest header (which declares the format) and the continuation hint work unchanged. Text **edits on document files are refused** with an explanation — they would corrupt the binary. Zero new dependencies.
+
 **File creation.** `write_file` creates whole files and intermediate folders; `edit_file` makes targeted changes. The coding agent can therefore both **create** and **modify**.
 
 **Diff preview + "always allow".** Before every destructive operation (when confirmations are on) Flair shows a **colored diff** of what will change (for `edit_file`/`write_file`) or the command (`run_command`). At the `[y]es / [n]o / [a]lways / [s]top` prompt, `a` stops asking **for that tool** for the rest of the session (so a long run of commands isn't interrupted at every step), and `s` (or `Ctrl-C`) **stops the whole agentic flow** and returns control to you — the interruption is recorded in the conversation, so the agent knows exactly where it was stopped and can pick up from there on your next message. If an `edit_file` match would fail, the preview says so up front instead of showing an empty diff.
@@ -259,7 +268,7 @@ Then add it to the `TOOLS` list of the right module (`tools/coding.py`, `tools/s
 
 ## Tests
 
-Offline suite (no network, fake provider) with ~535 assertions covering: robust argument parsing, usage normalization for both providers, the **real provider request path** (parameters sent to the API: `max_tokens` vs `max_completion_tokens`, `temperature` omitted on reasoning models, DeepSeek V4 thinking enabled via parameter, retry on transient errors only), **streaming assembly**, **compaction** and overflow recovery, the resilient `edit_file` matcher and **atomic `multi_edit`**, **actionable missing-argument errors** (naming the missing arg and suggesting the intended one, e.g. `filename`→`path`), **parallel tool execution** (ordered append despite out-of-order completion, exact delegated-usage accounting, destructive batches kept sequential, correct result association, on/off flag), the **`repo_map`** outline across ~two dozen languages, the **read-only `explore` sub-agent** (isolation, read-only toolset, no recursion, leak-proof usage roll-up), the **`plan`** tool and **stage-0 context pruning** (rules, guarantees, summary-skip), web **search** (multi-backend cascade + errors) and **fetch**, **session persistence** (save/resume round-trip and **atomic writes**, at both the store and CLI level), **session memory** (dedup, secret filtering, hard cap, prompt injection only at session boundaries, sidecar round-trip, `/reset` keeping notes, off-flag), **`grep` context/files-only modes** (merged adjacent blocks, match vs context markers, clamped context, coercion) and the root-confined **`move_path`** (deterministic no-overwrite semantics, directory moves, escape attempts blocked), **honest `read_file` headers** (declared range always equals delivered lines, continuation hint on every partial read) and the **mechanical read-inventory appended to compaction summaries** (partial markers, dedup, cap), **runtime provider/model switching**, the context indicator, the router (including deterministic continuation stickiness), **headless execution** (significant exit codes, the `--json` result object, read-only tool filtering, the hard cost budget), and **both** agents on the real tools.
+Offline suite (no network, fake provider) with ~660 assertions covering: robust argument parsing, usage normalization for both providers, the **real provider request path** (parameters sent to the API: `max_tokens` vs `max_completion_tokens`, `temperature` omitted on reasoning models, DeepSeek V4 thinking enabled via parameter, retry on transient errors only), **streaming assembly**, **compaction** and overflow recovery, the resilient `edit_file` matcher and **atomic `multi_edit`**, **actionable missing-argument errors** (naming the missing arg and suggesting the intended one, e.g. `filename`→`path`), **parallel tool execution** (ordered append despite out-of-order completion, exact delegated-usage accounting, destructive batches kept sequential, correct result association, on/off flag), the **`repo_map`** outline across ~two dozen languages, the **read-only `explore` sub-agent** (isolation, read-only toolset, no recursion, leak-proof usage roll-up), the **`plan`** tool and **stage-0 context pruning** (rules, guarantees, summary-skip), web **search** (multi-backend cascade + errors) and **fetch**, **session persistence** (save/resume round-trip and **atomic writes**, at both the store and CLI level), **session memory** (dedup, secret filtering, hard cap, prompt injection only at session boundaries, sidecar round-trip, `/reset` keeping notes, off-flag), **`grep` context/files-only modes** (merged adjacent blocks, match vs context markers, clamped context, coercion) and the root-confined **`move_path`** (deterministic no-overwrite semantics, directory moves, escape attempts blocked), **honest `read_file` headers** (declared range always equals delivered lines, continuation hint on every partial read), **document text extraction** (DOCX/XLSX/PPTX/ODT and best-effort PDF behind a quality gate, edits on documents refused) and the **mechanical read-inventory appended to compaction summaries** (partial markers, dedup, cap), **runtime provider/model switching**, the context indicator, the router (including deterministic continuation stickiness), **headless execution** (significant exit codes, the `--json` result object, read-only tool filtering, the hard cost budget), and **both** agents on the real tools.
 
 ```bash
 python tests/test_smoke.py        # direct runner

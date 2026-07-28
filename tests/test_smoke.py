@@ -3172,6 +3172,125 @@ def test_edit_typographic_fold():
     check("fold: edit_file end-to-end", res.startswith("✓ Edited") and "typographic punctuation folded" in res, res)
 
 
+def test_local_provider():
+    import tempfile as _tf
+
+    from flair.config import resolve_pricing
+    from flair.llm.factory import create_provider
+    from flair.llm.local import LocalProvider
+
+    root = Path(_tf.mkdtemp(prefix="flair_lc_")).resolve()
+    cfg = cfg_for(root)
+    cfg.provider = "local"
+    cfg.validate()   # nessuna API key richiesta per il locale
+    check("local: factory registrato", isinstance(create_provider(cfg), LocalProvider))
+    check("local: prezzi a zero", resolve_pricing("local", "qwen3.6-27b") == (0.0, 0.0, 0.0))
+
+    prov = create_provider(cfg)
+    params = prov._build_params([{"role": "user", "content": "ciao"}], None, False, None)
+    check("local: temperature NON inviata di default (vince il server)", "temperature" not in params, params)
+    check("local: max_tokens come token param", "max_tokens" in params)
+    cfg.local.temperature = 0.8
+    params2 = prov._build_params([{"role": "user", "content": "ciao"}], None, False, None)
+    check("local: LOCAL_TEMPERATURE esplicita viene inviata", params2.get("temperature") == 0.8, params2)
+    check("local: reasoning history spogliata (default base)", prov.keeps_reasoning_history is False)
+
+
+def test_read_documents():
+    import inspect as _inspect
+    import tempfile as _tf
+    import zipfile as _zip
+
+    from flair.core.tool import ToolError
+    from flair.tools import coding as coding_tools
+    from flair.tools.fs import edit_file_impl, read_file_impl
+
+    root = Path(_tf.mkdtemp(prefix="flair_doc_")).resolve()
+
+    def make_zip(name: str, entries: dict[str, str]) -> None:
+        with _zip.ZipFile(root / name, "w") as z:
+            for arc, content in entries.items():
+                z.writestr(arc, content)
+
+    # DOCX (con namespace vero: l'estrattore è namespace-agnostico).
+    W = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"'
+    make_zip("doc.docx", {"word/document.xml":
+        f'<w:document {W}><w:body>'
+        '<w:p><w:r><w:t>Primo paragrafo</w:t></w:r></w:p>'
+        '<w:p><w:r><w:t>Secondo </w:t></w:r><w:r><w:t>paragrafo</w:t></w:r></w:p>'
+        '<w:p><w:r><w:t>Terzo</w:t></w:r></w:p></w:body></w:document>'})
+    out = read_file_impl(root, "doc.docx", 1, None, 4000)
+    check("documenti: DOCX estratto con header dichiarato",
+          "DOCX text · lines 1-3 of 3" in out and "Secondo paragrafo" in out, out)
+    out2 = read_file_impl(root, "doc.docx", 2, 1, 4000)
+    check("documenti: offset/limit sulla pipeline standard",
+          "lines 2-2 of 3" in out2 and "Secondo paragrafo" in out2 and "Primo" not in out2, out2)
+
+    # XLSX: shared strings + numeri + nome del foglio.
+    make_zip("cal.xlsx", {
+        "xl/workbook.xml": '<workbook><sheets><sheet name="Dati"/></sheets></workbook>',
+        "xl/sharedStrings.xml": "<sst><si><t>nome</t></si><si><t>Federico</t></si></sst>",
+        "xl/worksheets/sheet1.xml":
+            '<worksheet><sheetData><row><c t="s"><v>0</v></c><c><v>42</v></c></row>'
+            '<row><c t="s"><v>1</v></c></row></sheetData></worksheet>'})
+    out = read_file_impl(root, "cal.xlsx", 1, None, 4000)
+    check("documenti: XLSX con foglio, shared strings e numeri",
+          "── Dati ──" in out and "nome | 42" in out and "Federico" in out, out)
+
+    # PPTX: slide in ordine numerico.
+    make_zip("slides.pptx", {
+        "ppt/slides/slide2.xml": "<sld><t>Seconda slide</t></sld>",
+        "ppt/slides/slide1.xml": "<sld><t>Prima slide</t></sld>"})
+    out = read_file_impl(root, "slides.pptx", 1, None, 4000)
+    check("documenti: PPTX in ordine di slide",
+          out.index("Prima slide") < out.index("Seconda slide") and "── slide 1 ──" in out, out)
+
+    # ODT.
+    make_zip("doc.odt", {"content.xml": "<doc><h>Titolo</h><p>Riga ODT</p></doc>"})
+    out = read_file_impl(root, "doc.odt", 1, None, 4000)
+    check("documenti: ODT estratto", "Titolo" in out and "Riga ODT" in out, out)
+
+    # PDF semplice (stream non compresso, operatori Tj/Td).
+    (root / "ok.pdf").write_bytes(
+        b"%PDF-1.4\n1 0 obj\n<< /Length 80 >>\nstream\n"
+        b"BT /F1 12 Tf (Hello from the flair PDF extractor) Tj 0 -14 Td (second line here) Tj ET\n"
+        b"endstream\nendobj\ntrailer\n%%EOF")
+    out = read_file_impl(root, "ok.pdf", 1, None, 4000)
+    check("documenti: PDF best-effort estratto",
+          "PDF text ·" in out and "Hello from the flair PDF extractor" in out and "second line here" in out, out)
+
+    # PDF spazzatura (CID/scansione simulata) → cancello di qualità.
+    (root / "bad.pdf").write_bytes(
+        b"%PDF-1.4\nstream\nBT (" + bytes([0x82] * 60) + b") Tj ET\nendstream\n%%EOF")
+    try:
+        read_file_impl(root, "bad.pdf", 1, None, 4000)
+        check("documenti: cancello di qualità sul PDF illeggibile", False)
+    except ToolError as exc:
+        check("documenti: cancello di qualità sul PDF illeggibile", "scanned" in str(exc), exc)
+
+    # PDF cifrato → errore onesto immediato.
+    (root / "enc.pdf").write_bytes(b"%PDF-1.4\n/Encrypt 1 0 R\n%%EOF")
+    try:
+        read_file_impl(root, "enc.pdf", 1, None, 4000)
+        check("documenti: PDF cifrato rifiutato", False)
+    except ToolError as exc:
+        check("documenti: PDF cifrato rifiutato", "encrypted" in str(exc), exc)
+
+    # Gli edit sui documenti sono rifiutati (corromperebbero il binario).
+    try:
+        edit_file_impl(root, "doc.docx", "Primo", "X")
+        check("documenti: edit rifiutato sul formato binario", False)
+    except ToolError as exc:
+        check("documenti: edit rifiutato sul formato binario", "would corrupt" in str(exc), exc)
+    check("documenti: multi_edit passa dalla stessa guardia",
+          "fs.document_guard(p)" in _inspect.getsource(coding_tools))
+
+    # I binari NON documento restano rifiutati come prima.
+    (root / "img.png").write_bytes(b"\x89PNG\r\n")
+    check("documenti: gli altri binari restano rifiutati",
+          "Binary file" in read_file_impl(root, "img.png", 1, None, 4000))
+
+
 def main():
     test_arg_parse()
     test_usage_normalization()
@@ -3203,6 +3322,8 @@ def main():
     test_session_recap()
     test_edit_invisible_chars()
     test_edit_typographic_fold()
+    test_local_provider()
+    test_read_documents()
     test_parallel_tools()
     test_cli_session_roundtrip()
     test_shared_memory()

@@ -71,6 +71,7 @@ MODEL_PRICING: dict[str, tuple[float, float, float]] = {
 _PROVIDER_FALLBACK = {
     "deepseek": (0.0028, 0.14, 0.28),
     "openai": (0.075, 0.15, 0.60),
+    "local": (0.0, 0.0, 0.0),   # inference locale: il costo vero è la bolletta
 }
 
 
@@ -119,6 +120,7 @@ class Config:
     provider: str
     deepseek: ProviderConfig
     openai: ProviderConfig
+    local: ProviderConfig | None = None   # server locale OpenAI-compatibile (llama-server e simili)
 
     # Generazione
     max_tokens: int = 8000
@@ -183,6 +185,8 @@ class Config:
 
     @property
     def active(self) -> ProviderConfig:
+        if self.provider == "local" and self.local is not None:
+            return self.local
         return self.deepseek if self.provider == "deepseek" else self.openai
 
     @property
@@ -198,9 +202,9 @@ class Config:
         self.price_output = _float("FLAIR_PRICE_OUTPUT", out)
 
     def validate(self) -> None:
-        if self.provider not in ("deepseek", "openai"):
-            raise RuntimeError(f"Invalid provider: {self.provider} (use 'deepseek' or 'openai').")
-        if not self.active.api_key:
+        if self.provider not in ("deepseek", "openai", "local"):
+            raise RuntimeError(f"Invalid provider: {self.provider} (use 'deepseek', 'openai' or 'local').")
+        if self.provider != "local" and not self.active.api_key:
             key_name = "DEEPSEEK_API_KEY" if self.provider == "deepseek" else "OPENAI_API_KEY"
             raise RuntimeError(
                 f"{key_name} missing. Create a .env file (see .env.example) "
@@ -238,12 +242,22 @@ def load_config() -> Config:
         reasoning_effort=os.getenv("OPENAI_REASONING_EFFORT") or None,
     )
 
+    local_model = os.getenv("LOCAL_MODEL", "local")
+    local = ProviderConfig(
+        api_key=os.getenv("LOCAL_API_KEY", "local"),   # llama-server non la verifica
+        base_url=os.getenv("LOCAL_BASE_URL", "http://127.0.0.1:8001/v1"),
+        model=local_model,
+        think_model=os.getenv("LOCAL_THINK_MODEL", local_model),   # un solo modello in VRAM
+        temperature=_float("LOCAL_TEMPERATURE", -1.0),   # -1 = non inviare: vince il server
+    )
+
     log_dir = os.getenv("FLAIR_LOG_DIR")
 
     cfg = Config(
         provider=provider,
         deepseek=deepseek,
         openai=openai,
+        local=local,
         max_tokens=_int("FLAIR_MAX_TOKENS", 8000),
         request_timeout=_int("FLAIR_TIMEOUT", 300),
         stream=_bool("FLAIR_STREAM", True),

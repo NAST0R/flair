@@ -4,11 +4,13 @@ from __future__ import annotations
 
 from .base import LLMProvider
 from .deepseek import DeepSeekProvider
+from .local import LocalProvider
 from .openai import OpenAIProvider
 
 _REGISTRY = {
     "deepseek": DeepSeekProvider,
     "openai": OpenAIProvider,
+    "local": LocalProvider,
 }
 
 

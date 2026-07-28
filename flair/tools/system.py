@@ -213,7 +213,9 @@ def list_directory(ctx: ToolContext, path: str = "~") -> str:
 
 @tool(
     "read_file",
-    "Read any text file on the computer, with line numbers.",
+    "Read any text file on the computer, with line numbers. Also extracts the text "
+    "of common documents: DOCX, XLSX, PPTX, ODT and PDF (best-effort: scanned/"
+    "CID-encoded PDFs are refused with an explanation).",
     {
         "type": "object",
         "properties": {

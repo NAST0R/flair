@@ -809,8 +809,8 @@ class CLI:
                 parts = line.split(maxsplit=1)
                 if len(parts) == 2:
                     target = parts[1].strip().lower()
-                    if target not in ("deepseek", "openai"):
-                        self.console.print("[yellow]invalid provider (deepseek|openai).[/yellow]\n")
+                    if target not in ("deepseek", "openai", "local"):
+                        self.console.print("[yellow]invalid provider (deepseek|openai|local).[/yellow]\n")
                     else:
                         self.cfg.provider = target
                         self.cfg.refresh_pricing()

@@ -20,7 +20,9 @@ from . import fs, repomap, shell
 
 @tool(
     "read_file",
-    "Read a project text file with line numbers. Use offset/limit for large files.",
+    "Read a project text file with line numbers. Use offset/limit for large files. "
+    "Also extracts the text of common documents: DOCX, XLSX, PPTX, ODT and PDF "
+    "(best-effort: scanned/CID-encoded PDFs are refused with an explanation).",
     {
         "type": "object",
         "properties": {
@@ -295,6 +297,7 @@ def multi_edit(ctx: ToolContext, path: str, edits: list) -> str:
     if not isinstance(edits, list) or not edits:
         return "❌ 'edits' must be a non-empty list of edits."
 
+    fs.document_guard(p)
     text = p.read_text(encoding="utf-8", errors="replace")
     working = text
     notes = []

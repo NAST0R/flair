@@ -12,6 +12,7 @@ import io
 import json as json_module
 import shutil
 import sys
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -217,7 +218,10 @@ def test_router():
 # ── 5. agente CODING end-to-end ───────────────────────────────────────────────
 
 def test_coding_agent():
-    root = Path("/tmp/flair3_coding")
+    # Radice nel temp di SISTEMA e RISOLTA: su Windows "/tmp" è un path senza
+    # lettera di drive, e la sandbox (relative_to su path risolti) rigetterebbe
+    # ogni file — gli edit non si applicherebbero mai. Vale per tutti i test.
+    root = Path(tempfile.gettempdir(), "flair3_coding").resolve()
     if root.exists():
         shutil.rmtree(root)
     root.mkdir(parents=True)
@@ -274,7 +278,7 @@ def test_coding_agent():
 # ── 6. agente GENERICO end-to-end ─────────────────────────────────────────────
 
 def test_general_agent():
-    root = Path("/tmp/flair3_general")
+    root = Path(tempfile.gettempdir(), "flair3_general").resolve()
     if root.exists():
         shutil.rmtree(root)
     root.mkdir(parents=True)
@@ -305,7 +309,7 @@ def test_general_agent():
 # ── 7. gate di approvazione ───────────────────────────────────────────────────
 
 def test_approval_gate():
-    root = Path("/tmp/flair3_approval")
+    root = Path(tempfile.gettempdir(), "flair3_approval").resolve()
     if root.exists():
         shutil.rmtree(root)
     root.mkdir(parents=True)
@@ -616,7 +620,7 @@ def test_web_search():
 
 def test_session_persistence():
     from flair.session_store import SessionStore
-    root = Path("/tmp/flair_sess_test")
+    root = Path(tempfile.gettempdir(), "flair_sess_test").resolve()
     shutil.rmtree(root, ignore_errors=True)
     cfg = cfg_for(root)
     cfg.session_dir = root / "sessions"
@@ -653,7 +657,7 @@ def test_session_persistence():
 
 def test_cli_session_roundtrip():
     from flair.cli import CLI
-    root = Path("/tmp/flair_cli_sess")
+    root = Path(tempfile.gettempdir(), "flair_cli_sess").resolve()
     shutil.rmtree(root, ignore_errors=True)
     cfg = cfg_for(root)
     cfg.session_dir = root / "sessions"
@@ -672,7 +676,7 @@ def test_cli_session_roundtrip():
 
 def test_multi_edit():
     from flair.tools import coding as coding_tools
-    root = Path("/tmp/flair_me")
+    root = Path(tempfile.gettempdir(), "flair_me").resolve()
     shutil.rmtree(root, ignore_errors=True)
     root.mkdir(parents=True)
     (root / "a.py").write_text("x = 1\ny = 2\nz = 3\n")
@@ -804,7 +808,7 @@ def test_streaming_reasoning_order():
 
 def test_system_write_edit():
     from flair.tools import system as st
-    root = Path("/tmp/flair_sys_we")
+    root = Path(tempfile.gettempdir(), "flair_sys_we").resolve()
     shutil.rmtree(root, ignore_errors=True)
     root.mkdir(parents=True)
     ctx = ToolContext(cfg=cfg_for(root))
@@ -879,7 +883,7 @@ def test_help_renders():
 
 
 def test_stop_flow():
-    root = Path("/tmp/flair_stop")
+    root = Path(tempfile.gettempdir(), "flair_stop").resolve()
     shutil.rmtree(root, ignore_errors=True)
     root.mkdir(parents=True)
     (root / "a.py").write_text("x\n")
@@ -927,7 +931,7 @@ def test_keyboard_interrupt_mid_tools():
     # Ctrl-C MENTRE un tool è in approvazione/esecuzione: l'assistant con i tool_call è
     # già in cronologia, quindi ogni tool_call DEVE ricevere una risposta 'tool', altrimenti
     # la prossima chiamata API fallirebbe. La conversazione resta valida.
-    root = Path("/tmp/flair_kbi")
+    root = Path(tempfile.gettempdir(), "flair_kbi").resolve()
     shutil.rmtree(root, ignore_errors=True)
     root.mkdir(parents=True)
     (root / "a.py").write_text("x\n")
@@ -1173,17 +1177,31 @@ def test_shell_multiline_routing():
 
 
 def test_shell_decoding_robust():
+    import os as _os
+    import sys as _sys
+    import tempfile as _tf
+
     from flair.tools import shell
-    # output con byte non-UTF8: senza errors="replace" run() alzerebbe UnicodeDecodeError
-    cmd = r'''python3 -c 'import sys; sys.stdout.buffer.write(b"\xff\xfe ok")' '''
-    proc = shell.run_shell(cmd.strip(), timeout=10)
-    check("shell: output non decodificabile non rompe",
-          proc.returncode == 0 and isinstance(proc.stdout, str) and "ok" in proc.stdout, repr(proc.stdout))
+    # Output con byte non-UTF8: senza errors="replace" run() alzerebbe UnicodeDecodeError.
+    # Lo script emette i byte da FILE e l'interprete è sys.executable: niente apici
+    # singoli (che cmd.exe non interpreta) né 'python3' (non garantito su Windows).
+    d = Path(_tf.mkdtemp(prefix="flair_dec_")).resolve()
+    try:
+        (d / "emit.py").write_text(
+            'import sys; sys.stdout.buffer.write(b"\\xff\\xfe ok")\n', encoding="utf-8")
+        cmd = f'"{_sys.executable}" "{d / "emit.py"}"'
+        if _os.name == "nt":
+            cmd = '"' + cmd + '"'   # cmd /c: le virgolette esterne proteggono le due coppie interne
+        proc = shell.run_shell(cmd, timeout=30)
+        check("shell: output non decodificabile non rompe",
+              proc.returncode == 0 and isinstance(proc.stdout, str) and "ok" in proc.stdout, repr(proc.stdout))
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
 
 
 def test_search_files_coercion():
     from flair.tools import system as st
-    root = Path("/tmp/flair_search")
+    root = Path(tempfile.gettempdir(), "flair_search").resolve()
     shutil.rmtree(root, ignore_errors=True)
     root.mkdir(parents=True)
     (root / "song.mp3").write_text("x")
@@ -3328,6 +3346,118 @@ def test_read_documents():
           "Binary file" in read_file_impl(root, "img.png", 1, None, 4000))
 
 
+def test_glob_recursive():
+    """Regressione: `**` deve avere la VERA semantica glob (zero o più directory).
+    Con fnmatch, `**/*` richiedeva almeno un separatore e i file alla RADICE non
+    matchavano mai — proprio l'inventario che i prompt di sistema raccomandano."""
+    import tempfile as _tf
+
+    from flair.tools import coding
+
+    root = Path(_tf.mkdtemp(prefix="flair_glob_")).resolve()
+    try:
+        (root / "README.md").write_text("x", encoding="utf-8")
+        (root / "top.py").write_text("x", encoding="utf-8")
+        (root / "src").mkdir()
+        (root / "src" / "mid.py").write_text("x", encoding="utf-8")
+        (root / "src" / "deep").mkdir()
+        (root / "src" / "deep" / "leaf.py").write_text("x", encoding="utf-8")
+        (root / "src" / "deep" / "data.txt").write_text("x", encoding="utf-8")
+        ctx = ToolContext(cfg=cfg_for(root))
+
+        def norm(s: str) -> str:
+            return s.replace("\\", "/")   # su Windows display usa i backslash
+
+        out = norm(coding.glob(ctx, pattern="**/*"))
+        for name in ("README.md", "top.py", "src/mid.py", "src/deep/leaf.py", "src/deep/data.txt"):
+            check(f"glob **: '{name}' incluso nell'inventario", name in out, out)
+
+        out = norm(coding.glob(ctx, pattern="**/*.py"))
+        check("glob **.py: file alla radice incluso", "top.py" in out, out)
+        check("glob **.py: nidificati inclusi", "src/mid.py" in out and "src/deep/leaf.py" in out, out)
+        check("glob **.py: estensioni diverse escluse", "README.md" not in out and "data.txt" not in out, out)
+
+        # `dir/**/X` copre anche ZERO directory intermedie (semantica standard).
+        out = norm(coding.glob(ctx, pattern="src/**/*.py"))
+        check("glob src/**: zero livelli coperti", "src/mid.py" in out, out)
+        check("glob src/**: livelli profondi coperti", "src/deep/leaf.py" in out, out)
+        check("glob src/**: la radice resta fuori", "top.py" not in out, out)
+
+        # Comodità invariata: un pattern senza '/' vale sul nome file a ogni profondità.
+        out = norm(coding.glob(ctx, pattern="*.py"))
+        check("glob *.py: nome file a ogni profondità", "top.py" in out and "src/deep/leaf.py" in out, out)
+
+        # `src/*.py` NON deve più over-matchare i nipoti (prima `*` attraversava '/').
+        out = norm(coding.glob(ctx, pattern="src/*.py"))
+        check("glob src/*.py: figli diretti sì", "src/mid.py" in out, out)
+        check("glob src/*.py: nipoti esclusi (niente over-match)", "leaf.py" not in out, out)
+
+        # Classi di caratteri nei pattern CON '/' (prima coperte solo da fnmatch).
+        out = norm(coding.glob(ctx, pattern="src/mid.[px]y"))
+        check("glob classi: [px] dentro un segmento", "src/mid.py" in out, out)
+
+        check("glob: nessun match → messaggio pulito",
+              coding.glob(ctx, pattern="**/*.rs").startswith("No files match"))
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_provider_switch_ctx():
+    """Regressione: /provider deve riallineare ANCHE ctx.provider — è il provider
+    con cui i tool che delegano (explore, in percorso sequenziale) costruiscono il
+    sub-agente. Prima restava quello VECCHIO (client, chiave e listino di prima)."""
+    import io as _io
+
+    from rich.console import Console
+
+    from flair.cli import CLI
+    from flair.llm.openai import OpenAIProvider
+
+    cfg = cfg_for(Path("."))
+    cfg.provider = "deepseek"
+    cli = CLI(cfg)
+    cli.console = Console(file=_io.StringIO())
+    old = cli.provider
+    check("switch ctx: in partenza ctx.provider = provider iniziale",
+          all(a.ctx.provider is old for a in cli.agents.values()))
+
+    check("switch ctx: switch riuscito", cli._switch_provider("openai") is True)
+    check("switch ctx: nuovo provider creato", isinstance(cli.provider, OpenAIProvider) and cli.provider is not old)
+    for k, a in cli.agents.items():
+        check(f"switch ctx: agent '{k}' → provider riallineato", a.provider is cli.provider)
+        check(f"switch ctx: agent '{k}' → ctx.provider riallineato (explore sul provider NUOVO)",
+              a.ctx.provider is cli.provider)
+
+    current = cli.provider
+    check("switch ctx: target sconosciuto rifiutato", cli._switch_provider("boh") is False)
+    check("switch ctx: sul rifiuto nulla cambia",
+          cli.provider is current and cli.cfg.provider == "openai"
+          and all(a.ctx.provider is current for a in cli.agents.values()))
+
+
+def test_cli_parser_local():
+    """Regressione: `--provider local` era rifiutato da argparse (choices non
+    aggiornate alla nascita del provider locale), mentre FLAIR_PROVIDER=local e
+    /provider local funzionavano già."""
+    import contextlib
+    import io as _io
+
+    from flair.cli import _build_parser
+
+    ap = _build_parser()
+    ns = ap.parse_args(["--provider", "local"])
+    check("parser: --provider local accettato", ns.provider == "local")
+    ns2 = ap.parse_args(["--provider", "deepseek", "-p", "x"])
+    check("parser: gli altri provider invariati", ns2.provider == "deepseek" and ns2.prompt == "x")
+    raised = False
+    try:
+        with contextlib.redirect_stderr(_io.StringIO()):
+            ap.parse_args(["--provider", "claude"])
+    except SystemExit:
+        raised = True
+    check("parser: provider sconosciuto ancora rifiutato", raised)
+
+
 def main():
     test_arg_parse()
     test_usage_normalization()
@@ -3408,6 +3538,9 @@ def main():
     test_budget_abort()
     test_read_only_mode()
     test_automation_helpers()
+    test_glob_recursive()
+    test_provider_switch_ctx()
+    test_cli_parser_local()
     test_evals_harness()
     print(f"\nTUTTI I {len(PASS)} TEST PASSATI ✅")
 

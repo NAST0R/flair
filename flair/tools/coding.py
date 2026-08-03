@@ -53,6 +53,61 @@ def list_directory(ctx: ToolContext, path: str = ".") -> str:
 
 # ── glob ─────────────────────────────────────────────────────────────────────
 
+def _glob_seg_rx(seg: str) -> str:
+    """Regex per UN segmento di path di un glob: `*` e `?` non attraversano mai
+    il separatore; le classi `[...]` (con negazione `[!...]`) passano intatte."""
+    out: list[str] = []
+    i, n = 0, len(seg)
+    while i < n:
+        c = seg[i]
+        if c == "*":
+            out.append("[^/]*")
+        elif c == "?":
+            out.append("[^/]")
+        elif c == "[":
+            j = i + 1
+            if j < n and seg[j] in "!^":
+                j += 1
+            if j < n and seg[j] == "]":
+                j += 1
+            while j < n and seg[j] != "]":
+                j += 1
+            if j >= n:                       # '[' senza chiusura: letterale
+                out.append(re.escape(c))
+            else:
+                inner = seg[i + 1:j]
+                if inner.startswith("!"):
+                    inner = "^" + inner[1:]
+                out.append("[" + inner.replace("\\", "\\\\") + "]")
+                i = j
+        else:
+            out.append(re.escape(c))
+        i += 1
+    return "".join(out)
+
+
+def _compile_glob(pattern: str) -> re.Pattern:
+    """Compila un glob in regex con la VERA semantica di `**` (zero o più
+    directory). fnmatch tratta `*` come "qualsiasi cosa, separatori compresi":
+    `**/*.py` richiedeva quindi almeno una directory e i file alla RADICE non
+    matchavano mai — proprio l'inventario (`glob **/*`) che i prompt di sistema
+    raccomandano. Qui `**/` copre anche il livello zero e `*`/`?` restano dentro
+    un singolo segmento (niente over-match di `src/*.py` sui nipoti)."""
+    pat = pattern.replace("\\", "/")
+    while pat.startswith("./"):
+        pat = pat[2:]
+    parts = pat.split("/")
+    rx: list[str] = []
+    for i, part in enumerate(parts):
+        last = i == len(parts) - 1
+        if part == "**":
+            rx.append(".*" if last else "(?:[^/]+/)*")
+        else:
+            rx.append(_glob_seg_rx(part) + ("" if last else "/"))
+    flags = re.IGNORECASE if os.name == "nt" else 0
+    return re.compile("^" + "".join(rx) + "$", flags)
+
+
 @tool(
     "glob",
     "Find files by glob pattern, e.g. '**/*.py' or 'src/**/*.ts'.",
@@ -69,13 +124,16 @@ def glob(ctx: ToolContext, pattern: str, path: str = ".") -> str:
     base = fs.resolve(ctx.cfg.root, path)
     if not base.exists():
         return f"❌ Path does not exist: {fs.display(ctx.cfg.root, base)}"
+    rx = _compile_glob(pattern)
     matches: list[str] = []
     for root_dir, dirs, files in os.walk(base):
         dirs[:] = [d for d in dirs if d not in fs.NOISE_DIRS]
         for f in files:
             full = Path(root_dir) / f
             relp = fs.display(ctx.cfg.root, full)
-            if fnmatch.fnmatch(relp, pattern) or fnmatch.fnmatch(f, pattern):
+            # Regex sul path relativo (semantica `**` corretta) + comodità sul solo
+            # nome file: un pattern senza '/' come '*.py' vale a ogni profondità.
+            if rx.match(relp.replace("\\", "/")) or fnmatch.fnmatch(f, pattern):
                 matches.append(relp)
     matches.sort()
     if not matches:

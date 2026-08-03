@@ -239,6 +239,22 @@ class CLI:
         self.agents["coding"].ctx.memory = self.memory
         self._refresh_memory_prompts()
 
+    def _switch_provider(self, target: str) -> bool:
+        """Cambia provider a runtime (/provider). Oltre a ricreare il client,
+        riallinea OGNI riferimento che gli agenti tengono al provider — incluso
+        ctx.provider, usato dai tool che delegano (explore): senza, il percorso
+        sequenziale costruiva il sub-agente sul provider VECCHIO (client, chiave
+        e listino di prima). Ritorna False su target sconosciuto (nulla cambia)."""
+        if target not in ("deepseek", "openai", "local"):
+            return False
+        self.cfg.provider = target
+        self.cfg.refresh_pricing()
+        self.provider = create_provider(self.cfg)
+        for a in self.agents.values():
+            a.provider = self.provider
+            a.ctx.provider = self.provider
+        return True
+
     def _refresh_memory_prompts(self) -> None:
         """(Ri)compone i system prompt: base (prompt + istruzioni di progetto) + blocco
         memoria. Da chiamare SOLO ai confini di sessione (avvio, /load, /memory clear,
@@ -809,14 +825,9 @@ class CLI:
                 parts = line.split(maxsplit=1)
                 if len(parts) == 2:
                     target = parts[1].strip().lower()
-                    if target not in ("deepseek", "openai", "local"):
+                    if not self._switch_provider(target):
                         self.console.print("[yellow]invalid provider (deepseek|openai|local).[/yellow]\n")
                     else:
-                        self.cfg.provider = target
-                        self.cfg.refresh_pricing()
-                        self.provider = create_provider(self.cfg)
-                        for a in self.agents.values():
-                            a.provider = self.provider
                         pc = self.cfg.active
                         self.console.print(f"[yellow]provider → {target} | model: {pc.model} | thinking: {pc.think_model}[/yellow]\n")
                 else:
@@ -896,11 +907,14 @@ def _build_config(args) -> Config:
     return cfg
 
 
-def main(argv: list[str] | None = None) -> int:
+def _build_parser() -> argparse.ArgumentParser:
+    """Costruisce il parser dei flag di avvio. Estratto da main() per poterlo
+    testare direttamente (es. la regressione: --provider deve accettare 'local',
+    come già fanno FLAIR_PROVIDER e il comando /provider del REPL)."""
     ap = argparse.ArgumentParser(prog="flair", description="Agentic AI assistant (coding + general) on DeepSeek/OpenAI.")
     ap.add_argument("--version", action="version", version=f"flair {__version__}")
     ap.add_argument("-p", "--prompt", help="run a single task and exit (use '-' to read from stdin)")
-    ap.add_argument("--provider", choices=["deepseek", "openai"], help="LLM provider")
+    ap.add_argument("--provider", choices=["deepseek", "openai", "local"], help="LLM provider")
     ap.add_argument("--agent", choices=["coding", "general", "auto"], default="auto", help="force an agent (default: auto)")
     ap.add_argument("--root", help="working root for the coding agent")
     ap.add_argument("--think", action="store_true", help="use the thinking model (one-shot: the task; REPL: every turn of the session)")
@@ -917,7 +931,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--think-model", dest="think_model", help="override the thinking model")
     ap.add_argument("--session", help="use/create a session with this name (autosave)")
     ap.add_argument("--continue", dest="continue_", action="store_true", help="resume the latest saved session")
-    args = ap.parse_args(argv)
+    return ap
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _build_parser().parse_args(argv)
 
     # Modalità di output one-shot: json/quiet valgono solo con -p (la REPL resta human).
     json_mode = bool(args.prompt is not None and args.json)

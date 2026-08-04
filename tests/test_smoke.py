@@ -3458,6 +3458,89 @@ def test_cli_parser_local():
     check("parser: provider sconosciuto ancora rifiutato", raised)
 
 
+# Certificato self-signed EC generato una tantum per i test (CN=flair-test-ca,
+# scadenza 2036): serve solo a validare il CARICAMENTO del PEM nel trust store,
+# mai una connessione — la scadenza non conta per load_verify_locations.
+_TEST_CA_PEM = """-----BEGIN CERTIFICATE-----
+MIIBhTCCASugAwIBAgIUXsTyt4C2p6f+UdVRrjuDjXszXp8wCgYIKoZIzj0EAwIw
+GDEWMBQGA1UEAwwNZmxhaXItdGVzdC1jYTAeFw0yNjA4MDQxNTIyNDZaFw0zNjA4
+MDExNTIyNDZaMBgxFjAUBgNVBAMMDWZsYWlyLXRlc3QtY2EwWTATBgcqhkjOPQIB
+BggqhkjOPQMBBwNCAAQ8iGcGzvBINgL8WZWmxgxAP1hdNNFIYx8+5AnbH52EvU2W
+hZL9Iw0mWPUqqoaTplSyIfEHe5YwScZtg6YMNy21o1MwUTAdBgNVHQ4EFgQUO8NK
+RFz9DK74ssIN4pxj1QuUSAIwHwYDVR0jBBgwFoAUO8NKRFz9DK74ssIN4pxj1QuU
+SAIwDwYDVR0TAQH/BAUwAwEB/zAKBggqhkjOPQQDAgNIADBFAiAHjPUY/05LKRy1
+k6IDyYfkpKuADGPl3ViIqUtxZhAsQAIhAJIUaBqB5Z6i/C0RxskQqlrCK/nKzfvi
+esycXik8UJRb
+-----END CERTIFICATE-----
+"""
+
+
+def test_ca_bundle():
+    """FLAIR_CA_BUNDLE: bundle CA privato per la verifica TLS (endpoint self-signed
+    come llama-server --ssl-*, o TLS inspection aziendale). Senza bundle il client
+    custom NON viene creato: il percorso di default dell'SDK resta identico."""
+    import os as _os
+    import ssl as _ssl
+    import tempfile as _tf
+
+    import httpx as _httpx
+
+    from flair.config import load_config
+    from flair.llm.base import _build_http_client
+    from flair.llm.factory import create_provider
+
+    # Default: nessun bundle → nessun client custom (zero regressioni sul percorso SDK).
+    cfg = cfg_for(Path("."))
+    check("ca: default None in Config", cfg.ca_bundle is None)
+    check("ca: nessun client custom senza bundle", _build_http_client(cfg) is None)
+
+    d = Path(_tf.mkdtemp(prefix="flair_ca_")).resolve()
+    try:
+        pem = d / "ca.pem"
+        pem.write_text(_TEST_CA_PEM, encoding="utf-8")
+
+        # Env → Config: path espanso e risolto al load (ancorato alla dir di lancio).
+        _os.environ["FLAIR_CA_BUNDLE"] = str(pem)
+        try:
+            cfg2 = load_config()
+            check("ca: FLAIR_CA_BUNDLE caricata come Path risolto", cfg2.ca_bundle == pem, cfg2.ca_bundle)
+        finally:
+            _os.environ.pop("FLAIR_CA_BUNDLE", None)
+        check("ca: senza env resta None", load_config().ca_bundle is None)
+
+        # Il PEM è caricabile in un SSLContext (stessa chiamata usata dal builder).
+        sctx = _ssl.create_default_context(cafile=str(pem))
+        check("ca: PEM di test nel trust store", sctx.cert_store_stats().get("x509", 0) >= 1,
+              sctx.cert_store_stats())
+
+        # Builder: httpx.Client con verify a SSLContext (httpx>=0.28-proof).
+        cfg.ca_bundle = pem
+        client = _build_http_client(cfg)
+        try:
+            check("ca: client httpx creato col bundle", isinstance(client, _httpx.Client))
+        finally:
+            if client is not None:
+                client.close()
+
+        # Il provider si costruisce senza errori col bundle attivo (nessuna rete).
+        cfg.provider = "local"
+        check("ca: provider costruito col bundle", create_provider(cfg) is not None)
+
+        # validate(): bundle inesistente → fail-fast con messaggio azionabile.
+        cfg.ca_bundle = d / "manca.pem"
+        try:
+            cfg.validate()
+            check("ca: bundle mancante rifiutato da validate", False)
+        except RuntimeError as exc:
+            check("ca: bundle mancante rifiutato da validate", "FLAIR_CA_BUNDLE" in str(exc), exc)
+        # Il PEM valido invece passa la validazione.
+        cfg.ca_bundle = pem
+        cfg.validate()
+        check("ca: bundle esistente accettato da validate", True)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def main():
     test_arg_parse()
     test_usage_normalization()
@@ -3541,6 +3624,7 @@ def main():
     test_glob_recursive()
     test_provider_switch_ctx()
     test_cli_parser_local()
+    test_ca_bundle()
     test_evals_harness()
     print(f"\nTUTTI I {len(PASS)} TEST PASSATI ✅")
 

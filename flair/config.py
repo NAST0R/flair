@@ -126,6 +126,11 @@ class Config:
     max_tokens: int = 8000
     request_timeout: int = 300
     stream: bool = True
+    # Bundle CA privato (PEM) per la verifica TLS di QUALSIASI provider: endpoint
+    # self-hosted con certificato self-signed (llama-server --ssl-*) o reti con
+    # TLS inspection che ri-firmano il traffico. Sostituisce SSL_CERT_FILE, che
+    # httpx >= 0.28 non onora più. None = trust di default (certifi), invariato.
+    ca_bundle: Path | None = None
 
     # Loop agentico
     max_steps: int = 60
@@ -212,6 +217,8 @@ class Config:
             )
         if not self.root.exists():
             raise RuntimeError(f"FLAIR_ROOT does not exist: {self.root}")
+        if self.ca_bundle is not None and not self.ca_bundle.is_file():
+            raise RuntimeError(f"FLAIR_CA_BUNDLE does not exist: {self.ca_bundle}")
 
 
 def _think_steps() -> str:
@@ -252,6 +259,9 @@ def load_config() -> Config:
     )
 
     log_dir = os.getenv("FLAIR_LOG_DIR")
+    # Risolto SUBITO (prima del chdir alla root di lavoro): un path relativo
+    # resta ancorato alla directory di lancio, prevedibile per l'utente.
+    ca_bundle = os.getenv("FLAIR_CA_BUNDLE")
 
     cfg = Config(
         provider=provider,
@@ -261,6 +271,7 @@ def load_config() -> Config:
         max_tokens=_int("FLAIR_MAX_TOKENS", 8000),
         request_timeout=_int("FLAIR_TIMEOUT", 300),
         stream=_bool("FLAIR_STREAM", True),
+        ca_bundle=Path(ca_bundle).expanduser().resolve() if ca_bundle else None,
         max_steps=_int("FLAIR_MAX_STEPS", 60),
         explorer_max_steps=_int("FLAIR_EXPLORER_MAX_STEPS", 20),
         think_steps=_think_steps(),

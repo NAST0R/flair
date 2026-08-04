@@ -24,6 +24,7 @@ import json
 import logging
 import random
 import re
+import ssl
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable
@@ -53,6 +54,7 @@ try:
     import httpx
     _HTTPX_TRANSIENT: tuple[type[Exception], ...] = (httpx.TransportError,)
 except Exception:  # pragma: no cover
+    httpx = None  # type: ignore[assignment]
     _HTTPX_TRANSIENT = ()
 
 log = logging.getLogger(__name__)
@@ -235,6 +237,23 @@ class _StreamInterrupted(Exception):
         self.original = original
 
 
+def _build_http_client(cfg):
+    """Client HTTP esplicito SOLO quando serve un CA bundle privato (FLAIR_CA_BUNDLE):
+    endpoint self-hosted con certificato self-signed (llama-server --ssl-*) o reti
+    con TLS inspection che ri-firmano il traffico. Il certificato deve avere IP o
+    hostname dell'endpoint nel subjectAltName. Si costruisce un SSLContext esplicito
+    perché httpx >= 0.28 ha rimosso il supporto a SSL_CERT_FILE e a verify=<path>.
+    Senza bundle ritorna None: l'SDK crea il suo client di default e il percorso
+    resta IDENTICO a prima (zero regressioni). Il timeout è impostato anche qui,
+    oltre che sull'SDK, così vale qualunque dei due abbia la precedenza."""
+    if not getattr(cfg, "ca_bundle", None):
+        return None
+    if httpx is None:  # pragma: no cover — openai dipende da httpx; solo prudenza
+        raise RuntimeError("FLAIR_CA_BUNDLE requires the httpx package (installed with openai).")
+    ctx = ssl.create_default_context(cafile=str(cfg.ca_bundle))
+    return httpx.Client(verify=ctx, timeout=cfg.request_timeout)
+
+
 class OpenAICompatProvider(LLMProvider):
     """Provider per qualsiasi backend compatibile OpenAI Chat Completions."""
 
@@ -245,7 +264,8 @@ class OpenAICompatProvider(LLMProvider):
     def __init__(self, cfg) -> None:
         self.cfg = cfg
         pc = cfg.active
-        self._client = OpenAI(api_key=pc.api_key, base_url=pc.base_url, timeout=cfg.request_timeout)
+        self._client = OpenAI(api_key=pc.api_key, base_url=pc.base_url,
+                              timeout=cfg.request_timeout, http_client=_build_http_client(cfg))
 
     def is_reasoning_model(self, model: str) -> bool:
         return bool(self.reasoning_regex and self.reasoning_regex.search(model))

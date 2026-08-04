@@ -104,6 +104,7 @@ LOCAL_BASE_URL=http://127.0.0.1:8001/v1
 LOCAL_MODEL=qwen3.6-27b            # display name; llama-server ignores it
 # LOCAL_TEMPERATURE=               # unset = the server's sampling wins (recommended)
 # With a 64K server context, align flair: FLAIR_CONTEXT_WINDOW=60000
+# FLAIR_CA_BUNDLE=C:\certs\ca.pem  # PEM trusted for TLS (self-signed HTTPS endpoints)
 
 FLAIR_ROOT=.                       # working root for the coding agent
 FLAIR_AUTO_APPROVE=false           # confirmation for destructive tools

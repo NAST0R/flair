@@ -2761,6 +2761,7 @@ def test_reasoning_regimes():
 def test_cost_attribution():
     import os as _os
 
+    import flair.config as _fc
     from flair.config import price_for
     from flair.llm.base import Usage, _usage_cost
     from flair.llm.deepseek import DeepSeekProvider
@@ -2769,52 +2770,60 @@ def test_cost_attribution():
     for k in ("FLAIR_PRICE_CACHE_HIT", "FLAIR_PRICE_CACHE_MISS", "FLAIR_PRICE_OUTPUT"):
         _os.environ.pop(k, None)
 
-    # ── price_for: listino del modello indicato, non del modello attivo ──────
-    check("costi: price_for distingue flash e pro",
-          price_for("deepseek", "deepseek-v4-flash") == (0.0028, 0.14, 0.28)
-          and price_for("deepseek", "deepseek-v4-pro") == (0.003625, 0.435, 0.87))
-    _os.environ["FLAIR_PRICE_CACHE_MISS"] = "9.9"
-    check("costi: override env vince campo per campo, su ogni modello",
-          price_for("deepseek", "deepseek-v4-pro")[1] == 9.9
-          and price_for("deepseek", "deepseek-v4-flash")[1] == 9.9
-          and price_for("deepseek", "deepseek-v4-pro")[2] == 0.87)
-    _os.environ.pop("FLAIR_PRICE_CACHE_MISS", None)
+    # Fascia FORZATA a off-peak: senza, le asserzioni sui numeri dipenderebbero
+    # dall'orologio del runner (il listino DeepSeek è a fasce orarie dal 2026-08).
+    real_peak = _fc.is_peak_hour
+    _fc.is_peak_hour = lambda when=None: False
+    try:
+        # ── price_for: listino del modello indicato, non del modello attivo ──
+        check("costi: price_for distingue flash e pro",
+              price_for("deepseek", "deepseek-v4-flash") == (0.007, 0.22, 0.66)
+              and price_for("deepseek", "deepseek-v4-pro") == (0.022, 0.66, 1.98))
+        _os.environ["FLAIR_PRICE_CACHE_MISS"] = "9.9"
+        check("costi: override env vince campo per campo, su ogni modello",
+              price_for("deepseek", "deepseek-v4-pro")[1] == 9.9
+              and price_for("deepseek", "deepseek-v4-flash")[1] == 9.9
+              and price_for("deepseek", "deepseek-v4-pro")[2] == 1.98)
+        _os.environ.pop("FLAIR_PRICE_CACHE_MISS", None)
 
-    # ── Usage: il costo si somma come i token ────────────────────────────────
-    a = Usage(prompt_tokens=10, cost_usd=0.5)
-    b = Usage(prompt_tokens=5, cost_usd=0.25)
-    check("costi: __add__ somma cost_usd", (a + b).cost_usd == 0.75)
-    check("costi: default 0.0 (nessuna attribuzione)", Usage().cost_usd == 0.0)
+        # ── Usage: il costo si somma come i token ────────────────────────────
+        a = Usage(prompt_tokens=10, cost_usd=0.5)
+        b = Usage(prompt_tokens=5, cost_usd=0.25)
+        check("costi: __add__ somma cost_usd", (a + b).cost_usd == 0.75)
+        check("costi: default 0.0 (nessuna attribuzione)", Usage().cost_usd == 0.0)
 
-    # ── _request_cost: la stessa Usage costa diverso su flash e su pro ───────
-    cfgd = load_config()
-    cfgd.provider = "deepseek"
-    ds = DeepSeekProvider(cfgd)
-    u = Usage(prompt_tokens=1_000_000, completion_tokens=1_000_000,
-              cache_hit_tokens=0, cache_miss_tokens=1_000_000)
-    flash = ds._request_cost(u, "deepseek-v4-flash")
-    pro = ds._request_cost(u, "deepseek-v4-pro")
-    check("costi: richiesta prezzata col modello reale (flash)", abs(flash - (0.14 + 0.28)) < 1e-9, flash)
-    check("costi: richiesta prezzata col modello reale (pro)", abs(pro - (0.435 + 0.87)) < 1e-9, pro)
+        # ── _request_cost: la stessa Usage costa diverso su flash e su pro ───
+        cfgd = load_config()
+        cfgd.provider = "deepseek"
+        ds = DeepSeekProvider(cfgd)
+        u = Usage(prompt_tokens=1_000_000, completion_tokens=1_000_000,
+                  cache_hit_tokens=0, cache_miss_tokens=1_000_000)
+        flash = ds._request_cost(u, "deepseek-v4-flash")
+        pro = ds._request_cost(u, "deepseek-v4-pro")
+        check("costi: richiesta prezzata col modello reale (flash)", abs(flash - (0.22 + 0.66)) < 1e-9, flash)
+        check("costi: richiesta prezzata col modello reale (pro)", abs(pro - (0.66 + 1.98)) < 1e-9, pro)
 
-    # ── estimate_cost: preferisce l'accumulato, ricade sull'aggregato ────────
-    attributed = Usage(prompt_tokens=1_000_000, cache_miss_tokens=1_000_000, cost_usd=1.234)
-    check("costi: estimate_cost usa l'accumulato quando c'è",
-          ds.estimate_cost(attributed, cfgd) == 1.234)
-    legacy = Usage(prompt_tokens=1_000_000, cache_miss_tokens=1_000_000)
-    expected = _usage_cost(legacy, cfgd.price_cache_hit, cfgd.price_cache_miss, cfgd.price_output)
-    check("costi: senza attribuzione ricade sul listino unico (retrocompat)",
-          abs(ds.estimate_cost(legacy, cfgd) - expected) < 1e-12)
+        # ── estimate_cost: preferisce l'accumulato, ricade sull'aggregato ────
+        cfgd.refresh_pricing()   # snapshot con la fascia forzata: deterministico
+        attributed = Usage(prompt_tokens=1_000_000, cache_miss_tokens=1_000_000, cost_usd=1.234)
+        check("costi: estimate_cost usa l'accumulato quando c'è",
+              ds.estimate_cost(attributed, cfgd) == 1.234)
+        legacy = Usage(prompt_tokens=1_000_000, cache_miss_tokens=1_000_000)
+        expected = _usage_cost(legacy, cfgd.price_cache_hit, cfgd.price_cache_miss, cfgd.price_output)
+        check("costi: senza attribuzione ricade sul listino unico (retrocompat)",
+              abs(ds.estimate_cost(legacy, cfgd) - expected) < 1e-12)
 
-    # ── il caso che ha motivato il fix: turno misto flash+pro ────────────────
-    step_pro = Usage(cache_miss_tokens=100_000, completion_tokens=10_000)
-    step_pro.cost_usd = ds._request_cost(step_pro, "deepseek-v4-pro")
-    step_flash = Usage(cache_miss_tokens=100_000, completion_tokens=10_000)
-    step_flash.cost_usd = ds._request_cost(step_flash, "deepseek-v4-flash")
-    turn = step_pro + step_flash
-    check("costi: turno misto = somma dei listini reali (non 2x flash)",
-          abs(ds.estimate_cost(turn, cfgd) - (step_pro.cost_usd + step_flash.cost_usd)) < 1e-12
-          and turn.cost_usd > 2 * step_flash.cost_usd)
+        # ── il caso che ha motivato il fix: turno misto flash+pro ────────────
+        step_pro = Usage(cache_miss_tokens=100_000, completion_tokens=10_000)
+        step_pro.cost_usd = ds._request_cost(step_pro, "deepseek-v4-pro")
+        step_flash = Usage(cache_miss_tokens=100_000, completion_tokens=10_000)
+        step_flash.cost_usd = ds._request_cost(step_flash, "deepseek-v4-flash")
+        turn = step_pro + step_flash
+        check("costi: turno misto = somma dei listini reali (non 2x flash)",
+              abs(ds.estimate_cost(turn, cfgd) - (step_pro.cost_usd + step_flash.cost_usd)) < 1e-12
+              and turn.cost_usd > 2 * step_flash.cost_usd)
+    finally:
+        _fc.is_peak_hour = real_peak
 
 
 def test_english_surface():
@@ -3541,6 +3550,97 @@ def test_ca_bundle():
         shutil.rmtree(d, ignore_errors=True)
 
 
+def test_pricing_bands():
+    """Listino a fasce orarie (DeepSeek, dal 2026-08-16): peak 01:00-04:00 e
+    06:00-10:00 UTC a 2x dell'off-peak. Ogni richiesta è prezzata nella SUA
+    fascia; i listini senza fasce (OpenAI, local) restano piatti a ogni ora."""
+    import os as _os
+    from datetime import datetime as _dt
+    from datetime import timedelta as _td
+    from datetime import timezone as _tz
+
+    import flair.config as _fc
+    from flair.config import is_peak_hour, price_for, resolve_pricing
+
+    for k in ("FLAIR_PRICE_CACHE_HIT", "FLAIR_PRICE_CACHE_MISS", "FLAIR_PRICE_OUTPUT",
+              "FLAIR_PRICE_CACHE_HIT_PEAK", "FLAIR_PRICE_CACHE_MISS_PEAK", "FLAIR_PRICE_OUTPUT_PEAK"):
+        _os.environ.pop(k, None)
+
+    def utc(h, m=0):
+        return _dt(2026, 8, 17, h, m, tzinfo=_tz.utc)
+
+    # ── Bordi delle fasce: inizio incluso, fine esclusa ──────────────────────
+    for h, m, exp in ((0, 59, False), (1, 0, True), (3, 59, True), (4, 0, False),
+                      (5, 59, False), (6, 0, True), (9, 59, True), (10, 0, False),
+                      (12, 0, False), (23, 59, False)):
+        check(f"fasce: {h:02d}:{m:02d} UTC → {'peak' if exp else 'off-peak'}",
+              is_peak_hour(utc(h, m)) is exp)
+    # Naive = UTC; aware in altri fusi viene convertito (11:00 CEST = 09:00 UTC).
+    check("fasce: datetime naive interpretato come UTC",
+          is_peak_hour(_dt(2026, 8, 17, 7, 30)) is True)
+    cest = _tz(_td(hours=2))
+    check("fasce: tz-aware convertito in UTC (11:00 CEST → peak)",
+          is_peak_hour(_dt(2026, 8, 17, 11, 0, tzinfo=cest)) is True
+          and is_peak_hour(_dt(2026, 8, 17, 13, 0, tzinfo=cest)) is False)
+
+    # ── resolve_pricing: fascia giusta per la famiglia DeepSeek ──────────────
+    off, peak = utc(12), utc(7)
+    check("fasce: flash off-peak", resolve_pricing("deepseek", "deepseek-v4-flash", off) == (0.007, 0.22, 0.66))
+    check("fasce: flash peak = 2x", resolve_pricing("deepseek", "deepseek-v4-flash", peak) == (0.014, 0.44, 1.32))
+    check("fasce: pro off-peak", resolve_pricing("deepseek", "deepseek-v4-pro", off) == (0.022, 0.66, 1.98))
+    check("fasce: pro peak = 2x", resolve_pricing("deepseek", "deepseek-v4-pro", peak) == (0.044, 1.32, 3.96))
+    check("fasce: prefisso più lungo vince anche in peak",
+          resolve_pricing("deepseek", "deepseek-v4-pro-0813", peak) == (0.044, 1.32, 3.96))
+    check("fasce: fallback provider deepseek segue la fascia",
+          resolve_pricing("deepseek", "sconosciuto", off) == (0.007, 0.22, 0.66)
+          and resolve_pricing("deepseek", "sconosciuto", peak) == (0.014, 0.44, 1.32))
+
+    # ── I listini senza fasce restano piatti in ogni ora ─────────────────────
+    check("fasce: openai piatto a ogni ora",
+          resolve_pricing("openai", "gpt-4.1-mini", off) == resolve_pricing("openai", "gpt-4.1-mini", peak)
+          == (0.10, 0.40, 1.60))
+    check("fasce: local piatto (zero) a ogni ora",
+          resolve_pricing("local", "qwen", off) == resolve_pricing("local", "qwen", peak) == (0.0, 0.0, 0.0))
+    # Nomi con prefisso vendor (reseller): niente match → fallback piatto, MAI il peak ufficiale.
+    check("fasce: slug reseller non eredita le fasce del listino ufficiale",
+          resolve_pricing("openai", "deepseek/deepseek-v4-flash", peak) == (0.075, 0.15, 0.60))
+
+    # ── Override env: FLAIR_PRICE_* ovunque, *_PEAK vince solo in fascia alta ─
+    _os.environ["FLAIR_PRICE_OUTPUT"] = "5.0"
+    _os.environ["FLAIR_PRICE_OUTPUT_PEAK"] = "7.0"
+    try:
+        check("fasce: override piatto vale in off-peak",
+              price_for("deepseek", "deepseek-v4-flash", off)[2] == 5.0)
+        check("fasce: override _PEAK vince in peak",
+              price_for("deepseek", "deepseek-v4-flash", peak)[2] == 7.0)
+        _os.environ.pop("FLAIR_PRICE_OUTPUT_PEAK", None)
+        check("fasce: senza _PEAK l'override piatto vale anche in peak",
+              price_for("deepseek", "deepseek-v4-flash", peak)[2] == 5.0)
+    finally:
+        for k in ("FLAIR_PRICE_OUTPUT", "FLAIR_PRICE_OUTPUT_PEAK"):
+            _os.environ.pop(k, None)
+
+    # ── Attribuzione a request-time: _request_cost segue la fascia corrente ──
+    import os as _os2
+    _os2.environ["DEEPSEEK_API_KEY"] = "sk-test"
+    from flair.llm.base import Usage
+    from flair.llm.deepseek import DeepSeekProvider
+    cfgd = load_config()
+    cfgd.provider = "deepseek"
+    ds = DeepSeekProvider(cfgd)
+    u = Usage(prompt_tokens=1_000_000, completion_tokens=1_000_000, cache_miss_tokens=1_000_000)
+    real_peak = _fc.is_peak_hour
+    try:
+        _fc.is_peak_hour = lambda when=None: False
+        low = ds._request_cost(u, "deepseek-v4-flash")
+        _fc.is_peak_hour = lambda when=None: True
+        high = ds._request_cost(u, "deepseek-v4-flash")
+    finally:
+        _fc.is_peak_hour = real_peak
+    check("fasce: la STESSA richiesta costa 2x in peak (attribuzione a request-time)",
+          abs(low - (0.22 + 0.66)) < 1e-9 and abs(high - (0.44 + 1.32)) < 1e-9 and abs(high - 2 * low) < 1e-9)
+
+
 def main():
     test_arg_parse()
     test_usage_normalization()
@@ -3625,6 +3725,7 @@ def main():
     test_provider_switch_ctx()
     test_cli_parser_local()
     test_ca_bundle()
+    test_pricing_bands()
     test_evals_harness()
     print(f"\nTUTTI I {len(PASS)} TEST PASSATI ✅")
 

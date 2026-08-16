@@ -225,7 +225,7 @@ For unattended runs prefer **stateless** invocations (no `--session`): two sched
 
 **Session logging.** With `--log <folder>` (or `FLAIR_LOG_DIR`) every turn is written to `session-<timestamp>.jsonl` (task, response, tools used, usage) and internal events to `flair.log` — useful to analyze where tokens go.
 
-**Model-aware cost tracking + budget warning.** Every request is priced with the rates of the model that actually served it (fast and thinking steps in the same turn are each billed correctly — validated against the provider dashboard) and accumulated into the displayed cost; the price table is overridable via `FLAIR_PRICE_*`, and the `FLAIR_MAX_COST` hard cap brakes on this real spend. Set `FLAIR_COST_WARN=<usd>` to get a one-time warning when a session's estimated cost crosses that threshold.
+**Model-aware cost tracking + budget warning.** Every request is priced with the rates of the model that actually served it (fast and thinking steps in the same turn are each billed correctly — validated against the provider dashboard) and accumulated into the displayed cost; since DeepSeek's 2026-08 peak/off-peak billing, each request is also priced in its own time band (peak = 01:00-04:00 and 06:00-10:00 UTC at 2x). The price table is overridable via `FLAIR_PRICE_*` (plus `FLAIR_PRICE_*_PEAK` for the peak band), and the `FLAIR_MAX_COST` hard cap brakes on this real spend. Set `FLAIR_COST_WARN=<usd>` to get a one-time warning when a session's estimated cost crosses that threshold.
 
 ---
 

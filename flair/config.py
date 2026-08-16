@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 try:
@@ -41,15 +42,20 @@ def _float(name: str, default: float) -> float:
 # Prezzi indicativi (USD per 1M token: cache-hit, input/cache-miss, output).
 # Sono STIME e cambiano spesso: servono solo a mostrare un costo approssimato e
 # sono sovrascrivibili via env (FLAIR_PRICE_*). Match per prefisso del nome.
+#
+# Dal 2026-08-16 (16:00 UTC) l'API ufficiale DeepSeek fattura per FASCE ORARIE:
+# questa tabella è il listino OFF-PEAK (la base); le varianti PEAK (= 2x) vivono
+# in MODEL_PRICING_PEAK e vengono selezionate da resolve_pricing in base all'ora
+# UTC della richiesta. I listini senza fasce (OpenAI, local) restano piatti.
 MODEL_PRICING: dict[str, tuple[float, float, float]] = {
-    # DeepSeek (USD/1M: cache-hit, input, output). V4-flash è il workhorse;
-    # V4-pro il reasoner di punta. Gli alias chat/reasoner mappano su V4-flash.
-    # Fonte: api-docs.deepseek.com/quick_start/pricing (verificati 2026-07-13).
-    "deepseek-v4-flash": (0.0028, 0.14, 0.28),
-    "deepseek-v4-pro": (0.003625, 0.435, 0.87),
-    "deepseek-chat": (0.0028, 0.14, 0.28),
-    "deepseek-reasoner": (0.0028, 0.14, 0.28),
-    "deepseek-v4": (0.0028, 0.14, 0.28),
+    # DeepSeek (USD/1M: cache-hit, input, output), listino OFF-PEAK. V4-flash è
+    # il workhorse; V4-pro il reasoner di punta. Gli alias legacy mappano su flash.
+    # Fonte: api-docs.deepseek.com/quick_start/pricing (verificati 2026-08-17).
+    "deepseek-v4-flash": (0.007, 0.22, 0.66),
+    "deepseek-v4-pro": (0.022, 0.66, 1.98),
+    "deepseek-chat": (0.007, 0.22, 0.66),
+    "deepseek-reasoner": (0.007, 0.22, 0.66),
+    "deepseek-v4": (0.007, 0.22, 0.66),
     # OpenAI (approssimati, USD/1M; verificati 2026-07, sovrascrivibili via env)
     "gpt-4.1-nano": (0.025, 0.10, 0.40),
     "gpt-4.1-mini": (0.10, 0.40, 1.60),
@@ -68,34 +74,81 @@ MODEL_PRICING: dict[str, tuple[float, float, float]] = {
     "o3-mini": (0.55, 1.10, 4.40),
     "o3": (0.50, 2.00, 8.00),
 }
+# Varianti PEAK (esattamente 2x l'off-peak, dal listino ufficiale). Solo i
+# listini a fasce hanno una voce qui; chi manca resta piatto in ogni ora.
+# Nota: vale per l'API ufficiale — i reseller (OpenRouter e simili) usano nomi
+# con prefisso vendor che non matchano queste chiavi, e correttamente ricadono
+# sul fallback piatto del provider.
+MODEL_PRICING_PEAK: dict[str, tuple[float, float, float]] = {
+    "deepseek-v4-flash": (0.014, 0.44, 1.32),
+    "deepseek-v4-pro": (0.044, 1.32, 3.96),
+    "deepseek-chat": (0.014, 0.44, 1.32),
+    "deepseek-reasoner": (0.014, 0.44, 1.32),
+    "deepseek-v4": (0.014, 0.44, 1.32),
+}
 _PROVIDER_FALLBACK = {
-    "deepseek": (0.0028, 0.14, 0.28),
+    "deepseek": (0.007, 0.22, 0.66),      # off-peak flash
     "openai": (0.075, 0.15, 0.60),
     "local": (0.0, 0.0, 0.0),   # inference locale: il costo vero è la bolletta
 }
+_PROVIDER_FALLBACK_PEAK = {
+    "deepseek": (0.014, 0.44, 1.32),
+}
+
+# Fasce peak del listino DeepSeek, [inizio, fine) in ore UTC. Definite in UTC
+# dal listino ufficiale — quindi immuni all'ora legale per costruzione (in
+# Italia: 03-06 e 08-12 col DST estivo, un'ora prima in inverno).
+_PEAK_RANGES_UTC: tuple[tuple[int, int], ...] = ((1, 4), (6, 10))
 
 
-def resolve_pricing(provider: str, model: str) -> tuple[float, float, float]:
+def is_peak_hour(when: datetime | None = None) -> bool:
+    """True se `when` (default: adesso) cade nelle fasce peak DeepSeek.
+    I datetime naive sono interpretati come UTC; quelli aware vengono convertiti."""
+    now = when if when is not None else datetime.now(timezone.utc)
+    if now.tzinfo is not None:
+        now = now.astimezone(timezone.utc)
+    return any(a <= now.hour < b for a, b in _PEAK_RANGES_UTC)
+
+
+def resolve_pricing(provider: str, model: str,
+                    when: datetime | None = None) -> tuple[float, float, float]:
+    """Listino per (provider, modello) nell'istante `when` (default: adesso).
+    Match per prefisso più lungo; se la chiave ha una variante peak e l'ora è
+    di fascia alta, vince quella. Chiamata a request-time dall'attribuzione
+    costi, quindi ogni richiesta è prezzata nella SUA fascia oraria."""
     m = model.lower()
-    best: tuple[float, float, float] | None = None
+    best_key: str | None = None
     best_len = -1
-    for key, price in MODEL_PRICING.items():
+    for key in MODEL_PRICING:
         if m.startswith(key) and len(key) > best_len:
-            best, best_len = price, len(key)
-    return best or _PROVIDER_FALLBACK.get(provider, _PROVIDER_FALLBACK["deepseek"])
+            best_key, best_len = key, len(key)
+    peak = is_peak_hour(when)
+    if best_key is not None:
+        if peak and best_key in MODEL_PRICING_PEAK:
+            return MODEL_PRICING_PEAK[best_key]
+        return MODEL_PRICING[best_key]
+    if peak and provider in _PROVIDER_FALLBACK_PEAK:
+        return _PROVIDER_FALLBACK_PEAK[provider]
+    return _PROVIDER_FALLBACK.get(provider, _PROVIDER_FALLBACK["deepseek"])
 
 
-def price_for(provider: str, model: str) -> tuple[float, float, float]:
-    """Prezzi effettivi per UNA richiesta: listino del modello indicato, con gli
-    override FLAIR_PRICE_* (anche parziali) sempre vincenti. Serve all'attribuzione
-    dei costi per-richiesta: in un turno --think (o con FLAIR_THINK_STEPS=all) si
-    alternano fast e thinking, e un listino unico sottostimerebbe il reasoner."""
-    hit, miss, out = resolve_pricing(provider, model)
-    return (
-        _float("FLAIR_PRICE_CACHE_HIT", hit),
-        _float("FLAIR_PRICE_CACHE_MISS", miss),
-        _float("FLAIR_PRICE_OUTPUT", out),
-    )
+def price_for(provider: str, model: str,
+              when: datetime | None = None) -> tuple[float, float, float]:
+    """Prezzi effettivi per UNA richiesta: listino del modello indicato nella
+    fascia oraria corrente, con gli override env sempre vincenti campo per campo.
+    In fascia peak vale la catena FLAIR_PRICE_*_PEAK > FLAIR_PRICE_* > listino
+    peak; in off-peak FLAIR_PRICE_* > listino base (retrocompatibile). Serve
+    all'attribuzione dei costi per-richiesta: in un turno --think si alternano
+    fast e thinking, e un listino unico sottostimerebbe il reasoner."""
+    hit, miss, out = resolve_pricing(provider, model, when)
+    hit = _float("FLAIR_PRICE_CACHE_HIT", hit)
+    miss = _float("FLAIR_PRICE_CACHE_MISS", miss)
+    out = _float("FLAIR_PRICE_OUTPUT", out)
+    if is_peak_hour(when):
+        hit = _float("FLAIR_PRICE_CACHE_HIT_PEAK", hit)
+        miss = _float("FLAIR_PRICE_CACHE_MISS_PEAK", miss)
+        out = _float("FLAIR_PRICE_OUTPUT_PEAK", out)
+    return (hit, miss, out)
 
 
 # Nomi dei file di istruzioni di progetto caricati nel prompt dell'agente coding.
@@ -200,7 +253,9 @@ class Config:
 
     def refresh_pricing(self) -> None:
         """Riallinea i prezzi al modello attivo; gli override via env (anche di un
-        singolo campo) hanno la precedenza."""
+        singolo campo) hanno la precedenza. NOTA: è uno snapshot della fascia
+        oraria del momento — serve solo da fallback per Usage senza attribuzione;
+        il costo autorevole è quello per-richiesta (price_for a request-time)."""
         hit, miss, out = resolve_pricing(self.provider, self.active.model)
         self.price_cache_hit = _float("FLAIR_PRICE_CACHE_HIT", hit)
         self.price_cache_miss = _float("FLAIR_PRICE_CACHE_MISS", miss)

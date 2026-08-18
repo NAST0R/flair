@@ -3602,9 +3602,13 @@ def test_pricing_bands():
           == (0.10, 0.40, 1.60))
     check("fasce: local piatto (zero) a ogni ora",
           resolve_pricing("local", "qwen", off) == resolve_pricing("local", "qwen", peak) == (0.0, 0.0, 0.0))
-    # Nomi con prefisso vendor (reseller): niente match → fallback piatto, MAI il peak ufficiale.
-    check("fasce: slug reseller non eredita le fasce del listino ufficiale",
-          resolve_pricing("openai", "deepseek/deepseek-v4-flash", peak) == (0.075, 0.15, 0.60))
+    # Slug con prefisso vendor (reseller): NORMALIZZATI alla famiglia giusta, ma le
+    # fasce restano un attributo dell'endpoint UFFICIALE — chi compra da terzi passa
+    # banded=False (lo decide il provider dal proprio endpoint) e ottiene il listino
+    # base anche in ora peak.
+    check("fasce: slug reseller → famiglia giusta, flat con banded=False",
+          resolve_pricing("openai", "deepseek/deepseek-v4-flash", peak, banded=False) == (0.007, 0.22, 0.66)
+          and resolve_pricing("deepseek", "deepseek-ai/DeepSeek-V4-Pro-0813", peak, banded=False) == (0.022, 0.66, 1.98))
 
     # ── Override env: FLAIR_PRICE_* ovunque, *_PEAK vince solo in fascia alta ─
     _os.environ["FLAIR_PRICE_OUTPUT"] = "5.0"
@@ -3837,6 +3841,128 @@ def test_cache_breaks_counter():
     check("breaks: reset azzera", convo.cache_breaks == 0)
 
 
+def test_deepseek_endpoint_profiles():
+    """Lo slot deepseek si adatta all'ENDPOINT: first-party (api.deepseek.com) =
+    protocollo completo, byte-identico a prima; host terzi = profilo standard-compat
+    (reasoning spogliato, niente extra_body, listino flat). Override esplicito con
+    FLAIR_DEEPSEEK_FIRST_PARTY; retry una-tantum se un endpoint rigetta il passback."""
+    import os as _os
+
+    import flair.config as _fc
+    from flair.config import deepseek_first_party
+
+    _os.environ["DEEPSEEK_API_KEY"] = "sk-test"
+    for k in ("FLAIR_DEEPSEEK_FIRST_PARTY", "FLAIR_PRICE_CACHE_HIT",
+              "FLAIR_PRICE_CACHE_MISS", "FLAIR_PRICE_OUTPUT"):
+        _os.environ.pop(k, None)
+
+    # ── Rilevamento: hostname esatto, mai substring, override tri-stato ───────
+    check("profili: ufficiale riconosciuto", deepseek_first_party("https://api.deepseek.com/v1") is True)
+    check("profili: host terzo riconosciuto", deepseek_first_party("https://api.deepinfra.com/v1/openai") is False)
+    check("profili: OpenRouter riconosciuto come terzo", deepseek_first_party("https://openrouter.ai/api/v1") is False)
+    check("profili: niente match substring (host ostile)",
+          deepseek_first_party("https://api.deepseek.com.evil.io/v1") is False)
+    check("profili: URL vuoto → terzo (prudente)", deepseek_first_party("") is False)
+    _os.environ["FLAIR_DEEPSEEK_FIRST_PARTY"] = "false"
+    try:
+        check("profili: override false vince sull'ufficiale",
+              deepseek_first_party("https://api.deepseek.com/v1") is False)
+        _os.environ["FLAIR_DEEPSEEK_FIRST_PARTY"] = "true"
+        check("profili: override true vince sul terzo (proxy interno, dominio futuro)",
+              deepseek_first_party("https://api.deepinfra.com/v1/openai") is True)
+    finally:
+        _os.environ.pop("FLAIR_DEEPSEEK_FIRST_PARTY", None)
+
+    # ── First-party: protocollo completo (l'invariante che non deve muoversi) ─
+    cfg = cfg_for(Path("."))
+    cfg.provider = "deepseek"
+    ds = DeepSeekProvider(cfg)
+    check("profili: first-party → passback e fasce attivi",
+          ds.first_party is True and ds.keeps_reasoning_history is True and ds.banded_pricing is True)
+
+    # ── Terzi: profilo standard-compat, cambiando SOLO endpoint e slug ────────
+    cfg2 = cfg_for(Path("."))
+    cfg2.provider = "deepseek"
+    cfg2.deepseek.base_url = "https://api.deepinfra.com/v1/openai"
+    cfg2.deepseek.model = "deepseek-ai/DeepSeek-V4-Flash-0731"
+    cfg2.deepseek.think_model = "deepseek-ai/DeepSeek-V4-Pro-0813"
+    dc = DeepSeekProvider(cfg2)
+    check("profili: terzi → passback e fasce spenti",
+          dc.first_party is False and dc.keeps_reasoning_history is False and dc.banded_pricing is False)
+
+    msgs = [{"role": "user", "content": "ciao"},
+            {"role": "assistant", "content": "ok", "reasoning_content": "thinking..."},
+            {"role": "user", "content": "vai"}]
+    rec = _wire(dc)
+    dc.complete(msgs, think=True)
+    check("profili: terzi → niente estensioni proprietarie neanche con --think",
+          "extra_body" not in rec.kwargs and "reasoning_effort" not in rec.kwargs, str(rec.kwargs))
+    check("profili: terzi → --think = switch di modello (slug vendor)",
+          rec.kwargs["model"] == "deepseek-ai/DeepSeek-V4-Pro-0813")
+    check("profili: terzi → reasoning spogliato a request-time",
+          all("reasoning_content" not in m for m in rec.kwargs["messages"]))
+    check("profili: terzi → la cronologia condivisa NON è mutata",
+          msgs[1].get("reasoning_content") == "thinking...")
+    check("profili: terzi → temperature (standard) sempre inviata", "temperature" in rec.kwargs)
+
+    # ── Override true + slug vendor: protocollo completo aggancia lo slug ─────
+    _os.environ["FLAIR_DEEPSEEK_FIRST_PARTY"] = "true"
+    try:
+        df = DeepSeekProvider(cfg2)
+        rec2 = _wire(df)
+        df.complete(msgs, think=True)
+        check("profili: first-party forzato → extra_body anche con slug vendor",
+              rec2.kwargs.get("extra_body") == {"thinking": {"type": "enabled"}}, str(rec2.kwargs.get("extra_body")))
+        check("profili: first-party forzato → passback presente",
+              any("reasoning_content" in m for m in rec2.kwargs["messages"]))
+    finally:
+        _os.environ.pop("FLAIR_DEEPSEEK_FIRST_PARTY", None)
+
+    # ── Prezzi: terzi flat anche in ora peak; ufficiale a fasce ───────────────
+    real_peak = _fc.is_peak_hour
+    _fc.is_peak_hour = lambda when=None: True
+    try:
+        u = Usage(prompt_tokens=1_000_000, completion_tokens=1_000_000, cache_miss_tokens=1_000_000)
+        check("profili: richiesta sui terzi prezzata flat anche in peak",
+              abs(dc._request_cost(u, "deepseek-ai/DeepSeek-V4-Flash-0731") - (0.22 + 0.66)) < 1e-9)
+        check("profili: richiesta first-party prezzata in fascia (2x)",
+              abs(ds._request_cost(u, "deepseek-v4-flash") - (0.44 + 1.32)) < 1e-9)
+        cfg2.refresh_pricing()
+        check("profili: snapshot prezzi flat sui terzi (peak ignorato)",
+              (cfg2.price_cache_hit, cfg2.price_cache_miss, cfg2.price_output) == (0.007, 0.22, 0.66))
+        cfg.refresh_pricing()
+        check("profili: snapshot prezzi a fasce sull'ufficiale",
+              (cfg.price_cache_hit, cfg.price_cache_miss, cfg.price_output) == (0.014, 0.44, 1.32))
+    finally:
+        _fc.is_peak_hour = real_peak
+
+    # ── Cintura: endpoint che rigetta il passback → retry compat una-tantum ───
+    cfg3 = cfg_for(Path("."))
+    cfg3.provider = "deepseek"
+    ds3 = DeepSeekProvider(cfg3)
+    check("profili: precondizione retry, passback attivo", ds3.keeps_reasoning_history is True)
+    reject = BadRequestError("unknown field 'reasoning_content' in messages",
+                             response=httpx.Response(400, request=httpx.Request("POST", "https://x")), body=None)
+    rec3 = _wire(ds3, [reject, _fake_response()])
+    resp = ds3.complete(msgs, think=False)
+    check("profili: retry avvenuto (due chiamate)", rec3.calls == 2, rec3.calls)
+    check("profili: dopo il rigetto il profilo resta compat", ds3.keeps_reasoning_history is False)
+    check("profili: la seconda richiesta parte spogliata",
+          all("reasoning_content" not in m for m in rec3.kwargs["messages"]))
+    check("profili: risposta consegnata", resp.content is not None)
+    # Un 400 QUALSIASI (es. overflow) non innesca il retry: si propaga subito.
+    ds4 = DeepSeekProvider(cfg3)
+    overflow = BadRequestError("maximum context length exceeded",
+                               response=httpx.Response(400, request=httpx.Request("POST", "https://x")), body=None)
+    _wire(ds4, overflow)
+    raised = False
+    try:
+        ds4.complete(msgs, think=False)
+    except BadRequestError:
+        raised = True
+    check("profili: 400 generico propagato senza retry", raised and ds4.keeps_reasoning_history is True)
+
+
 def main():
     test_arg_parse()
     test_usage_normalization()
@@ -3917,6 +4043,7 @@ def main():
     test_cache_friendly_summary()
     test_prune_hysteresis()
     test_cache_breaks_counter()
+    test_deepseek_endpoint_profiles()
     test_budget_abort()
     test_read_only_mode()
     test_automation_helpers()

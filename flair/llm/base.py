@@ -275,6 +275,9 @@ class OpenAICompatProvider(LLMProvider):
     # il campo viene rimosso a request-time (copiando SOLO i dict interessati:
     # la cronologia condivisa non viene mai mutata).
     keeps_reasoning_history: bool = False
+    # Le fasce orarie peak/off-peak sono un attributo del listino UFFICIALE
+    # DeepSeek: solo quel provider (su quell'endpoint) le attiva. Default: flat.
+    banded_pricing: bool = False
 
     def _build_params(self, messages, tools, think, max_tokens) -> dict[str, Any]:
         pc = self.cfg.active
@@ -346,8 +349,10 @@ class OpenAICompatProvider(LLMProvider):
 
     def _request_cost(self, usage: Usage, model: str) -> float:
         """Costo della SINGOLA richiesta, coi prezzi del modello che l'ha servita
-        (gli override FLAIR_PRICE_* mantengono la precedenza, campo per campo)."""
-        hit, miss, out = price_for(self.cfg.provider, model)
+        (gli override FLAIR_PRICE_* mantengono la precedenza, campo per campo).
+        Le fasce orarie si applicano solo se il provider compra dal listino che
+        le ha (banded_pricing): i terzi prezzano flat anche in ora peak."""
+        hit, miss, out = price_for(self.cfg.provider, model, banded=self.banded_pricing)
         return _usage_cost(usage, hit, miss, out)
 
     # ── interni ───────────────────────────────────────────────────────────

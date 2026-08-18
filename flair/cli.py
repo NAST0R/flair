@@ -253,7 +253,18 @@ class CLI:
         for a in self.agents.values():
             a.provider = self.provider
             a.ctx.provider = self.provider
+        self._announce_provider_profile()
         return True
+
+    def _announce_provider_profile(self) -> None:
+        """Il degrado a profilo compat non deve MAI essere silenzioso: se lo slot
+        deepseek punta a un endpoint terzo (o l'ufficiale cambiasse dominio senza
+        riallineare la lista host), lo si dichiara all'avvio del REPL e allo
+        switch — una riga, così una settimana di stime sballate non passa mai."""
+        if self.cfg.provider == "deepseek" and not getattr(self.provider, "first_party", True):
+            self.console.print("[dim]deepseek: third-party endpoint → compat profile (no reasoning "
+                               "passback, flat pricing — set FLAIR_PRICE_* to the host's card; "
+                               "FLAIR_DEEPSEEK_FIRST_PARTY=true to force the full protocol)[/dim]")
 
     def _refresh_memory_prompts(self) -> None:
         """(Ri)compone i system prompt: base (prompt + istruzioni di progetto) + blocco
@@ -720,6 +731,7 @@ class CLI:
             border_style="cyan", padding=(1, 2),
         ))
         self.console.print("[dim]/help for commands. Type a request (coding or general).[/dim]\n")
+        self._announce_provider_profile()
         if self.convo.messages:
             # Sessione ripresa da --session/--continue: orienta subito.
             self._print_session_recap()

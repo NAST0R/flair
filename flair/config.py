@@ -12,6 +12,7 @@ import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlparse
 
 try:
     from dotenv import load_dotenv
@@ -37,6 +38,37 @@ def _float(name: str, default: float) -> float:
         return float(os.getenv(name, str(default)))
     except ValueError:
         return default
+
+
+# Host che parlano il protocollo first-party DeepSeek (passback del reasoning,
+# thinking via extra_body, listino a fasce orarie). Tutti gli altri endpoint
+# OpenAI-compatibili che servono i pesi DeepSeek ricevono il profilo standard.
+_FIRST_PARTY_HOSTS = ("api.deepseek.com",)
+
+
+def deepseek_first_party(base_url: str | None) -> bool:
+    """True se l'endpoint parla il protocollo first-party DeepSeek. Dedotto
+    dall'HOST dell'URL (match esatto sull'hostname, MAI substring: un proxy
+    ostile 'api.deepseek.com.evil.io' non deve passare), con override esplicito
+    FLAIR_DEEPSEEK_FIRST_PARTY=true|false (default: auto). L'override copre ciò
+    che la deduzione non può conoscere — un endpoint ufficiale futuro non ancora
+    in lista, o un reverse-proxy interno davanti all'API ufficiale — così un
+    eventuale cambio di dominio si risolve con una riga di .env, zero codice."""
+    override = os.getenv("FLAIR_DEEPSEEK_FIRST_PARTY", "auto").strip().lower()
+    if override in ("true", "1", "yes"):
+        return True
+    if override in ("false", "0", "no"):
+        return False
+    host = (urlparse(base_url or "").hostname or "").lower()
+    return host in _FIRST_PARTY_HOSTS
+
+
+def _model_key(model: str) -> str:
+    """Chiave di listino dal nome modello: gli slug dei reseller portano prefisso
+    vendor e maiuscole ('deepseek-ai/DeepSeek-V4-Flash-0731') — si normalizza
+    all'ultimo segmento minuscolo; il match per prefisso digerisce da solo i
+    suffissi di versione (-0731, -0813)."""
+    return model.rsplit("/", 1)[-1].strip().lower()
 
 
 # Prezzi indicativi (USD per 1M token: cache-hit, input/cache-miss, output).
@@ -110,19 +142,21 @@ def is_peak_hour(when: datetime | None = None) -> bool:
     return any(a <= now.hour < b for a, b in _PEAK_RANGES_UTC)
 
 
-def resolve_pricing(provider: str, model: str,
-                    when: datetime | None = None) -> tuple[float, float, float]:
+def resolve_pricing(provider: str, model: str, when: datetime | None = None,
+                    banded: bool = True) -> tuple[float, float, float]:
     """Listino per (provider, modello) nell'istante `when` (default: adesso).
-    Match per prefisso più lungo; se la chiave ha una variante peak e l'ora è
-    di fascia alta, vince quella. Chiamata a request-time dall'attribuzione
-    costi, quindi ogni richiesta è prezzata nella SUA fascia oraria."""
-    m = model.lower()
+    Match per prefisso più lungo sul nome NORMALIZZATO (gli slug vendor dei
+    reseller agganciano la famiglia giusta). `banded` dice se il chiamante compra
+    dall'API ufficiale DeepSeek: le fasce peak/off-peak sono un attributo di QUEL
+    listino — i terzi prezzano flat e passano False (lo decide il provider dal
+    proprio endpoint), altrimenti in peak la stima raddoppierebbe a torto."""
+    m = _model_key(model)
     best_key: str | None = None
     best_len = -1
     for key in MODEL_PRICING:
         if m.startswith(key) and len(key) > best_len:
             best_key, best_len = key, len(key)
-    peak = is_peak_hour(when)
+    peak = banded and is_peak_hour(when)
     if best_key is not None:
         if peak and best_key in MODEL_PRICING_PEAK:
             return MODEL_PRICING_PEAK[best_key]
@@ -132,19 +166,19 @@ def resolve_pricing(provider: str, model: str,
     return _PROVIDER_FALLBACK.get(provider, _PROVIDER_FALLBACK["deepseek"])
 
 
-def price_for(provider: str, model: str,
-              when: datetime | None = None) -> tuple[float, float, float]:
+def price_for(provider: str, model: str, when: datetime | None = None,
+              banded: bool = True) -> tuple[float, float, float]:
     """Prezzi effettivi per UNA richiesta: listino del modello indicato nella
-    fascia oraria corrente, con gli override env sempre vincenti campo per campo.
-    In fascia peak vale la catena FLAIR_PRICE_*_PEAK > FLAIR_PRICE_* > listino
-    peak; in off-peak FLAIR_PRICE_* > listino base (retrocompatibile). Serve
-    all'attribuzione dei costi per-richiesta: in un turno --think si alternano
-    fast e thinking, e un listino unico sottostimerebbe il reasoner."""
-    hit, miss, out = resolve_pricing(provider, model, when)
+    fascia oraria corrente (se `banded`), con gli override env sempre vincenti
+    campo per campo. In fascia peak vale la catena FLAIR_PRICE_*_PEAK >
+    FLAIR_PRICE_* > listino peak; in off-peak (o su listini flat) FLAIR_PRICE_* >
+    listino base. Serve all'attribuzione dei costi per-richiesta: in un turno
+    --think si alternano fast e thinking, e un listino unico sottostimerebbe."""
+    hit, miss, out = resolve_pricing(provider, model, when, banded=banded)
     hit = _float("FLAIR_PRICE_CACHE_HIT", hit)
     miss = _float("FLAIR_PRICE_CACHE_MISS", miss)
     out = _float("FLAIR_PRICE_OUTPUT", out)
-    if is_peak_hour(when):
+    if banded and is_peak_hour(when):
         hit = _float("FLAIR_PRICE_CACHE_HIT_PEAK", hit)
         miss = _float("FLAIR_PRICE_CACHE_MISS_PEAK", miss)
         out = _float("FLAIR_PRICE_OUTPUT_PEAK", out)
@@ -262,7 +296,9 @@ class Config:
         singolo campo) hanno la precedenza. NOTA: è uno snapshot della fascia
         oraria del momento — serve solo da fallback per Usage senza attribuzione;
         il costo autorevole è quello per-richiesta (price_for a request-time)."""
-        hit, miss, out = resolve_pricing(self.provider, self.active.model)
+        hit, miss, out = resolve_pricing(
+            self.provider, self.active.model,
+            banded=(self.provider != "deepseek" or deepseek_first_party(self.deepseek.base_url)))
         self.price_cache_hit = _float("FLAIR_PRICE_CACHE_HIT", hit)
         self.price_cache_miss = _float("FLAIR_PRICE_CACHE_MISS", miss)
         self.price_output = _float("FLAIR_PRICE_OUTPUT", out)

@@ -206,6 +206,12 @@ class Config:
     compact_keep_recent: int = 8            # messaggi recenti tenuti integri
     compact_summary_max_tokens: int = 2000
     compact_prune: bool = True              # stadio 0: pota gli output di tool superati prima del riassunto
+    # Isteresi dello stadio 0: la potatura da sola evita il riassunto SOLO se porta
+    # il contesto sotto soglia con questo margine (frazione della finestra). La
+    # mutazione ha comunque rotto il prefisso in cache: uscire a ridosso della
+    # soglia significherebbe ricascarci in pochi step e pagare una SECONDA rottura
+    # ravvicinata — a quel punto conviene compattare subito, nello stesso respiro.
+    prune_hysteresis_ratio: float = 0.10
 
     # Filesystem / tool
     root: Path = Path(".")
@@ -337,6 +343,7 @@ def load_config() -> Config:
         compact_keep_recent=_int("FLAIR_COMPACT_KEEP", 8),
         compact_summary_max_tokens=_int("FLAIR_COMPACT_SUMMARY_MAX", 2000),
         compact_prune=_bool("FLAIR_COMPACT_PRUNE", True),
+        prune_hysteresis_ratio=_float("FLAIR_PRUNE_HYSTERESIS", 0.10),
         root=Path(os.getenv("FLAIR_ROOT", ".")).expanduser().resolve(),
         read_file_max_chars=_int("FLAIR_READ_MAX", 12000),
         grep_max_chars=_int("FLAIR_GREP_MAX", 6000),

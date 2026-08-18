@@ -38,7 +38,8 @@ class SessionLogger:
         ts = datetime.now().strftime("%Y%m%d-%H%M%S")
         self.path = log_dir / f"session-{ts}.jsonl"
 
-    def log_turn(self, agent: str, task: str, result, tool_events: list[dict]) -> None:
+    def log_turn(self, agent: str, task: str, result, tool_events: list[dict],
+                 cache_breaks: int = 0) -> None:
         usage = result.usage
         record = {
             "ts": datetime.now().isoformat(timespec="seconds"),
@@ -47,6 +48,7 @@ class SessionLogger:
             "response": _trunc(result.content or "", 4000),
             "steps": result.steps,
             "stopped_reason": result.stopped_reason,
+            "cache_breaks": cache_breaks,
             "usage": {
                 "prompt_tokens": usage.prompt_tokens,
                 "completion_tokens": usage.completion_tokens,

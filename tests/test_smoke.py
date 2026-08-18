@@ -2852,13 +2852,14 @@ def test_english_surface():
     # sfuggiti i residui di bcfef91^ (header di compaction, overflow di list_dir,
     # suffisso di explore). Si asseriscono le costanti/funzioni che li generano
     # e un output prodotto davvero, così la classe di bug resta chiusa.
-    from flair.core.agent import _COMPACT_PROMPT, _SUMMARIZE_PREAMBLE, _SUMMARY_HEADER
+    from flair.core.agent import _COMPACT_PROMPT, _SUMMARIZE_ON_PREFIX, _SUMMARIZE_PREAMBLE, _SUMMARY_HEADER
     from flair.core.prune import STUB
     from flair.tools.subagent import _footer
     runtime = {
         "header compaction": _SUMMARY_HEADER,
         "preambolo summarize": _SUMMARIZE_PREAMBLE,
         "prompt compaction": _COMPACT_PROMPT,
+        "istruzione summarize su prefisso": _SUMMARIZE_ON_PREFIX,
         "stub prune": STUB,
         "footer explore (1)": _footer(1),
         "footer explore (3)": _footer(3),
@@ -3641,6 +3642,201 @@ def test_pricing_bands():
           abs(low - (0.22 + 0.66)) < 1e-9 and abs(high - (0.44 + 1.32)) < 1e-9 and abs(high - 2 * low) < 1e-9)
 
 
+def test_cache_friendly_summary():
+    """La chiamata di riassunto riusa il prefisso in cache: [system dell'agente,
+    storia byte-identica, istruzione], con gli STESSI schemi tool del loop. Fallback
+    al render legacy su risposta anomala (tool call/vuota), su overflow del prefisso
+    e in modalità aggressive (dove il contesto è per definizione troppo grande)."""
+    from flair.core.agent import _COMPACT_PROMPT, _SUMMARIZE_ON_PREFIX, _SUMMARY_HEADER
+
+    class ToolsSpy(FakeProvider):
+        def __init__(self, script):
+            super().__init__(script)
+            self.tools_seen: list = []
+
+        def complete(self, messages, tools=None, **kw):
+            self.tools_seen.append(tools)
+            return super().complete(messages, tools=tools, **kw)
+
+    def history():
+        return [
+            {"role": "user", "content": "primo task " + "x" * 4000},
+            {"role": "assistant", "content": "fatto"},
+            {"role": "user", "content": "secondo"},
+            {"role": "assistant", "content": "ok"},
+        ]
+
+    # ── Percorso primario: prefisso riusato, un'unica chiamata ────────────────
+    cfg = cfg_for(Path("."))
+    cfg.context_window = 1000       # soglia = 750
+    cfg.compact_keep_recent = 1
+    prov = ToolsSpy([LLMResponse(content="SINTESI", usage=Usage(prompt_tokens=8, cache_hit_tokens=7, total_tokens=8))])
+    agent = general_agent.build(cfg, prov)
+    agent.convo.messages = history()
+    agent.convo.last_prompt_tokens = 900   # sopra soglia
+    agent._maybe_compact()
+    joined = "\n".join(m.get("content") or "" for m in agent.convo.messages)
+    check("summary cache: compaction avvenuta col riassunto", _SUMMARY_HEADER in joined and "SINTESI" in joined)
+    check("summary cache: UNA sola chiamata", len(prov.seen) == 1, len(prov.seen))
+    sent = prov.seen[0]
+    check("summary cache: prefisso = system dell'agente",
+          sent[0]["role"] == "system" and sent[0]["content"] == agent.system_prompt)
+    head = history()[:3]   # keep_recent=1 → split a len-1
+    check("summary cache: storia byte-identica nel prefisso",
+          sent[1:-1] == head, f"{len(sent)} messaggi inviati")
+    check("summary cache: istruzione in coda (miss solo su di lei)",
+          sent[-1]["role"] == "user" and sent[-1]["content"] == _SUMMARIZE_ON_PREFIX)
+    check("summary cache: stessi schemi tool del loop (prefisso identico)",
+          prov.tools_seen[0] == agent.toolset.schemas())
+    check("summary cache: usage del riassunto contato in sessione",
+          agent.convo.total_usage.cache_hit_tokens == 7)
+
+    # ── Fallback 1: il modello risponde con una tool call → render legacy ─────
+    cfg2 = cfg_for(Path("."))
+    cfg2.compact_keep_recent = 1
+    prov2 = ToolsSpy([
+        LLMResponse(tool_calls=[tc("read_file", path="x.py")]),          # anomala
+        LLMResponse(content="SINTESI2", usage=Usage(total_tokens=5)),    # legacy
+    ])
+    agent2 = general_agent.build(cfg2, prov2)
+    agent2.convo.messages = history()
+    check("summary cache: fallback compatta comunque", agent2._compact() is True)
+    check("summary cache: due chiamate (prefisso + legacy)", len(prov2.seen) == 2, len(prov2.seen))
+    check("summary cache: il fallback usa il prompt legacy",
+          prov2.seen[1][0]["content"] == _COMPACT_PROMPT and prov2.tools_seen[1] is None)
+    check("summary cache: riassunto dal fallback",
+          any("SINTESI2" in (m.get("content") or "") for m in agent2.convo.messages))
+
+    # ── Fallback 2: overflow sul prefisso → render legacy (compresso) ─────────
+    overflow = BadRequestError("maximum context length exceeded",
+                               response=httpx.Response(400, request=httpx.Request("POST", "https://x")), body=None)
+    cfg3 = cfg_for(Path("."))
+    cfg3.compact_keep_recent = 1
+    prov3 = ToolsSpy([overflow, LLMResponse(content="SINTESI3", usage=Usage(total_tokens=5))])
+    agent3 = general_agent.build(cfg3, prov3)
+    agent3.convo.messages = history()
+    check("summary cache: overflow del prefisso → compatta col legacy",
+          agent3._compact() is True and any("SINTESI3" in (m.get("content") or "") for m in agent3.convo.messages))
+    check("summary cache: legacy dopo overflow", prov3.seen[1][0]["content"] == _COMPACT_PROMPT)
+
+    # ── Aggressive (recupero da overflow): SOLO il legacy, direttamente ───────
+    cfg4 = cfg_for(Path("."))
+    cfg4.compact_keep_recent = 1
+    prov4 = ToolsSpy([LLMResponse(content="SINTESI4", usage=Usage(total_tokens=5))])
+    agent4 = general_agent.build(cfg4, prov4)
+    agent4.convo.messages = history()
+    check("summary cache: aggressive → legacy diretto", agent4._compact(aggressive=True) is True)
+    check("summary cache: una chiamata, prompt legacy",
+          len(prov4.seen) == 1 and prov4.seen[0][0]["content"] == _COMPACT_PROMPT)
+
+    # ── Errori NON di overflow: propagati (compaction fallisce, storia intatta) ─
+    cfg5 = cfg_for(Path("."))
+    cfg5.compact_keep_recent = 1
+    agent5 = general_agent.build(cfg5, ToolsSpy([RuntimeError("boom")]))
+    agent5.convo.messages = history()
+    before = list(agent5.convo.messages)
+    check("summary cache: errore non-overflow → compaction fallita, storia invariata",
+          agent5._compact() is False and agent5.convo.messages == before)
+
+
+def test_prune_hysteresis():
+    """Isteresi dello stadio 0: la potatura da sola evita il riassunto SOLO se
+    libera margine vero sotto soglia; a ridosso, si compatta nello stesso respiro
+    (la rottura del prefisso è già pagata). Ratio a 0 = vecchio comportamento."""
+    from flair.core import prune
+    from flair.core.agent import Conversation
+
+    def history():
+        a, b = tc("read_file", path="f.py"), tc("read_file", path="f.py")
+        return [{"role": "user", "content": "task"},
+                _asst_msg(a), _tool_msg(a.id, "x" * 1200),
+                _asst_msg(b), _tool_msg(b.id, "x" * 1200),
+                {"role": "assistant", "content": "y" * 10000}]
+
+    # A ridosso della soglia (stima post-potatura ~2850, soglia 3000, margine 400):
+    # la sola potatura NON basta → il riassunto parte nello stesso respiro. Lo stub
+    # viene poi ASSORBITO nella testa riassunta: la potatura si osserva dal callback.
+    cfg = cfg_for(Path("."))
+    cfg.context_window = 4000          # soglia = 3000; margine 10% = 400
+    cfg.compact_keep_recent = 2
+    pruned_counts: list[int] = []
+    prov = FakeProvider([LLMResponse(content="SINTESI", usage=Usage(total_tokens=5))])
+    convo = Conversation()
+    convo.messages = history()
+    convo.last_prompt_tokens = 3500
+    agent = coding_agent.build(cfg, prov, conversation=convo, on_prune=pruned_counts.append)
+    agent._maybe_compact()
+    check("isteresi: potatura avvenuta", pruned_counts == [1], str(pruned_counts))
+    check("isteresi: a ridosso della soglia si compatta comunque", len(prov.seen) == 1, len(prov.seen))
+    check("isteresi: riassunto in testa",
+          any("SINTESI" in (m.get("content") or "") for m in convo.messages))
+
+    # Stessa storia, ratio 0 → vecchio comportamento: uscita prune-only, zero LLM.
+    cfg0 = cfg_for(Path("."))
+    cfg0.context_window = 4000
+    cfg0.compact_keep_recent = 2
+    cfg0.prune_hysteresis_ratio = 0.0
+    prov0 = FakeProvider([])
+    convo0 = Conversation()
+    convo0.messages = history()
+    convo0.last_prompt_tokens = 3500
+    agent0 = coding_agent.build(cfg0, prov0, conversation=convo0)
+    agent0._maybe_compact()
+    check("isteresi: ratio 0 → uscita prune-only (retrocompat)", len(prov0.seen) == 0, len(prov0.seen))
+    check("isteresi: ratio 0 → stub presente", any(m.get("content") == prune.STUB for m in convo0.messages))
+
+
+def test_cache_breaks_counter():
+    """Contatore delle rotture del prefisso: una per RIPRISTINO (prune+compaction
+    consecutivi = un solo evento; niente conteggio se nulla era stato inviato).
+    Persistito nel dump/load di sessione, azzerato da reset()."""
+    from flair.core.agent import Conversation
+
+    def history():
+        a, b = tc("read_file", path="f.py"), tc("read_file", path="f.py")
+        return [{"role": "user", "content": "task"},
+                _asst_msg(a), _tool_msg(a.id, "x" * 1200),
+                _asst_msg(b), _tool_msg(b.id, "x" * 1200),
+                {"role": "assistant", "content": "fine"}]
+
+    cfg = cfg_for(Path("."))
+    cfg.compact_keep_recent = 2
+    prov = FakeProvider([LLMResponse(content="S1"), LLMResponse(content="S2")])
+    convo = Conversation()
+    convo.messages = history()
+    agent = coding_agent.build(cfg, prov, conversation=convo)
+
+    # Nulla ancora inviato: compattare non rompe alcun prefisso in cache.
+    check("breaks: parte da 0", convo.cache_breaks == 0)
+    agent.compact()          # prune + riassunto, ma sent_upto/last_prompt_tokens = 0
+    check("breaks: nessun conteggio se nulla era stato inviato", convo.cache_breaks == 0)
+
+    # Prefisso "inviato": prune+compaction nello stesso respiro = UN evento.
+    convo.messages = history()
+    convo.last_prompt_tokens = 900
+    convo.sent_upto = len(convo.messages)
+    agent.compact()
+    check("breaks: prune+compaction consecutivi = un solo evento", convo.cache_breaks == 1, convo.cache_breaks)
+
+    # Nuovo "invio" e nuova rottura → secondo evento.
+    convo.messages = history()
+    convo.last_prompt_tokens = 900
+    convo.sent_upto = len(convo.messages)
+    check("breaks: la sola potatura conta (muta il prefisso)",
+          agent._prune_superseded() == 1 and convo.cache_breaks == 2, convo.cache_breaks)
+
+    # Round-trip di sessione e reset.
+    state = convo.dump()
+    check("breaks: nel dump", state.get("cache_breaks") == 2)
+    convo2 = Conversation()
+    convo2.load(state)
+    check("breaks: dal load", convo2.cache_breaks == 2)
+    convo2.load({"messages": []})   # sessione pre-contatore → 0 senza errori
+    check("breaks: load retrocompat → 0", convo2.cache_breaks == 0)
+    convo.reset()
+    check("breaks: reset azzera", convo.cache_breaks == 0)
+
+
 def main():
     test_arg_parse()
     test_usage_normalization()
@@ -3718,6 +3914,9 @@ def main():
     test_plan_tool()
     test_prune_superseded_rules()
     test_prune_in_agent()
+    test_cache_friendly_summary()
+    test_prune_hysteresis()
+    test_cache_breaks_counter()
     test_budget_abort()
     test_read_only_mode()
     test_automation_helpers()

@@ -64,6 +64,25 @@ _COMPACT_PROMPT = (
     "technical facts but concise. Do not invent anything."
 )
 
+# Istruzione per il riassunto SUL PREFISSO IN CACHE: viene accodata alla
+# conversazione COSÌ COM'È (system prompt dell'agente + storia byte-identica a
+# quella già inviata) → il provider riusa la cache e si paga miss solo su queste
+# righe, invece dell'intera storia ri-renderizzata: ~5x in meno sulle storie
+# tool-heavy (dove il render tronca molto), fino a ~30x su quelle poco
+# troncabili. In più il riassuntore vede gli output tool INTEGRALI, non gli
+# stub a 800 caratteri (misurato: il render copre anche solo il 15% della storia).
+_SUMMARIZE_ON_PREFIX = (
+    "Stop the current work. Summarize the ENTIRE conversation above in a "
+    "self-sufficient way, so an assistant can continue without having read it. "
+    "Keep: the goal/request, the files examined with the relevant contents and "
+    "signatures, the edits already applied, the decisions made, the errors "
+    "encountered, any plan/TODO with the status of each step, and the current "
+    "status with the next steps. If the conversation already contains a previous "
+    "summary, incorporate ALL of its information without losing any of it. Be "
+    "complete on technical facts but concise. Do not invent anything. Reply with "
+    "the summary as PLAIN TEXT ONLY: do not call any tools."
+)
+
 
 @dataclass
 class AgentResult:
@@ -93,18 +112,25 @@ class Conversation:
     last_prompt_tokens: int = 0   # dimensione esatta dell'ultimo contesto inviato
     sent_upto: int = 0            # indice di `messages` fin dove era già stato inviato
     total_usage: Usage = field(default_factory=Usage)
+    # Rotture del prefisso in cache nella sessione (una per RIPRISTINO, non per
+    # mutazione: prune+compaction nello stesso respiro = un solo evento). Col
+    # listino a fasce ogni rottura è un evento economico: contarle le rende
+    # visibili (/cost, JSONL) invece di doverle dedurre dal cache-hit% che cala.
+    cache_breaks: int = 0
 
     def reset(self) -> None:
         self.messages = []
         self.last_prompt_tokens = 0
         self.sent_upto = 0
         self.total_usage = Usage()
+        self.cache_breaks = 0
 
     def dump(self) -> dict:
         """Stato serializzabile (JSON) della conversazione e dell'uso cumulativo."""
         u = self.total_usage
         return {"messages": self.messages,
-                "usage": {k: getattr(u, k) for k in _USAGE_FIELDS}}
+                "usage": {k: getattr(u, k) for k in _USAGE_FIELDS},
+                "cache_breaks": self.cache_breaks}
 
     def load(self, state: dict) -> None:
         msgs = state.get("messages")
@@ -112,6 +138,10 @@ class Conversation:
             self.messages = list(msgs)
         u = state.get("usage") or {}
         self.total_usage = Usage(**{k: int(u.get(k, 0)) for k in _USAGE_FIELDS})
+        try:
+            self.cache_breaks = int(state.get("cache_breaks", 0))
+        except (TypeError, ValueError):
+            self.cache_breaks = 0
         self.last_prompt_tokens = 0
         self.sent_upto = 0
 
@@ -359,12 +389,25 @@ class Agent:
     def _maybe_compact(self) -> None:
         if self._ctx_estimate() <= self.cfg.compact_threshold:
             return
-        # Stadio 0: potatura deterministica degli output superati — gratis (nessuna
-        # chiamata LLM) e senza perdita di fedeltà sul resto. Se basta a rientrare
-        # sotto soglia, il riassunto (che sostituirebbe il dettaglio) non serve.
-        if self._prune_superseded() and self._ctx_estimate() <= self.cfg.compact_threshold:
-            return
+        # Stadio 0: potatura deterministica degli output superati — nessuna chiamata
+        # LLM e nessuna perdita di fedeltà sul resto. ATTENZIONE alla cache: la prima
+        # mutazione ha GIÀ rotto il prefisso, quindi accettarla come unica misura
+        # conviene solo se libera margine VERO (isteresi): a ridosso della soglia si
+        # ricadrebbe in pochi step, pagando una SECONDA rottura ravvicinata — meglio
+        # compattare ora, nello stesso respiro (la rottura è ormai pagata).
+        if self._prune_superseded():
+            margin = int(self.cfg.context_window * getattr(self.cfg, "prune_hysteresis_ratio", 0.10))
+            if self._ctx_estimate() <= self.cfg.compact_threshold - margin:
+                return
         self._compact()
+
+    def _note_prefix_break(self) -> None:
+        """Conta le rotture del prefisso in cache: una per RIPRISTINO, non per
+        mutazione. Si conta solo se c'era davvero un prefisso inviato da rompere
+        (contatori non già azzerati): così prune+compaction consecutivi — o una
+        compaction a conversazione mai inviata — non gonfiano il contatore."""
+        if self.convo.sent_upto or self.convo.last_prompt_tokens:
+            self.convo.cache_breaks += 1
 
     def _prune_superseded(self) -> int:
         """Stub-ba gli output di tool provabilmente superati (vedi core/prune.py).
@@ -375,6 +418,7 @@ class Agent:
             return 0
         pruned = prune.prune_superseded(self.convo.messages)
         if pruned:
+            self._note_prefix_break()
             self.convo.last_prompt_tokens = 0
             self.convo.sent_upto = 0
             if self.on_prune:
@@ -398,7 +442,7 @@ class Agent:
             return False  # niente di sostanziale da comprimere
 
         try:
-            summary = self._summarize(to_summarize)
+            summary = self._summarize(to_summarize, aggressive=aggressive)
         except Exception as exc:  # noqa: BLE001
             log.warning("Compaction fallita (%s): mantengo il contesto invariato.", exc)
             return False
@@ -414,6 +458,7 @@ class Agent:
         tail = self.convo.messages[split:]
         # Il system prompt non è nella storia (lo antepone ogni agente): qui sostituiamo
         # solo la parte vecchia con UN messaggio di riassunto. La testa resta stabile.
+        self._note_prefix_break()
         self.convo.messages = (
             [{"role": "user", "content": _SUMMARY_HEADER + summary}]
             + tail
@@ -424,7 +469,39 @@ class Agent:
             self.on_compact(before, len(self.convo.messages))
         return True
 
-    def _summarize(self, msgs: list[dict]) -> str:
+    def _summarize(self, msgs: list[dict], aggressive: bool = False) -> str:
+        """Riassunto della testa della conversazione, in due strategie.
+
+        Percorso primario (cache-friendly): si accoda l'istruzione di riassunto alla
+        conversazione COSÌ COM'È — stesso system prompt, stessa storia byte-identica,
+        STESSI schemi tool del loop (partecipano al prefisso renderizzato) — così il
+        provider riusa la cache e si paga miss solo sull'istruzione, non sull'intera
+        storia (~5-30x in meno a compaction secondo quanto il render avrebbe
+        troncato, e il riassuntore vede gli output tool integrali). Fallback al render legacy (compresso, prompt a sé): quando il
+        modello risponde in modo anomalo (tool call / vuoto), quando il prefisso non
+        entra nella finestra (overflow) e in modalità aggressive — dove per definizione
+        il contesto è GIÀ troppo grande e solo il render compresso può passare."""
+        if not aggressive:
+            try:
+                resp = self.provider.complete(
+                    [{"role": "system", "content": self.system_prompt},
+                     *msgs,
+                     {"role": "user", "content": _SUMMARIZE_ON_PREFIX}],
+                    tools=self.toolset.schemas(),
+                    think=False,
+                    max_tokens=self.cfg.compact_summary_max_tokens,
+                )
+                self.convo.total_usage = self.convo.total_usage + resp.usage
+                if (resp.content or "").strip() and not resp.tool_calls:
+                    return resp.content
+                log.warning("Riassunto sul prefisso anomalo (tool call o vuoto): ripiego sul render.")
+            except Exception as exc:  # noqa: BLE001
+                if not is_context_overflow(exc):
+                    raise
+                log.warning("Riassunto sul prefisso in overflow: ripiego sul render compresso.")
+        return self._summarize_rendered(msgs)
+
+    def _summarize_rendered(self, msgs: list[dict]) -> str:
         blob = self._render_for_summary(msgs)
         resp = self.provider.complete(
             [{"role": "system", "content": _COMPACT_PROMPT},

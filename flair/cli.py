@@ -595,7 +595,8 @@ class CLI:
                                    "model (without --think) for tool work.[/yellow]")
 
         if self.logger:
-            self.logger.log_turn(agent_key, task, result, self._turn_tools)
+            self.logger.log_turn(agent_key, task, result, self._turn_tools,
+                                 cache_breaks=self.convo.cache_breaks)
 
         if human:
             self._print_turn(result.usage, result.steps, result.stopped_reason)
@@ -748,7 +749,8 @@ class CLI:
                 self.console.print("[yellow]conversation cleared.[/yellow]\n")
                 continue
             if low == "/cost":
-                self.console.print(f"[dim]  session · {self._cost_line(self._session_usage())}[/dim]\n")
+                self.console.print(f"[dim]  session · {self._cost_line(self._session_usage())} "
+                                   f"| prefix breaks {self.convo.cache_breaks}[/dim]\n")
                 continue
             if low == "/agent":
                 self.console.print(f"[dim]current agent (sticky): {self.last_agent or 'none'}[/dim]\n")

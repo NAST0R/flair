@@ -200,6 +200,10 @@ class ProviderConfig:
     # Opt-in: profondità del ragionamento di DEFAULT del modello veloce (il flash
     # V4 pensa già a 'high' lato server anche senza parametri). None = intatto.
     fast_reasoning_effort: str | None = None
+    # L'endpoint accetta immagini (content multipart OpenAI-style)? Esplicito
+    # per-slot, MAI dedotto: solo chi gestisce l'endpoint sa se il server ha
+    # l'encoder visivo caricato (es. llama-server con --mmproj). Default: no.
+    vision: bool = False
 
 
 @dataclass
@@ -240,6 +244,13 @@ class Config:
     compact_keep_recent: int = 8            # messaggi recenti tenuti integri
     compact_summary_max_tokens: int = 2000
     compact_prune: bool = True              # stadio 0: pota gli output di tool superati prima del riassunto
+    # Immagini (view_image / /img): lato massimo in px oltre cui ridimensionare
+    # PRIMA dell'invio (richiede Pillow, opzionale: senza, si invia com'è) e stima
+    # token per immagine usata dal contatore di contesto — il costo vero lo decide
+    # l'encoder del server e torna nell'usage; questa serve solo alla compaction.
+    image_max_side: int = 1536
+    image_token_estimate: int = 1200
+
     # Isteresi dello stadio 0: la potatura da sola evita il riassunto SOLO se porta
     # il contesto sotto soglia con questo margine (frazione della finestra). La
     # mutazione ha comunque rotto il prefisso in cache: uscire a ridosso della
@@ -336,6 +347,7 @@ def load_config() -> Config:
         temperature=_float("DEEPSEEK_TEMPERATURE", 0.0),
         reasoning_effort=os.getenv("DEEPSEEK_REASONING_EFFORT") or None,
         fast_reasoning_effort=os.getenv("DEEPSEEK_FAST_REASONING_EFFORT") or None,
+        vision=_bool("DEEPSEEK_VISION", False),
     )
     openai = ProviderConfig(
         api_key=os.getenv("OPENAI_API_KEY", ""),
@@ -344,6 +356,7 @@ def load_config() -> Config:
         think_model=os.getenv("OPENAI_THINK_MODEL", "gpt-5-mini"),
         temperature=_float("OPENAI_TEMPERATURE", 0.0),
         reasoning_effort=os.getenv("OPENAI_REASONING_EFFORT") or None,
+        vision=_bool("OPENAI_VISION", False),
     )
 
     local_model = os.getenv("LOCAL_MODEL", "local")
@@ -353,6 +366,7 @@ def load_config() -> Config:
         model=local_model,
         think_model=os.getenv("LOCAL_THINK_MODEL", local_model),   # un solo modello in VRAM
         temperature=_float("LOCAL_TEMPERATURE", -1.0),   # -1 = non inviare: vince il server
+        vision=_bool("LOCAL_VISION", False),
     )
 
     log_dir = os.getenv("FLAIR_LOG_DIR")
@@ -380,6 +394,8 @@ def load_config() -> Config:
         compact_summary_max_tokens=_int("FLAIR_COMPACT_SUMMARY_MAX", 2000),
         compact_prune=_bool("FLAIR_COMPACT_PRUNE", True),
         prune_hysteresis_ratio=_float("FLAIR_PRUNE_HYSTERESIS", 0.10),
+        image_max_side=_int("FLAIR_IMAGE_MAX_SIDE", 1536),
+        image_token_estimate=_int("FLAIR_IMAGE_TOKENS", 1200),
         root=Path(os.getenv("FLAIR_ROOT", ".")).expanduser().resolve(),
         read_file_max_chars=_int("FLAIR_READ_MAX", 12000),
         grep_max_chars=_int("FLAIR_GREP_MAX", 6000),

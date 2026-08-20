@@ -18,7 +18,7 @@ from datetime import datetime
 from pathlib import Path
 
 from ..core.tool import ToolContext, tool
-from . import fs, shell
+from . import fs, images, shell
 
 _OS = platform.system()  # 'Windows' | 'Darwin' | 'Linux'
 
@@ -445,8 +445,26 @@ def clipboard_set(ctx: ToolContext, text: str) -> str:
     return "✓ Copied to the clipboard." if ok else f"❌ Could not write to the clipboard: {err}"
 
 
+@tool(
+    "view_image",
+    "Load an image file (png/jpg/webp/gif/bmp) so YOU can actually see it: it gets "
+    "attached to the conversation right after this result. Use it for screenshots, "
+    "photos, diagrams. Requires a vision-capable endpoint.",
+    {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "description": "Path of the image file (png/jpg/jpeg/webp/gif/bmp)."},
+        },
+        "required": ["path"],
+    },
+    stages_media=True,
+)
+def view_image(ctx: ToolContext, path: str) -> str:
+    return images.view_image_impl(ctx, path, root=None)
+
+
 TOOLS = [
     open_url, open_path, open_application, search_files, list_directory,
     read_file, write_file, edit_file, run_command, run_powershell, system_info,
-    get_datetime, clipboard_get, clipboard_set,
+    get_datetime, clipboard_get, clipboard_set, view_image,
 ]

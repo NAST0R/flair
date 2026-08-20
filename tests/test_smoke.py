@@ -2852,7 +2852,14 @@ def test_english_surface():
     # sfuggiti i residui di bcfef91^ (header di compaction, overflow di list_dir,
     # suffisso di explore). Si asseriscono le costanti/funzioni che li generano
     # e un output prodotto davvero, così la classe di bug resta chiusa.
-    from flair.core.agent import _COMPACT_PROMPT, _SUMMARIZE_ON_PREFIX, _SUMMARIZE_PREAMBLE, _SUMMARY_HEADER
+    from flair.core.agent import (
+        _ATTACHED_IMAGES_PREFIX,
+        _COMPACT_PROMPT,
+        _IMAGE_REJECTED_NOTE,
+        _SUMMARIZE_ON_PREFIX,
+        _SUMMARIZE_PREAMBLE,
+        _SUMMARY_HEADER,
+    )
     from flair.core.prune import STUB
     from flair.tools.subagent import _footer
     runtime = {
@@ -2860,6 +2867,8 @@ def test_english_surface():
         "preambolo summarize": _SUMMARIZE_PREAMBLE,
         "prompt compaction": _COMPACT_PROMPT,
         "istruzione summarize su prefisso": _SUMMARIZE_ON_PREFIX,
+        "header allegati immagine": _ATTACHED_IMAGES_PREFIX,
+        "nota immagine rigettata": _IMAGE_REJECTED_NOTE,
         "stub prune": STUB,
         "footer explore (1)": _footer(1),
         "footer explore (3)": _footer(3),
@@ -3039,8 +3048,8 @@ def test_think_session_default():
     src = _inspect.getsource(CLI.repl)
     check("--think REPL: task nudo eredita il default",
           'self._safe_run_task(line, think=self.default_think)' in src)
-    check("--think REPL: /code e /do ereditano il default",
-          src.count("think=self.default_think") == 3)
+    check("--think REPL: /code, /do e /img ereditano il default",
+          src.count("think=self.default_think") == 4)
     check("--think REPL: /think resta rinforzo esplicito", "think=True" in src)
     check("--think REPL: banner dichiara lo stato", "think: ON every turn" in src)
 
@@ -3963,6 +3972,244 @@ def test_deepseek_endpoint_profiles():
     check("profili: 400 generico propagato senza retry", raised and ds4.keeps_reasoning_history is True)
 
 
+def test_vision():
+    """Vision trasversale: content multipart OpenAI-style, gating per-slot esplicito,
+    tool `view_image` con staging→flush (il canale tool è solo-testo: l'immagine
+    viaggia come messaggio utente accodato DOPO i risultati del batch), validazioni
+    PRE-invio (estensione, dimensione, magic bytes, decodifica con Pillow), stima
+    token a costo fisso, render/recap con placeholder, e neutralizzazione degli
+    allegati che l'endpoint rigetta (la sessione si auto-ripara, mai murata)."""
+    import base64 as _b64
+    import inspect as _ins
+    import io as _io
+    import tempfile as _tf
+
+    from rich.console import Console
+
+    from flair.cli import CLI, _build_parser, _recap_messages
+    from flair.core.agent import _IMAGE_REJECTED_NOTE, Agent, Conversation, content_text
+    from flair.core.tool import ToolError as _TE
+    from flair.tools import coding as _ct
+    from flair.tools import images as _im
+    from flair.tools import system as _st
+
+    # PNG 1x1 valido (rosso), generato una tantum: basta per encoding e mime.
+    png = _b64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/q842"
+        "iQAAAABJRU5ErkJggg==")
+
+    # ── content_text: l'unico punto che conosce il multipart ──────────────────
+    check("vision: content_text su stringa", content_text("ciao") == "ciao")
+    check("vision: content_text su None", content_text(None) == "")
+    parts = [{"type": "text", "text": "guarda"},
+             {"type": "image_url", "image_url": {"url": "data:image/png;base64,xxx"}}]
+    check("vision: content_text su multipart", content_text(parts) == "guarda\n[image]")
+    check("vision: placeholder personalizzabile", content_text(parts, image_placeholder="") == "guarda\n")
+
+    # ── Stima token: costo fisso per immagine, MAI i caratteri del base64 ─────
+    fat = [{"type": "text", "text": "x" * 400},
+           {"type": "image_url", "image_url": {"url": "data:image/png;base64," + "A" * 2_000_000}}]
+    est = Agent._estimate_tokens([{"role": "user", "content": fat}], image_tokens=1200)
+    check("vision: stima = testo + costo fisso immagine", est == 400 // 4 + 1200, est)
+    check("vision: il base64 non esplode la stima", est < 5000)
+
+    root = Path(_tf.mkdtemp(prefix="flair_vis_")).resolve()
+    try:
+        (root / "shot.png").write_bytes(png)
+        (root / "note.txt").write_text("x", encoding="utf-8")
+
+        # ── load_image_part: encoding, mime, errori azionabili ────────────────
+        cfg = cfg_for(root)
+        part, note = _im.load_image_part(cfg, root / "shot.png")
+        check("vision: parte image_url con data URI png",
+              part["type"] == "image_url" and part["image_url"]["url"].startswith("data:image/png;base64,"))
+        check("vision: nota descrittiva col nome file", "shot.png" in note, note)
+        for bad, frag in (("note.txt", "Unsupported image format"), ("manca.png", "not found")):
+            try:
+                _im.load_image_part(cfg, root / bad)
+                check(f"vision: {bad} rifiutato", False)
+            except _TE as exc:
+                check(f"vision: {bad} rifiutato", frag in str(exc), exc)
+
+        # ── Hardening: la firma reale del contenuto deve confermare l'estensione ──
+        (root / "fake.png").write_bytes(b"this is not an image at all........")
+        try:
+            _im.load_image_part(cfg, root / "fake.png")
+            check("vision: contenuto non-immagine rifiutato (magic bytes)", False)
+        except _TE as exc:
+            check("vision: contenuto non-immagine rifiutato (magic bytes)",
+                  "corrupted or misnamed" in str(exc), exc)
+        (root / "trav.jpg").write_bytes(png)   # png travestito da jpg
+        try:
+            _im.load_image_part(cfg, root / "trav.jpg")
+            check("vision: estensione/contenuto discordanti rifiutati", False)
+        except _TE:
+            check("vision: estensione/contenuto discordanti rifiutati", True)
+        # webp con firma RIFF/WEBP valida ma corpo vuoto: senza Pillow passa lo
+        # sniff (decide il server); con Pillow la decodifica fallisce → rifiuto.
+        (root / "ok.webp").write_bytes(b"RIFF" + (100).to_bytes(4, "little") + b"WEBP" + b"\x00" * 24)
+        try:
+            p_w, _ = _im.load_image_part(cfg, root / "ok.webp")
+            webp_ok: bool | None = p_w["image_url"]["url"].startswith("data:image/webp")
+        except _TE:
+            webp_ok = None
+        corrupt = b"\x89PNG\r\n\x1a\n" + b"garbage" * 10
+        (root / "corrupt.png").write_bytes(corrupt)
+        try:
+            _im.load_image_part(cfg, root / "corrupt.png")
+            pil_reject = False
+        except _TE:
+            pil_reject = True
+        try:
+            import PIL  # noqa: F401
+            check("vision: corrotto oltre i magic → rifiutato (Pillow)", pil_reject is True)
+            check("vision: webp fasullo oltre la firma → rifiutato (Pillow)", webp_ok is None)
+        except ImportError:
+            check("vision: corrotto oltre i magic → decide il server (senza Pillow)", pil_reject is False)
+            check("vision: webp con firma valida accettato (senza Pillow)", webp_ok is True)
+            check("vision: senza Pillow l'originale passa intatto",
+                  _im._downscale(png, ".png", 1)[0] == png)
+
+        # ── Gating: endpoint cieco → rifiuto azionabile, nessuna staging ──────
+        ctx = ToolContext(cfg=cfg)
+        ctx.pending_images = []
+        out = _ct.view_image(ctx, path="shot.png")
+        check("vision: gate spento → rifiuto col fix nel messaggio",
+              out.startswith("❌") and "LOCAL_VISION" in out, out)
+        check("vision: gate spento → staging vuota", ctx.pending_images == [])
+
+        # ── Tool ON: staging popolata, conferma testuale, sandbox attiva ──────
+        cfg.deepseek.vision = True    # slot attivo di cfg_for
+        out = _ct.view_image(ctx, path="shot.png")
+        check("vision: conferma testuale", out.startswith("✅") and "shot.png" in out, out)
+        check("vision: staging popolata", len(ctx.pending_images) == 1
+              and ctx.pending_images[0]["part"]["type"] == "image_url"
+              and ctx.pending_images[0]["label"] == "shot.png")
+        try:
+            _ct.view_image(ctx, path="../../fuori.png")
+            check("vision: sandbox del coding attiva (ToolError)", False)
+        except _TE:
+            check("vision: sandbox del coding attiva (ToolError)", True)
+        check("vision: variante general senza sandbox esiste",
+              _st.view_image.name == "view_image" and _st.view_image.stages_media is True)
+
+        # ── Loop end-to-end: tool → flush → il modello VEDE l'immagine ────────
+        a_call = tc("view_image", path="shot.png")
+        prov = FakeProvider([
+            LLMResponse(tool_calls=[a_call]),
+            LLMResponse(content="Vedo un pixel rosso."),
+        ])
+        agent = coding_agent.build(cfg, prov)
+        res = agent.run("guarda shot.png e dimmi cosa vedi")
+        check("vision: turno completato", res.stopped_reason == "done" and "rosso" in res.content)
+        msgs = agent.convo.messages
+        i_tool = next(i for i, m in enumerate(msgs) if m.get("role") == "tool")
+        check("vision: risultato tool testuale", msgs[i_tool]["content"].startswith("✅"))
+        att = msgs[i_tool + 1]
+        check("vision: allegato = messaggio utente multipart SUBITO dopo il tool",
+              att["role"] == "user" and isinstance(att["content"], list)
+              and att["content"][0]["type"] == "text" and "shot.png" in att["content"][0]["text"]
+              and att["content"][1]["type"] == "image_url")
+        check("vision: la SECONDA richiesta contiene l'immagine",
+              any(isinstance(m.get("content"), list) for m in prov.seen[1]))
+        check("vision: staging svuotata dopo il flush", agent.ctx.pending_images == [])
+
+        # ── Neutralizzazione: 400 dell'endpoint su allegato mai inviato ───────
+        reject = BadRequestError("unsupported image input in messages",
+                                 response=httpx.Response(400, request=httpx.Request("POST", "https://x")),
+                                 body=None)
+        provN = FakeProvider([LLMResponse(tool_calls=[tc("view_image", path="shot.png")]), reject])
+        agentN = coding_agent.build(cfg, provN)
+        raisedN = False
+        try:
+            agentN.run("guarda shot.png")
+        except BadRequestError:
+            raisedN = True
+        check("vision: il turno fallisce rumorosamente (errore vero a schermo)", raisedN)
+        flatN = [p for m in agentN.convo.messages
+                 for p in (m.get("content") if isinstance(m.get("content"), list) else [])]
+        check("vision: allegato avvelenato neutralizzato (sessione auto-riparata)",
+              not any(isinstance(p, dict) and p.get("type") == "image_url" for p in flatN)
+              and any(_IMAGE_REJECTED_NOTE in content_text(m.get("content"))
+                      for m in agentN.convo.messages))
+        # Errore NON-400 (rete, ecc.): l'allegato resta — non era colpa sua.
+        provN2 = FakeProvider([LLMResponse(tool_calls=[tc("view_image", path="shot.png")]),
+                               RuntimeError("boom")])
+        agentN2 = coding_agent.build(cfg, provN2)
+        try:
+            agentN2.run("guarda shot.png")
+        except RuntimeError:
+            pass
+        check("vision: errore generico NON tocca l'allegato",
+              any(isinstance(p, dict) and p.get("type") == "image_url"
+                  for m in agentN2.convo.messages
+                  for p in (m.get("content") if isinstance(m.get("content"), list) else [])))
+
+        # ── Parallelo: view_image forza il percorso sequenziale ───────────────
+        b_call = tc("read_file", path="note.txt")
+        check("vision: batch con view_image NON parallelizzato",
+              agent._should_parallelize([a_call, b_call]) is False)
+        check("vision: batch di sole letture resta parallelo",
+              agent._should_parallelize([b_call, tc("glob", pattern="*.py")]) is True)
+
+        # ── /img e --image: mattoni del CLI ────────────────────────────────────
+        cfg2 = cfg_for(Path("."))
+        cli = CLI(cfg2)
+        cli.console = Console(file=_io.StringIO())
+        calls: list[tuple] = []
+        cli.run_task = lambda task, **kw: calls.append((task, kw))  # type: ignore[method-assign]
+        check("vision: /img documentato in help", "/img <path>" in _ins.getsource(CLI._print_help))
+        cfg2.deepseek.vision = True
+        p2, _n2 = _im.load_image_part(cfg2, root / "shot.png")
+        cli.run_task("cosa vedi?", attachments=[p2])
+        check("vision: run_task riceve testo + allegati separati",
+              calls and calls[0][0] == "cosa vedi?" and calls[0][1]["attachments"][0]["type"] == "image_url")
+
+        prov3 = FakeProvider([LLMResponse(content="ok")])
+        cli3 = CLI(cfg2)
+        cli3.console = Console(file=_io.StringIO())
+        cli3.provider = prov3
+        for a in cli3.agents.values():
+            a.provider = prov3
+            a.ctx.provider = prov3
+        cli3.run_task("descrivi", agent_key="general", attachments=[p2])
+        sent_user = next(m for m in prov3.seen[0] if m["role"] == "user")
+        check("vision: content del turno = multipart [testo, immagine]",
+              isinstance(sent_user["content"], list) and sent_user["content"][0]["text"] == "descrivi")
+
+        ns = _build_parser().parse_args(["-p", "x", "--image", "a.png", "--image", "b.png"])
+        check("vision: --image ripetibile nel parser", ns.image == ["a.png", "b.png"])
+
+        # ── Recap, render e sessione: multipart-safe ───────────────────────────
+        lines, _ = _recap_messages([{"role": "user", "content": parts},
+                                    {"role": "assistant", "content": "visto"}])
+        check("vision: recap multipart-safe", lines and lines[0][1].startswith("guarda"))
+        blob = Agent._render_for_summary([{"role": "user", "content": parts}])
+        check("vision: render compaction con placeholder", "[image]" in blob and "base64" not in blob)
+        c = Conversation()
+        c.messages = [{"role": "user", "content": parts}]
+        c2 = Conversation()
+        c2.load(c.dump())
+        check("vision: dump/load preserva il multipart",
+              isinstance(c2.messages[0]["content"], list) and c2.messages[0]["content"][1]["type"] == "image_url")
+
+        # ── Downscale (solo con Pillow presente) ───────────────────────────────
+        try:
+            from PIL import Image as _Img
+        except ImportError:
+            pass
+        else:
+            big = _Img.new("RGB", (3000, 1000), "red")
+            buf = _io.BytesIO()
+            big.save(buf, format="PNG")
+            small, mime, note2 = _im._downscale(buf.getvalue(), ".png", 1536)
+            reopened = _Img.open(_io.BytesIO(small))
+            check("vision: downscale al lato massimo",
+                  max(reopened.size) <= 1536 and mime == "image/png" and "→" in note2, reopened.size)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def main():
     test_arg_parse()
     test_usage_normalization()
@@ -4044,6 +4291,7 @@ def main():
     test_prune_hysteresis()
     test_cache_breaks_counter()
     test_deepseek_endpoint_profiles()
+    test_vision()
     test_budget_abort()
     test_read_only_mode()
     test_automation_helpers()

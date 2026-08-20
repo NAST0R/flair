@@ -14,7 +14,7 @@ import re
 from pathlib import Path
 
 from ..core.tool import ToolContext, ToolError, tool
-from . import fs, repomap, shell
+from . import fs, images, repomap, shell
 
 # ── read_file ────────────────────────────────────────────────────────────────
 
@@ -418,4 +418,23 @@ def move_path(ctx: ToolContext, src: str, dst: str) -> str:
     return fs.move_path_impl(ctx.cfg.root, src, dst)
 
 
-TOOLS = [read_file, list_directory, glob, grep, repo_map, edit_file, multi_edit, write_file, move_path, run_command]
+@tool(
+    "view_image",
+    "Load an image from the project (png/jpg/webp/gif/bmp) so YOU can actually see it: "
+    "it gets attached to the conversation right after this result. Use it for screenshots, "
+    "diagrams, UI mockups, photos of errors. Requires a vision-capable endpoint.",
+    {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "description": "Path of the image file (png/jpg/jpeg/webp/gif/bmp)."},
+        },
+        "required": ["path"],
+    },
+    stages_media=True,
+)
+def view_image(ctx: ToolContext, path: str) -> str:
+    return images.view_image_impl(ctx, path, root=ctx.cfg.root)
+
+
+TOOLS = [read_file, list_directory, glob, grep, repo_map, edit_file, multi_edit, write_file, move_path,
+         run_command, view_image]

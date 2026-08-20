@@ -29,13 +29,13 @@ from .agents import coding as coding_agent
 from .agents import general as general_agent
 from .config import Config, load_config
 from .core import router
-from .core.agent import _SUMMARY_HEADER, Conversation
+from .core.agent import _SUMMARY_HEADER, Conversation, content_text
 from .core.tool import ToolError
 from .llm import Usage, create_provider
 from .memory import SessionMemory
 from .session_log import SessionLogger, setup_file_logging
 from .session_store import SessionStore
-from .tools import fs
+from .tools import fs, images
 
 _TOOL_ICON = {
     "read_file": "📄", "list_directory": "📁", "glob": "🔎", "grep": "🔎",
@@ -80,7 +80,7 @@ def _recap_messages(messages: list[dict], max_msgs: int = 4,
     header = _SUMMARY_HEADER.strip()
     for m in messages:
         role = str(m.get("role") or "")
-        text = (m.get("content") or "").strip()
+        text = content_text(m.get("content")).strip()
         if role not in ("user", "assistant") or not text:
             continue
         if role == "user" and text.startswith(header):
@@ -528,13 +528,14 @@ class CLI:
         sys.stdout.write(json.dumps(obj, ensure_ascii=False) + "\n")
         sys.stdout.flush()
 
-    def run_once(self, task: str, agent_key: str | None = None, think: bool = False) -> int:
+    def run_once(self, task: str, agent_key: str | None = None, think: bool = False,
+                 attachments: list[dict] | None = None) -> int:
         """Esegue un singolo task (modalità `-p`) e ritorna un exit code per gli script:
         0 done, 2 max-step, 3 loop, 4 fermato (serviva approvazione o stop), 5 budget,
         1 errore, 130 interruzione. In modalità --json emette SEMPRE un oggetto su stdout
         (anche su errore/interruzione), così il contratto resta affidabile per l'automazione."""
         try:
-            result = self.run_task(task, agent_key=agent_key, think=think)
+            result = self.run_task(task, agent_key=agent_key, think=think, attachments=attachments)
         except KeyboardInterrupt:
             self._newline_if_needed()
             if self.output_mode == "json":
@@ -560,11 +561,17 @@ class CLI:
             sys.stdout.flush()
         return exit_code_for(result.stopped_reason)
 
-    def run_task(self, task: str, agent_key: str | None = None, think: bool = False):
+    def run_task(self, task: str, agent_key: str | None = None, think: bool = False,
+                 attachments: list[dict] | None = None):
         if agent_key is None:
             agent_key = router.classify(task, self.provider, self.last_agent, convo=self.convo)
         self.last_agent = agent_key
         agent = self.agents[agent_key]
+        # Allegati (/img, --image): il content del turno diventa multipart, ma il
+        # router classifica sul TESTO e il JSONL logga il testo — mai i blob base64.
+        content: str | list = task
+        if attachments:
+            content = [{"type": "text", "text": task}, *attachments]
         self._turn_tools = []
         self._mid_line = False
         human = self.output_mode == "human"
@@ -574,13 +581,13 @@ class CLI:
         if human and self.cfg.stream:
             self.console.print(f"[bold cyan]flair · {agent_key}[/bold cyan]")
             try:
-                result = agent.run(task, think=think)
+                result = agent.run(content, think=think)
             finally:
                 self._stop_thinking()   # rete di sicurezza: mai spinner orfani su errore
             self._newline_if_needed()
             self.console.print()
         else:
-            result = agent.run(task, think=think)
+            result = agent.run(content, think=think)
             if human and result.stopped_reason not in ("stopped", "budget"):
                 self.console.print(Panel(
                     Markdown(result.content or "(empty)"),
@@ -690,6 +697,7 @@ class CLI:
             ("/remember <note>", "jot a durable note into session memory yourself"),
             ("/reset", "reset the shared conversation"),
             ("/root <path>", "change the working folder (coding + general; reloads instructions)"),
+            ("/img <path> [prompt]", "attach an image to the turn (vision endpoints only)"),
             ("/help", "this help"),
             ("exit | quit", "esci"),
         ):
@@ -877,6 +885,28 @@ class CLI:
                             f"[yellow]root → {self.cfg.root} "
                             "(working folder for coding and general)[/yellow]\n")
                 continue
+            if low.startswith("/img"):
+                parts = line.split(maxsplit=2)
+                if len(parts) < 2:
+                    self.console.print("[yellow]usage: /img <path> [prompt][/yellow]\n")
+                    continue
+                if not getattr(self.cfg.active, "vision", False):
+                    self.console.print(
+                        "[yellow]The current provider/endpoint has no vision support: enable it "
+                        "only if the endpoint accepts images (e.g. llama-server with --mmproj) "
+                        "via DEEPSEEK_VISION / OPENAI_VISION / LOCAL_VISION=true in .env.[/yellow]\n")
+                    continue
+                prompt = parts[2].strip() if len(parts) == 3 else "Describe what you see in this image."
+                try:
+                    # Path scelto dall'UTENTE sulla propria macchina: niente sandbox
+                    # (come aprire un file a mano), solo expanduser+resolve.
+                    part, note = images.load_image_part(self.cfg, Path(parts[1]).expanduser().resolve())
+                except ToolError as exc:
+                    self.console.print(f"[yellow]{exc}[/yellow]\n")
+                    continue
+                self.console.print(f"[dim]📎 {note}[/dim]")
+                self.run_task(prompt, attachments=[part], think=self.default_think)
+                continue
             if low.startswith("/code"):
                 task = line[len("/code"):].strip()
                 if task:
@@ -932,6 +962,8 @@ def _build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--agent", choices=["coding", "general", "auto"], default="auto", help="force an agent (default: auto)")
     ap.add_argument("--root", help="working root for the coding agent")
     ap.add_argument("--think", action="store_true", help="use the thinking model (one-shot: the task; REPL: every turn of the session)")
+    ap.add_argument("--image", action="append", metavar="PATH",
+                    help="with -p: attach an image to the task (repeatable; vision endpoints only)")
     ap.add_argument("--yes", action="store_true", help="auto-approve destructive tools")
     ap.add_argument("--read-only", dest="read_only", action="store_true",
                     help="unattended execution: disables destructive tools (writes/edits/commands)")
@@ -1002,7 +1034,30 @@ def main(argv: list[str] | None = None) -> int:
                 console.print("[red]Empty prompt.[/red]")
             return 1
         key = None if args.agent == "auto" else args.agent
-        return cli.run_once(prompt, agent_key=key, think=args.think)
+        attachments: list[dict] | None = None
+        if args.image:
+            if not getattr(cfg.active, "vision", False):
+                msg = ("the current provider/endpoint has no vision support "
+                       "(set DEEPSEEK_VISION / OPENAI_VISION / LOCAL_VISION=true)")
+                if json_mode:
+                    cli._emit_json({"ok": False, "agent": None, "stopped_reason": "error",
+                                    "response": "", "error": msg})
+                else:
+                    console.print(f"[red]--image: {msg}.[/red]")
+                return 1
+            attachments = []
+            for raw in args.image:
+                try:
+                    part, _note = images.load_image_part(cfg, Path(raw).expanduser().resolve())
+                except ToolError as exc:
+                    if json_mode:
+                        cli._emit_json({"ok": False, "agent": None, "stopped_reason": "error",
+                                        "response": "", "error": str(exc)})
+                    else:
+                        console.print(f"[red]--image: {exc}[/red]")
+                    return 1
+                attachments.append(part)
+        return cli.run_once(prompt, agent_key=key, think=args.think, attachments=attachments)
     cli.default_think = bool(args.think)
     cli.repl()
     return 0

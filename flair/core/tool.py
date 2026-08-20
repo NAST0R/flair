@@ -114,6 +114,10 @@ class ToolContext:
     provider: Any = None    # per i tool che delegano a un sub-agente (es. explore)
     delegated_usage: Any = None  # usage riportato dai tool che delegano; l'agente lo somma a turno+sessione
     memory: Any = None      # SessionMemory della sessione (tool `remember`); None = non disponibile
+    # Staging area dei tool che allegano immagini (view_image): il canale tool è
+    # solo-testo, quindi il tool deposita qui la parte multipart e il loop la
+    # consegna come messaggio utente dopo i risultati del batch. None = spenta.
+    pending_images: Any = None
 
 
 @dataclass
@@ -123,6 +127,10 @@ class Tool:
     parameters: dict          # JSON schema dei parametri
     func: Callable[..., str]
     destructive: bool = False
+    # Il tool deposita media nella staging del ToolContext (view_image): va eseguito
+    # nel percorso SEQUENZIALE, sul ctx condiviso — i worker paralleli usano ctx
+    # isolati e il deposito andrebbe perso.
+    stages_media: bool = False
     _accepts: frozenset = field(init=False, repr=False, compare=False)
     _var_kw: bool = field(init=False, repr=False, compare=False)
     _types: dict = field(init=False, repr=False, compare=False)
@@ -184,11 +192,12 @@ class Tool:
         }
 
 
-def tool(name: str, description: str, parameters: dict, destructive: bool = False):
+def tool(name: str, description: str, parameters: dict, destructive: bool = False,
+         stages_media: bool = False):
     """Decoratore che trasforma una funzione `(ctx, **args) -> str` in un Tool."""
     def deco(fn: Callable[..., str]) -> Tool:
         return Tool(name=name, description=description, parameters=parameters,
-                    func=fn, destructive=destructive)
+                    func=fn, destructive=destructive, stages_media=stages_media)
     return deco
 
 

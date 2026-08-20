@@ -50,6 +50,8 @@ class StoppedByUser(Exception):
 # Testi iniettati in conversazione dalla compaction (superficie model-facing:
 # la guardia test_english_surface li asserisce direttamente).
 _SUMMARY_HEADER = "[Summary of the work done so far]\n\n"
+_ATTACHED_IMAGES_PREFIX = "[Images attached by view_image: "
+_IMAGE_REJECTED_NOTE = "[image removed: the endpoint rejected it]"
 _SUMMARIZE_PREAMBLE = "Conversation to summarize:\n\n"
 
 _COMPACT_PROMPT = (
@@ -71,6 +73,34 @@ _COMPACT_PROMPT = (
 # tool-heavy (dove il render tronca molto), fino a ~30x su quelle poco
 # troncabili. In più il riassuntore vede gli output tool INTEGRALI, non gli
 # stub a 800 caratteri (misurato: il render copre anche solo il 15% della storia).
+def content_text(content, image_placeholder: str = "[image]") -> str:
+    """Testo di un `content` che può essere una stringa (il caso normale) o una
+    LISTA di parti multimodali OpenAI-style (messaggi con immagini: /img e
+    view_image). Le parti immagine diventano un placeholder. È l'UNICO punto in
+    cui il resto di flair — stima del contesto, render della compaction, recap,
+    display — deve conoscere il formato multipart: tutto il resto chiama questo."""
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return "" if content is None else str(content)
+    out: list[str] = []
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        if part.get("type") == "text":
+            out.append(part.get("text") or "")
+        elif part.get("type") == "image_url":
+            out.append(image_placeholder)
+    return "\n".join(out)
+
+
+def _count_images(content) -> int:
+    """Numero di parti immagine in un content (0 per le stringhe)."""
+    if not isinstance(content, list):
+        return 0
+    return sum(1 for p in content if isinstance(p, dict) and p.get("type") == "image_url")
+
+
 _SUMMARIZE_ON_PREFIX = (
     "Stop the current work. Summarize the ENTIRE conversation above in a "
     "self-sufficient way, so an assistant can continue without having read it. "
@@ -189,6 +219,7 @@ class Agent:
         # e sessione.
         self.ctx = ToolContext(cfg=cfg, provider=provider)
         self.ctx.delegated_usage = Usage()
+        self.ctx.pending_images = []
 
     @property
     def messages(self) -> list[dict]:
@@ -227,7 +258,9 @@ class Agent:
                     "Control has returned to the user; wait for new instructions."
                 )})
 
-    def run(self, task: str, think: bool = False, max_steps: int | None = None) -> AgentResult:
+    def run(self, task: str | list, think: bool = False, max_steps: int | None = None) -> AgentResult:
+        # `task` è normalmente una stringa; con allegati (/img) è una LISTA di parti
+        # multimodali OpenAI-style, che viaggia nel content così com'è.
         self.convo.messages.append({"role": "user", "content": task})
         schemas = self.toolset.schemas()
         recent: dict[str, int] = {}
@@ -285,8 +318,10 @@ class Agent:
                             self.convo.messages.append({"role": "tool", "tool_call_id": tc.id, "content": output})
                 except StoppedByUser:
                     self._answer_unanswered(resp)
+                    self.ctx.pending_images = []   # niente allegati fuori contesto al turno dopo
                     return AgentResult("", self._fold_delegated(turn_usage), step, "stopped")
                 turn_usage = self._fold_delegated(turn_usage)
+                self._flush_pending_images()
 
                 if any(c >= 4 for c in recent.values()):
                     content, delta = self._force_final()
@@ -302,6 +337,7 @@ class Agent:
             # conversazione rispondendo agli eventuali tool_call ancora pendenti.
             if resp is not None and resp.has_tool_calls:
                 self._answer_unanswered(resp)
+            self.ctx.pending_images = []
             return AgentResult("", self._fold_delegated(turn_usage), step, "stopped")
 
         content, delta = self._force_final()
@@ -319,6 +355,41 @@ class Agent:
         self.convo.total_usage = self.convo.total_usage + d
         self.ctx.delegated_usage = Usage()
         return turn_usage + d
+
+    def _flush_pending_images(self) -> None:
+        """Consegna al modello le immagini depositate dai tool (view_image). Il canale
+        tool è solo-testo per protocollo: il tool risponde con una conferma e QUI il
+        framework accoda UN messaggio utente multipart con le immagini vere — DOPO i
+        risultati del batch (pairing tool_call/tool intatto), append-only come nudge
+        e inventario. Al passo successivo il modello se le trova nel contesto."""
+        staged = self.ctx.pending_images or []
+        if not staged:
+            return
+        self.ctx.pending_images = []
+        labels = ", ".join(s["label"] for s in staged)
+        parts: list[dict] = [{"type": "text", "text": f"{_ATTACHED_IMAGES_PREFIX}{labels}]"}]
+        parts.extend(s["part"] for s in staged)
+        self.convo.messages.append({"role": "user", "content": parts})
+
+    def _neutralize_rejected_images(self) -> None:
+        """Rete di sicurezza per l'irriducibile: un'immagine che passa le validazioni
+        locali ma che l'ENDPOINT rigetta con un 400 (es. un webp valido su llama.cpp,
+        che non lo decodifica) resterebbe nella storia append-only e murerebbe la
+        sessione — ogni richiesta successiva la rimanderebbe, rifallendo identica.
+        Qui, SOLO su 400 non-overflow (deciso dal chiamante) e SOLO nel suffisso MAI
+        inviato con successo, le parti immagine diventano un placeholder testuale:
+        il turno fallisce una volta con l'errore vero a schermo, la sessione si
+        auto-ripara. Nessuna rottura di cache: il suffisso mutato non era mai stato
+        accettato dal server."""
+        for m in self.convo.messages[self.convo.sent_upto:]:
+            content = m.get("content")
+            if m.get("role") == "user" and isinstance(content, list) and _count_images(content):
+                m["content"] = [
+                    {"type": "text", "text": _IMAGE_REJECTED_NOTE}
+                    if isinstance(p, dict) and p.get("type") == "image_url" else p
+                    for p in content
+                ]
+                log.warning("Endpoint rejected an image attachment: replaced with a placeholder.")
 
     def _over_budget(self) -> bool:
         """True se il costo cumulativo di sessione ha raggiunto il tetto `max_cost`
@@ -351,6 +422,8 @@ class Agent:
                 else:
                     raise
             else:
+                if getattr(exc, "status_code", None) == 400:
+                    self._neutralize_rejected_images()
                 raise
         self.convo.total_usage = self.convo.total_usage + resp.usage
         if resp.usage.prompt_tokens:
@@ -373,18 +446,27 @@ class Agent:
     # ── compaction ────────────────────────────────────────────────────────────
 
     @staticmethod
-    def _estimate_tokens(msgs: list[dict]) -> int:
+    def _estimate_tokens(msgs: list[dict], image_tokens: int = 1200) -> int:
         chars = 0
+        images = 0
         for m in msgs:
-            chars += len(m.get("content") or "")
+            # content_text, NON len(content): un'immagine base64 sono megabyte di
+            # caratteri ma ~1-2K token reali (li decide l'encoder del server) — la
+            # stima a caratteri esploderebbe innescando compaction a vuoto. Le
+            # immagini si contano a costo fisso (image_tokens, FLAIR_IMAGE_TOKENS).
+            content = m.get("content")
+            chars += len(content_text(content, image_placeholder=""))
+            images += _count_images(content)
             chars += len(m.get("reasoning_content") or "")   # tracce nei turni con tool
             for tc in (m.get("tool_calls") or []):
                 fn = tc.get("function", {})
                 chars += len(fn.get("arguments", "")) + len(fn.get("name", ""))
-        return chars // 4
+        return chars // 4 + images * image_tokens
 
     def _ctx_estimate(self) -> int:
-        return self.convo.last_prompt_tokens + self._estimate_tokens(self.convo.messages[self.convo.sent_upto:])
+        return self.convo.last_prompt_tokens + self._estimate_tokens(
+            self.convo.messages[self.convo.sent_upto:],
+            image_tokens=getattr(self.cfg, "image_token_estimate", 1200))
 
     def _maybe_compact(self) -> None:
         if self._ctx_estimate() <= self.cfg.compact_threshold:
@@ -573,7 +655,9 @@ class Agent:
                     content = content[:800] + " …[truncated]"
                 parts.append(f"[tool result] {content}")
             else:
-                parts.append(f"[{role}] {m.get('content') or ''}")
+                # content_text: i messaggi utente possono essere multipart (immagini);
+                # nel blob del riassunto un'immagine è solo il suo placeholder.
+                parts.append(f"[{role}] {content_text(m.get('content'))}")
         return "\n".join(parts)
 
     # ── interni ─────────────────────────────────────────────────────────────
@@ -662,6 +746,10 @@ class Agent:
             if t is None:
                 continue                       # sconosciuto: errore a valle, non esegue
             if t.destructive:
+                return False
+            if t.stages_media:
+                # Deposita nella staging del ctx CONDIVISO (view_image): i worker
+                # paralleli usano ctx isolati e l'allegato andrebbe perso.
                 return False
         return True
 

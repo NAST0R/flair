@@ -4210,6 +4210,138 @@ def test_vision():
         shutil.rmtree(root, ignore_errors=True)
 
 
+def test_configurer():
+    """tools/configurer.py: editor .env standalone (stdlib + Tkinter lazy). Qui si
+    testano le funzioni PURE — parse/render/validate e il catalogo — che girano
+    senza tkinter. Il guard di parità è il test più importante: il catalogo
+    duplica i default di config.py, e senza vincolo divergerebbero in silenzio."""
+    import importlib.util
+    import os as _os
+    import sys as _sys
+
+    path = Path(__file__).resolve().parent.parent / "tools" / "configurer.py"
+    check("configurer: il file esiste", path.is_file(), str(path))
+    spec = importlib.util.spec_from_file_location("flair_configurer", path)
+    assert spec and spec.loader
+    conf = importlib.util.module_from_spec(spec)
+    _sys.modules["flair_configurer"] = conf
+    spec.loader.exec_module(conf)      # deve importarsi SENZA tkinter installato
+    check("configurer: importabile headless (tkinter lazy)", conf.tk is None)
+
+    # ── Catalogo: nessun help perso, choices solo sui campi choice ────────────
+    check("configurer: ogni campo ha un help",
+          [f.key for f in conf.CATALOG if not f.help] == [])
+    check("configurer: choices è una tupla e solo sui campi choice",
+          all(isinstance(f.choices, tuple) for f in conf.CATALOG if f.kind == "choice")
+          and all(f.choices is None for f in conf.CATALOG if f.kind != "choice"))
+    check("configurer: default coerente col tipo dichiarato",
+          all(f.default in f.choices for f in conf.CATALOG
+              if f.kind == "choice" and f.default is not None))
+
+    # ── GUARD DI PARITÀ: catalogo vs default effettivi di load_config() ───────
+    saved = {k: v for k, v in _os.environ.items()
+             if k.startswith(("FLAIR_", "DEEPSEEK_", "OPENAI_", "LOCAL_", "TAVILY_"))}
+    try:
+        for k in saved:
+            del _os.environ[k]
+        _os.environ["DEEPSEEK_API_KEY"] = "sk-test"
+        cfg = load_config()
+        effective = {
+            "FLAIR_MAX_TOKENS": cfg.max_tokens, "FLAIR_TIMEOUT": cfg.request_timeout,
+            "FLAIR_MAX_STEPS": cfg.max_steps, "FLAIR_EXPLORER_MAX_STEPS": cfg.explorer_max_steps,
+            "FLAIR_PARALLEL_TOOLS_MAX": cfg.parallel_tools_max_workers,
+            "FLAIR_CONTEXT_WINDOW": cfg.context_window,
+            "FLAIR_COMPACT_RATIO": cfg.compact_threshold_ratio,
+            "FLAIR_COMPACT_KEEP": cfg.compact_keep_recent,
+            "FLAIR_COMPACT_SUMMARY_MAX": cfg.compact_summary_max_tokens,
+            "FLAIR_PRUNE_HYSTERESIS": cfg.prune_hysteresis_ratio,
+            "FLAIR_IMAGE_MAX_SIDE": cfg.image_max_side,
+            "FLAIR_IMAGE_TOKENS": cfg.image_token_estimate,
+            "FLAIR_READ_MAX": cfg.read_file_max_chars, "FLAIR_GREP_MAX": cfg.grep_max_chars,
+            "FLAIR_CMD_MAX": cfg.command_max_chars, "FLAIR_REPOMAP_MAX": cfg.repomap_max_chars,
+            "FLAIR_LISTDIR_MAX": cfg.list_dir_max_entries,
+            "FLAIR_SEARCH_MAX": cfg.search_max_results,
+            "FLAIR_SEARCH_SCAN_MAX": cfg.search_max_scanned,
+            "FLAIR_WEB_MAX": cfg.web_max_results, "FLAIR_MEMORY_MAX_CHARS": cfg.memory_max_chars,
+            "FLAIR_MAX_COST": cfg.max_cost, "FLAIR_THINK_STEPS": cfg.think_steps,
+            "DEEPSEEK_BASE_URL": cfg.deepseek.base_url, "DEEPSEEK_MODEL": cfg.deepseek.model,
+            "DEEPSEEK_THINK_MODEL": cfg.deepseek.think_model,
+            "OPENAI_MODEL": cfg.openai.model, "OPENAI_THINK_MODEL": cfg.openai.think_model,
+            "LOCAL_BASE_URL": cfg.local.base_url, "LOCAL_MODEL": cfg.local.model,
+        }
+        drift = []
+        for key, real in effective.items():
+            declared = conf.CATALOG_BY_KEY[key].default
+            if declared is None:
+                drift.append(f"{key}: catalogo dichiara 'unset', config.py ha {real!r}")
+                continue
+            try:
+                same = abs(float(real) - float(declared)) < 1e-9
+            except (TypeError, ValueError):
+                same = str(real).strip() == str(declared).strip()
+            if not same:
+                drift.append(f"{key}: catalogo={declared!r} config.py={real!r}")
+        check("configurer: default del catalogo allineati a load_config()", drift == [], "; ".join(drift))
+        check("configurer: nessuna chiave del catalogo fuori da .env.example",
+              all(f.key in (Path(__file__).resolve().parent.parent / ".env.example")
+                  .read_text(encoding="utf-8") for f in conf.CATALOG))
+    finally:
+        for k in [k for k in _os.environ
+                  if k.startswith(("FLAIR_", "DEEPSEEK_", "OPENAI_", "LOCAL_", "TAVILY_"))]:
+            del _os.environ[k]
+        _os.environ.update(saved)
+
+    # ── Round-trip: commenti, layout e fine-riga preservati byte per byte ─────
+    crlf = ("# \u2500\u2500 Active provider \u2500\u2500\u2500\u2500\r\n"
+            "FLAIR_PROVIDER=deepseek\r\n"
+            "\r\n"
+            "# \u2500\u2500 Generation / loop \u2500\u2500\u2500\u2500\r\n"
+            "FLAIR_MAX_TOKENS=32000   # inline note\r\n"
+            "# FLAIR_THINK_STEPS=first\r\n"
+            "# FLAIR_DEEPSEEK_FIRST_PARTY=true|false (default: auto)\r\n")
+    check("configurer: nessuna modifica → file byte-identico (CRLF)",
+          conf.render_env(crlf, {}) == crlf)
+    out = conf.render_env(crlf, {"FLAIR_MAX_TOKENS": "16000"})
+    check("configurer: edit preserva CRLF e commento inline",
+          "\r\r\n" not in out and out.count("\r\n") == crlf.count("\r\n")
+          and "FLAIR_MAX_TOKENS=16000   # inline note" in out)
+    check("configurer: la prosa non è confusa con una entry commentata",
+          "FLAIR_DEEPSEEK_FIRST_PARTY" not in conf.parse_env(crlf)[1]
+          and "FLAIR_THINK_STEPS" in conf.parse_env(crlf)[1])
+    check("configurer: unset commenta la riga conservando il valore",
+          "# FLAIR_MAX_TOKENS=32000" in conf.render_env(crlf, {"FLAIR_MAX_TOKENS": None}))
+    check("configurer: chiave nuova inserita nella sua sezione",
+          "FLAIR_STREAM=false" in conf.render_env(crlf, {"FLAIR_STREAM": "false"}))
+    check("configurer: chiavi sconosciute non vengono toccate",
+          "PIPPO=1" in conf.render_env("PIPPO=1\n", {"FLAIR_MAX_STEPS": "10"}))
+    check("configurer: quoting solo quando serve",
+          conf.quote_value("plain") == "plain" and conf.quote_value("with space").startswith('"'))
+    # LF puro: l'EOL del file non viene convertito
+    lf = "FLAIR_PROVIDER=local\nFLAIR_MAX_STEPS=60\n"
+    check("configurer: file LF resta LF", "\r" not in conf.render_env(lf, {"FLAIR_MAX_STEPS": "40"}))
+
+    # ── Validazione: errori bloccanti vs warning ──────────────────────────────
+    errs, warns = conf.validate({"FLAIR_PROVIDER": "deepseek", "FLAIR_MAX_STEPS": "abc"}, Path("."))
+    check("configurer: valore non numerico → errore", any("not a valid int" in e for e in errs))
+    check("configurer: provider senza API key → warning", any("API_KEY" in w for w in warns))
+    errs2, _ = conf.validate({"FLAIR_PROVIDER": "pippo"}, Path("."))
+    check("configurer: provider sconosciuto → errore", errs2 != [])
+    _, warns3 = conf.validate({"FLAIR_COMPACT_RATIO": "0.8", "FLAIR_PRUNE_HYSTERESIS": "0.9",
+                               "DEEPSEEK_API_KEY": "x"}, Path("."))
+    check("configurer: isteresi >= ratio → warning incrociato",
+          any("PRUNE_HYSTERESIS" in w for w in warns3))
+    errs4, _ = conf.validate({"FLAIR_COMPACT_RATIO": "1.5", "DEEPSEEK_API_KEY": "x"}, Path("."))
+    check("configurer: fuori dai limiti → errore", any("maximum" in e for e in errs4))
+
+    # ── build_default_env: generabile e ri-parsabile (giro completo) ──────────
+    generated = conf.build_default_env()
+    values, _ = conf.parse_env(generated)
+    check("configurer: template generato ri-parsabile",
+          values.get("FLAIR_PROVIDER") == "deepseek" and len(values) > 10, len(values))
+    check("configurer: template senza backslash orfani nelle intestazioni",
+          "\\u" not in generated)
+
+
 def main():
     test_arg_parse()
     test_usage_normalization()
@@ -4292,6 +4424,7 @@ def main():
     test_cache_breaks_counter()
     test_deepseek_endpoint_profiles()
     test_vision()
+    test_configurer()
     test_budget_abort()
     test_read_only_mode()
     test_automation_helpers()

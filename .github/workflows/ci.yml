@@ -21,10 +21,10 @@ jobs:
         run: pip install -e ".[dev]"
 
       - name: Lint (ruff)
-        run: ruff check flair tests
+        run: ruff check flair tests tools
 
       - name: Type-check (mypy)
-        run: mypy flair
+        run: mypy flair tools
 
       - name: Tests
         run: python tests/test_smoke.py

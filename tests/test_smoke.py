@@ -1177,7 +1177,6 @@ def test_shell_multiline_routing():
 
 
 def test_shell_decoding_robust():
-    import os as _os
     import sys as _sys
     import tempfile as _tf
 
@@ -1189,12 +1188,16 @@ def test_shell_decoding_robust():
     try:
         (d / "emit.py").write_text(
             'import sys; sys.stdout.buffer.write(b"\\xff\\xfe ok")\n', encoding="utf-8")
+        # Le due coppie di virgolette interne bastano e servono (path con spazi). NON
+        # aggiungerne un giro esterno "per cmd": su Windows subprocess(shell=True)
+        # compone GIÀ `cmd.exe /c "<comando>"`, quindi il secondo giro romperebbe il
+        # parsing ("La sintassi del nome del file ... non è corretta"). Verificato sul
+        # campo: è un ramo che gira solo su Windows, invisibile alla CI Linux.
         cmd = f'"{_sys.executable}" "{d / "emit.py"}"'
-        if _os.name == "nt":
-            cmd = '"' + cmd + '"'   # cmd /c: le virgolette esterne proteggono le due coppie interne
         proc = shell.run_shell(cmd, timeout=30)
         check("shell: output non decodificabile non rompe",
-              proc.returncode == 0 and isinstance(proc.stdout, str) and "ok" in proc.stdout, repr(proc.stdout))
+              proc.returncode == 0 and isinstance(proc.stdout, str) and "ok" in proc.stdout,
+              f"rc={proc.returncode} stdout={proc.stdout!r} stderr={proc.stderr!r}")
     finally:
         shutil.rmtree(d, ignore_errors=True)
 

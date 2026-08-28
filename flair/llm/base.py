@@ -212,6 +212,7 @@ class LLMProvider(ABC):
         on_delta: OnDelta | None = None,
         on_reasoning: OnDelta | None = None,
         on_reasoning_delta: OnDelta | None = None,
+        tool_choice: str | None = None,
     ) -> LLMResponse:
         raise NotImplementedError
 
@@ -279,7 +280,8 @@ class OpenAICompatProvider(LLMProvider):
     # DeepSeek: solo quel provider (su quell'endpoint) le attiva. Default: flat.
     banded_pricing: bool = False
 
-    def _build_params(self, messages, tools, think, max_tokens) -> dict[str, Any]:
+    def _build_params(self, messages, tools, think, max_tokens,
+                      tool_choice: str | None = None) -> dict[str, Any]:
         pc = self.cfg.active
         model = pc.think_model if think else pc.model
         if not self.keeps_reasoning_history:
@@ -292,7 +294,11 @@ class OpenAICompatProvider(LLMProvider):
         params[self.token_param] = max_tokens if max_tokens is not None else self.cfg.max_tokens
         if tools:
             params["tools"] = tools
-            params["tool_choice"] = "auto"
+            # "none" = schemi INVIATI ma chiamate vietate: serve a chiedere testo
+            # (riassunto di compaction, sintesi finale) SENZA cambiare il prompt
+            # renderizzato, quindi senza rompere il prefisso in cache. Togliere
+            # l'array `tools` otterrebbe lo stesso divieto pagando un cache-miss.
+            params["tool_choice"] = tool_choice or "auto"
         self._apply_reasoning(params, model, think)
         return params
 
@@ -322,8 +328,9 @@ class OpenAICompatProvider(LLMProvider):
         on_delta: OnDelta | None = None,
         on_reasoning: OnDelta | None = None,
         on_reasoning_delta: OnDelta | None = None,
+        tool_choice: str | None = None,
     ) -> LLMResponse:
-        params = self._build_params(messages, tools, think, max_tokens)
+        params = self._build_params(messages, tools, think, max_tokens, tool_choice)
 
         if stream and on_delta is not None:
             try:

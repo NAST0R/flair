@@ -97,9 +97,10 @@ class FakeProvider:
         self.calls = []  # kwargs di ogni chiamata
 
     def complete(self, messages, tools=None, think=False, max_tokens=None, stream=False,
-                 on_delta=None, on_reasoning=None, on_reasoning_delta=None):
+                 on_delta=None, on_reasoning=None, on_reasoning_delta=None, tool_choice=None):
         self.seen.append([dict(m) for m in messages])
-        self.calls.append({"think": think, "max_tokens": max_tokens, "stream": stream})
+        self.calls.append({"think": think, "max_tokens": max_tokens, "stream": stream,
+                           "tools": tools, "tool_choice": tool_choice})
         if self.i >= len(self.script):
             return LLMResponse(content="FINE", usage=Usage(total_tokens=1))
         r = self.script[self.i]
@@ -255,7 +256,7 @@ def test_coding_agent():
     a2 = coding_agent.build(cfg, fake2)
     a2.run("leggi passwd")
     tmsgs = [m for m in a2.messages if m["role"] == "tool"]
-    check("coding: sandbox blocca uscita", any("fuori dalla radice" in m["content"] for m in tmsgs))
+    check("coding: sandbox blocca uscita", any("outside the working root" in m["content"] for m in tmsgs))
 
     # edit ambiguo
     (root / "amb.py").write_text("x = 1\nx = 1\n", encoding="utf-8")
@@ -1452,10 +1453,18 @@ def test_tool_robustness():
 
     # 3) Argomento sconosciuto: il tool gira lo stesso, con nota; nessuna eccezione.
     r4 = coding.read_file(ctx, path="alpha.py", raw=True)
+    # La nota è un SUFFISSO: il primo carattere dell'output resta quello del tool,
+    # così `ok = not out.startswith("❌")` continua a dire la verità (vedi sotto).
     check("dispatch: kwarg sconosciuto ignorato con nota",
-          r4.startswith("ℹ️ Ignored arguments") and "raw" in r4.splitlines()[0], r4.splitlines()[0])
+          r4.rstrip().endswith("(not accepted by read_file): raw.") and "Ignored arguments" in r4, r4[-80:])
     r5 = coding.read_file(ctx, path="alpha.py", limit=1)
-    check("dispatch: kwarg validi → nessuna nota", not r5.startswith("ℹ️"), r5.splitlines()[0])
+    check("dispatch: kwarg validi → nessuna nota", "Ignored arguments" not in r5, r5.splitlines()[0])
+    # La regressione che questo protegge: con la nota in TESTA, un tool FALLITO
+    # sembrava riuscito (❌ non era più il primo carattere) → colore verde a video,
+    # ok=true in --json e il file elencato in files_changed senza essere stato scritto.
+    r6 = coding.read_file(ctx, path="manca.py", raw=True)
+    check("dispatch: la nota non falsifica l'esito di un tool fallito",
+          r6.startswith("❌") and "Ignored arguments" in r6, r6[:60])
 
     # Un argomento OBBLIGATORIO mancante dà ora un errore AZIONABILE (ToolError) che
     # nomina cosa manca, invece di un TypeError grezzo.
@@ -2890,6 +2899,60 @@ def test_english_surface():
     out = _fs.list_dir_impl(root, "en_dir", max_entries=2)
     check("superficie inglese runtime: overflow list_directory",
           "more entries]" in out and not rx.findall(out), out)
+
+    # ── Guardia GENERICA: nessun italiano nelle stringhe EMESSE dai tool ──────
+    # Sopra si asseriscono costanti NOTE (elencate a mano, quindi con buchi: tre
+    # leftover — sandbox di fs, note e hint di repomap, header delle istruzioni di
+    # progetto — sono sopravvissuti così per mesi). Questa parte chiude la categoria:
+    # scandisce l'AST di ogni modulo di tool (più i prompt) e cerca lessico italiano
+    # SOLO nelle stringhe che possono finire nel contesto del modello, cioè quelle di
+    # un `return` o di un `ToolError(...)`. Le stringhe di INPUT non sono toccate:
+    # i sinonimi tollerati in plan.py, as_bool in fs.py e le regex del router restano
+    # legittimamente in italiano.
+    import ast as _ast
+
+    italian = _re.compile(
+        r"\b(?:della|dello|delle|degli|dalla|dallo|nella|nello|nelle|negli|"
+        r"radice|cartella|scansione|limitata|sottocartella|restringere|istruzioni|"
+        r"specifiche|lavoro|sicurezza|errore|richiesta|contesto|"
+        r"presente|assente|mancante|impossibile|oppure|invece|perch)\b", _re.I)
+
+    def emitted_strings(path: Path) -> list[tuple[int, str]]:
+        """(riga, testo) di ogni stringa letterale in un `return` o in un
+        `ToolError(...)`; f-string e concatenazioni con + incluse."""
+        found: list[tuple[int, str]] = []
+
+        def collect(node, lineno: int) -> None:
+            if isinstance(node, _ast.Constant) and isinstance(node.value, str):
+                found.append((lineno, node.value))
+            elif isinstance(node, _ast.JoinedStr):
+                for v in node.values:
+                    if isinstance(v, _ast.Constant) and isinstance(v.value, str):
+                        found.append((lineno, v.value))
+            elif isinstance(node, _ast.BinOp):
+                collect(node.left, lineno)
+                collect(node.right, lineno)
+
+        for node in _ast.walk(_ast.parse(path.read_text(encoding="utf-8"))):
+            if isinstance(node, _ast.Return) and node.value is not None:
+                collect(node.value, node.lineno)
+            elif isinstance(node, _ast.Call) and getattr(node.func, "id", "") == "ToolError":
+                for arg in node.args:
+                    collect(arg, node.lineno)
+        return found
+
+    import flair.prompts as _prompts_mod
+    from flair.tools import fs as _fs_mod
+    tools_dir = Path(_fs_mod.__file__).resolve().parent
+    scanned = sorted(tools_dir.glob("*.py")) + [Path(_prompts_mod.__file__).resolve()]
+    offenders: list[str] = []
+    for mod_path in scanned:
+        for lineno, text in emitted_strings(mod_path):
+            hit = italian.search(text)
+            if hit:
+                offenders.append(f"{mod_path.name}:{lineno} «{hit.group(0)}» in {text[:50]!r}")
+    check(f"superficie inglese: stringhe emesse ({len(scanned)} moduli scansionati)",
+          offenders == [], "; ".join(offenders[:4]))
 
 
 def test_reasoning_stream_feedback():
@@ -4345,6 +4408,139 @@ def test_configurer():
           "\\u" not in generated)
 
 
+def test_tool_choice_none():
+    """Riassunto di compaction e sintesi finale chiedono TESTO senza togliere gli
+    schemi dei tool: `tool_choice="none"` vieta le chiamate lasciando il prefisso
+    renderizzato identico (cache riusata). Prima: il riassunto cadeva sul render
+    lossy quando il modello rispondeva con una tool call, e _force_final inviava
+    tools=None pagando un cache-miss integrale."""
+    from flair.core.agent import _COMPACT_PROMPT
+
+    def history():
+        return [{"role": "user", "content": "task " + "x" * 3000},
+                {"role": "assistant", "content": "ok"},
+                {"role": "user", "content": "altro"},
+                {"role": "assistant", "content": "fatto"}]
+
+    # ── Riassunto: schemi presenti E chiamate vietate ─────────────────────────
+    cfg = cfg_for(Path("."))
+    cfg.compact_keep_recent = 1
+    prov = FakeProvider([LLMResponse(content="SINTESI", usage=Usage(total_tokens=5))])
+    agent = coding_agent.build(cfg, prov)
+    agent.convo.messages = history()
+    check("tool_choice: compaction riuscita", agent._compact() is True)
+    call = prov.calls[0]
+    check("tool_choice: il riassunto invia gli schemi (prefisso invariato)",
+          call["tools"] == agent.toolset.schemas())
+    check("tool_choice: il riassunto vieta le tool call", call["tool_choice"] == "none", str(call))
+    check("tool_choice: una sola chiamata (nessun fallback al render)",
+          len(prov.calls) == 1 and prov.seen[0][0]["content"] != _COMPACT_PROMPT)
+
+    # ── Sintesi finale (max_steps): idem, schemi presenti e chiamate vietate ──
+    cfg2 = cfg_for(Path("."))
+    prov2 = FakeProvider([
+        LLMResponse(tool_calls=[tc("read_file", path="x.py")]),
+        LLMResponse(content="RISPOSTA FINALE"),
+    ])
+    agent2 = coding_agent.build(cfg2, prov2)
+    res = agent2.run("task", max_steps=1)
+    check("tool_choice: max_steps → sintesi finale", res.stopped_reason == "max_steps")
+    final = prov2.calls[-1]
+    check("tool_choice: la sintesi finale NON azzera gli schemi",
+          final["tools"] == agent2.toolset.schemas(), str(final["tools"])[:60])
+    check("tool_choice: la sintesi finale vieta le tool call", final["tool_choice"] == "none")
+
+    # ── Il loop normale resta 'auto' (nessuna regressione) ────────────────────
+    check("tool_choice: gli step del loop restano liberi di chiamare tool",
+          prov2.calls[0]["tool_choice"] is None)
+
+    # ── Livello provider: "none" arriva nella richiesta, il default resta auto ─
+    import os as _os
+    _os.environ["DEEPSEEK_API_KEY"] = "sk-test"
+    cfgd = cfg_for(Path("."))
+    cfgd.provider = "deepseek"
+    ds = DeepSeekProvider(cfgd)
+    schemas = [{"type": "function", "function": {"name": "t", "description": "d", "parameters": {}}}]
+    p_auto = ds._build_params([{"role": "user", "content": "x"}], schemas, False, 100)
+    p_none = ds._build_params([{"role": "user", "content": "x"}], schemas, False, 100, "none")
+    check("tool_choice: default 'auto' invariato", p_auto["tool_choice"] == "auto")
+    check("tool_choice: 'none' inoltrato", p_none["tool_choice"] == "none")
+    check("tool_choice: gli schemi restano in entrambi i casi",
+          p_auto["tools"] == schemas and p_none["tools"] == schemas)
+    p_no_tools = ds._build_params([{"role": "user", "content": "x"}], None, False, 100, "none")
+    check("tool_choice: senza schemi non si inventa il campo", "tool_choice" not in p_no_tools)
+
+
+def test_session_log_record():
+    """Il JSONL di sessione deve poter rispondere a 'quanto è costato questo turno,
+    su quale endpoint e con quale modello' senza ricalcoli a posteriori."""
+    import json as _json
+    import tempfile as _tf
+
+    from flair.core.agent import AgentResult
+    from flair.session_log import SessionLogger
+
+    d = Path(_tf.mkdtemp(prefix="flair_log_")).resolve()
+    try:
+        logger = SessionLogger(d)
+        check("log: file jsonl creato nella cartella", logger.path.parent == d and logger.path.suffix == ".jsonl")
+        result = AgentResult("risposta", Usage(prompt_tokens=100, completion_tokens=20,
+                                               total_tokens=120, cache_hit_tokens=90,
+                                               cache_miss_tokens=10), steps=3, stopped_reason="done")
+        logger.log_turn("coding", "task", result,
+                        [{"name": "read_file", "ok": True}], cache_breaks=2,
+                        provider="deepseek", model="deepseek-v4-flash", cost_usd=0.00123456)
+        rec = _json.loads(logger.path.read_text(encoding="utf-8").strip())
+        check("log: campi identificativi del turno",
+              rec["agent"] == "coding" and rec["steps"] == 3 and rec["stopped_reason"] == "done")
+        check("log: provider e modello del turno", rec["provider"] == "deepseek"
+              and rec["model"] == "deepseek-v4-flash")
+        check("log: costo registrato e arrotondato", rec["cost_usd"] == 0.001235, rec["cost_usd"])
+        check("log: rotture di prefisso e usage completo",
+              rec["cache_breaks"] == 2 and rec["usage"]["cache_hit_tokens"] == 90)
+        check("log: tool del turno", rec["tools"][0]["name"] == "read_file")
+
+        # Retrocompatibilità: i campi nuovi sono opzionali (chiamata vecchio stile).
+        logger.log_turn("general", "t2", result, [])
+        rec2 = _json.loads(logger.path.read_text(encoding="utf-8").strip().splitlines()[-1])
+        check("log: campi nuovi opzionali → None, nessun crash",
+              rec2["provider"] is None and rec2["model"] is None and rec2["cost_usd"] is None)
+
+        # Un JSONL è una riga per turno: due turni, due righe parsabili.
+        check("log: una riga per turno",
+              len(logger.path.read_text(encoding="utf-8").strip().splitlines()) == 2)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_config_error_is_clean():
+    """Un valore di configurazione fuori dominio deve produrre il messaggio pulito
+    di 'Invalid configuration', non un traceback: load_config() può già sollevare
+    (FLAIR_THINK_STEPS) e prima stava FUORI dal try che protegge validate()."""
+    import io as _io
+    import os as _os
+    from contextlib import redirect_stderr, redirect_stdout
+
+    from flair.cli import main
+
+    saved = _os.environ.get("FLAIR_THINK_STEPS")
+    _os.environ["FLAIR_THINK_STEPS"] = "sempre"     # dominio: first | all
+    _os.environ.setdefault("DEEPSEEK_API_KEY", "sk-test")
+    try:
+        err, out = _io.StringIO(), _io.StringIO()
+        with redirect_stderr(err), redirect_stdout(out):
+            code = main(["-p", "ciao", "--json"])
+        check("config: exit code 1 invece del traceback", code == 1)
+        payload = out.getvalue().strip()
+        check("config: contratto --json rispettato anche sull'errore di config",
+              '"stopped_reason": "config_error"' in payload and "FLAIR_THINK_STEPS" in payload, payload[:120])
+    finally:
+        if saved is None:
+            _os.environ.pop("FLAIR_THINK_STEPS", None)
+        else:
+            _os.environ["FLAIR_THINK_STEPS"] = saved
+
+
 def main():
     test_arg_parse()
     test_usage_normalization()
@@ -4428,6 +4624,9 @@ def main():
     test_deepseek_endpoint_profiles()
     test_vision()
     test_configurer()
+    test_tool_choice_none()
+    test_session_log_record()
+    test_config_error_is_clean()
     test_budget_abort()
     test_read_only_mode()
     test_automation_helpers()

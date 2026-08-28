@@ -614,7 +614,9 @@ class CLI:
 
         if self.logger:
             self.logger.log_turn(agent_key, task, result, self._turn_tools,
-                                 cache_breaks=self.convo.cache_breaks)
+                                 cache_breaks=self.convo.cache_breaks,
+                                 provider=self.cfg.provider, model=self.cfg.active.model,
+                                 cost_usd=self.provider.estimate_cost(result.usage, self.cfg))
 
         if human:
             self._print_turn(result.usage, result.steps, result.stopped_reason)
@@ -699,13 +701,13 @@ class CLI:
             ("/root <path>", "change the working folder (coding + general; reloads instructions)"),
             ("/img <path> [prompt]", "attach an image to the turn (vision endpoints only)"),
             ("/help", "this help"),
-            ("exit | quit", "esci"),
+            ("exit | quit", "leave the REPL"),
         ):
             table.add_row(Text(cmd), desc)
         self.console.print(table)
         self.console.print(
-            "[dim]Flag di avvio (CLI): «flair -h». Esempi: flair --think -p \"...\", "
-            "flair --session lavoro, flair --continue, flair --provider openai.[/dim]\n")
+            "[dim]Startup flags (CLI): «flair -h». Examples: flair --think -p \"...\", "
+            "flair --session work, flair --continue, flair --provider openai.[/dim]\n")
 
     def _print_tools(self) -> None:
         key = self.last_agent or "general"
@@ -989,12 +991,15 @@ def main(argv: list[str] | None = None) -> int:
     headless = json_mode or quiet_mode
 
     console = Console(stderr=headless)  # in headless i messaggi umani vanno su stderr
-    cfg = _build_config(args)
-    if headless:
-        cfg.stream = False              # niente delta su stdout: resta pulito per la macchina
+    # Costruzione E validazione nello stesso try: load_config() può già rifiutare un
+    # valore (es. FLAIR_THINK_STEPS fuori dominio solleva ValueError) e prima usciva
+    # con un traceback invece del messaggio pulito riservato agli errori di config.
     try:
+        cfg = _build_config(args)
+        if headless:
+            cfg.stream = False          # niente delta su stdout: resta pulito per la macchina
         cfg.validate()
-    except RuntimeError as exc:
+    except (RuntimeError, ValueError) as exc:
         if json_mode:
             sys.stdout.write(json.dumps(
                 {"ok": False, "stopped_reason": "config_error", "response": "", "error": str(exc)}) + "\n")

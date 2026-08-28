@@ -46,7 +46,7 @@ def resolve(root: Path | None, raw: str) -> Path:
     try:
         candidate.relative_to(root)
     except ValueError as exc:
-        raise PathOutsideRoot(f"Path fuori dalla radice di lavoro ({root}): {raw}") from exc
+        raise PathOutsideRoot(f"Path outside the working root ({root}): {raw}") from exc
     return candidate
 
 

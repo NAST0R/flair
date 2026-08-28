@@ -326,6 +326,6 @@ def build_repo_map(root: Path | None, rel_path: str, max_chars: int) -> str:
                 "Use list_directory/glob to see the files.")
 
     header = f"Project map ({len(blocks)} files with definitions):\n\n"
-    note = "\n\n[Scansione limitata ai primi file per sicurezza.]" if capped else ""
+    note = f"\n\n[Scan capped at the first {_MAX_FILES} files.]" if capped else ""
     return _trunc(header + "\n\n".join(blocks) + note, max_chars,
-                  hint="mappa una sottocartella con `path` per restringere")
+                  hint="map a subfolder with `path` to narrow it down")

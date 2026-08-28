@@ -406,10 +406,10 @@ class Agent:
     def _streaming(self) -> bool:
         return bool(self.cfg.stream and self.on_delta)
 
-    def _complete(self, tools, think) -> LLMResponse:
+    def _complete(self, tools, think, tool_choice: str | None = None) -> LLMResponse:
         self._maybe_compact()
         try:
-            resp = self._raw_complete(tools, think)
+            resp = self._raw_complete(tools, think, tool_choice)
         except Exception as exc:  # noqa: BLE001
             if is_context_overflow(exc):
                 # Prima la potatura (gratis), poi il riassunto aggressivo: in overflow
@@ -418,7 +418,7 @@ class Agent:
                 shrunk = self._compact(aggressive=True) or shrunk
                 if shrunk:
                     log.warning("Overflow di contesto: compattato e ritento.")
-                    resp = self._raw_complete(tools, think)
+                    resp = self._raw_complete(tools, think, tool_choice)
                 else:
                     raise
             else:
@@ -431,12 +431,13 @@ class Agent:
         self.convo.sent_upto = len(self.convo.messages)
         return resp
 
-    def _raw_complete(self, tools, think) -> LLMResponse:
+    def _raw_complete(self, tools, think, tool_choice: str | None = None) -> LLMResponse:
         streaming = self._streaming()
         return self.provider.complete(
             self.messages,
             tools=tools,
             think=think,
+            tool_choice=tool_choice,
             stream=streaming,
             on_delta=self.on_delta if streaming else None,
             on_reasoning=self.on_reasoning if streaming else None,
@@ -570,6 +571,12 @@ class Agent:
                      *msgs,
                      {"role": "user", "content": _SUMMARIZE_ON_PREFIX}],
                     tools=self.toolset.schemas(),
+                    # Schemi INVIATI (prefisso identico → cache riusata) ma chiamate
+                    # VIETATE: i modelli thinking, dopo decine di step a tool, tendono
+                    # a rispondere all'istruzione con una tool call — e ogni volta si
+                    # ripiegava sul render legacy (output tool troncati a 800 char),
+                    # cioè il riassunto peggiore proprio dove serve il migliore.
+                    tool_choice="none",
                     think=False,
                     max_tokens=self.cfg.compact_summary_max_tokens,
                 )
@@ -871,7 +878,10 @@ class Agent:
             "did/read. No more tool calls."
         )})
         try:
-            resp = self._complete(tools=None, think=False)
+            # Gli schemi restano nella richiesta e le chiamate sono vietate da
+            # tool_choice: il prefisso renderizzato non cambia, quindi la sintesi
+            # finale non paga un cache-miss integrale (togliere `tools` lo pagava).
+            resp = self._complete(tools=self.toolset.schemas(), think=False, tool_choice="none")
             self.convo.messages.append({"role": "assistant", "content": resp.content})
             return resp.content or "(no answer produced)", resp.usage
         except Exception as exc:  # noqa: BLE001

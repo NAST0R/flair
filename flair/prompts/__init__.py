@@ -30,5 +30,5 @@ def project_instructions(root: Path) -> str:
                 continue
             if len(text) > _MAX_PROJECT_CHARS:
                 text = text[:_MAX_PROJECT_CHARS] + "\n…[instructions truncated]"
-            return f"\n\n## Istruzioni specifiche del progetto (da {name})\n\n{text}"
+            return f"\n\n## Project-specific instructions (from {name})\n\n{text}"
     return ""

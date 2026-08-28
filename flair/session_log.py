@@ -39,7 +39,12 @@ class SessionLogger:
         self.path = log_dir / f"session-{ts}.jsonl"
 
     def log_turn(self, agent: str, task: str, result, tool_events: list[dict],
-                 cache_breaks: int = 0) -> None:
+                 cache_breaks: int = 0, provider: str | None = None,
+                 model: str | None = None, cost_usd: float | None = None) -> None:
+        """Un record per turno. `provider`/`model`/`cost_usd` sono opzionali per
+        retrocompatibilità, ma senza di essi il log non può rispondere alla domanda
+        che conta — quanto è costato QUESTO turno su QUALE endpoint — e il costo va
+        ricalcolato a posteriori da una tabella prezzi, cioè indovinato."""
         usage = result.usage
         record = {
             "ts": datetime.now().isoformat(timespec="seconds"),
@@ -49,6 +54,9 @@ class SessionLogger:
             "steps": result.steps,
             "stopped_reason": result.stopped_reason,
             "cache_breaks": cache_breaks,
+            "provider": provider,
+            "model": model,
+            "cost_usd": round(cost_usd, 6) if cost_usd is not None else None,
             "usage": {
                 "prompt_tokens": usage.prompt_tokens,
                 "completion_tokens": usage.completion_tokens,

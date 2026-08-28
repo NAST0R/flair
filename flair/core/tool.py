@@ -178,7 +178,11 @@ class Tool:
             raise ToolError(_missing_args_message(self.name, missing, unknown))
         out = self.func(ctx, **clean)
         if unknown:
-            out = f"ℹ️ Ignored arguments (not accepted by {self.name}): {', '.join(unknown)}.\n" + out
+            # SUFFISSO, non prefisso: il chiamante deduce l'esito dal primo carattere
+            # (`ok = not out.startswith("❌")`), quindi anteporre la nota trasformava
+            # un tool FALLITO in un successo apparente — colore verde a video, ok=true
+            # nel contratto --json e il file elencato in files_changed pur non scritto.
+            out = out + f"\nℹ️ Ignored arguments (not accepted by {self.name}): {', '.join(unknown)}."
         return out
 
     def schema(self) -> dict:

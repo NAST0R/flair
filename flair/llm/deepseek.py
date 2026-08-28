@@ -65,11 +65,12 @@ class DeepSeekProvider(OpenAICompatProvider):
                  think: bool = False, max_tokens: int | None = None, stream: bool = False,
                  on_delta: Callable[[str], None] | None = None,
                  on_reasoning: Callable[[str], None] | None = None,
-                 on_reasoning_delta: Callable[[str], None] | None = None) -> LLMResponse:
+                 on_reasoning_delta: Callable[[str], None] | None = None,
+                 tool_choice: str | None = None) -> LLMResponse:
         try:
             return super().complete(messages, tools=tools, think=think, max_tokens=max_tokens,
                                     stream=stream, on_delta=on_delta, on_reasoning=on_reasoning,
-                                    on_reasoning_delta=on_reasoning_delta)
+                                    on_reasoning_delta=on_reasoning_delta, tool_choice=tool_choice)
         except BadRequestError as exc:
             # Cintura per endpoint sconosciuti (es. first-party FORZATO via env su
             # un host che poi rigetta il passback): si degrada al profilo compat e
@@ -80,7 +81,7 @@ class DeepSeekProvider(OpenAICompatProvider):
                 self.keeps_reasoning_history = False
                 return super().complete(messages, tools=tools, think=think, max_tokens=max_tokens,
                                         stream=stream, on_delta=on_delta, on_reasoning=on_reasoning,
-                                        on_reasoning_delta=on_reasoning_delta)
+                                        on_reasoning_delta=on_reasoning_delta, tool_choice=tool_choice)
             raise
 
     def _apply_reasoning(self, params, model: str, think: bool) -> None:

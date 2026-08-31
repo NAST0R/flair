@@ -4,11 +4,22 @@ on: [push, pull_request]
 
 jobs:
   checks:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.10", "3.12"]
+        # Windows non è un extra: parecchio codice ha rami `os.name == "nt"` (quoting
+        # di cmd.exe, PowerShell su file temporaneo, spinner del terminale, permessi
+        # dei file) che su Linux NON vengono mai eseguiti — un test rotto proprio lì
+        # è rimasto invisibile alla CI per settimane. Una sola versione di Python su
+        # Windows basta a coprire quei rami senza raddoppiare i minuti di build.
+        include:
+          - os: ubuntu-latest
+            python-version: "3.10"
+          - os: ubuntu-latest
+            python-version: "3.12"
+          - os: windows-latest
+            python-version: "3.12"
     steps:
       - uses: actions/checkout@v4
 

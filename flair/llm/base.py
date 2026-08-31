@@ -20,6 +20,7 @@ Principi:
 
 from __future__ import annotations
 
+import importlib
 import json
 import logging
 import random
@@ -46,16 +47,43 @@ try:  # presente in openai>=1.x
 except Exception:  # pragma: no cover
     BadRequestError = Exception  # type: ignore
 
-# httpx è una dipendenza di openai. Durante l'iterazione di uno stream, l'SDK NON
-# riavvolge i timeout/errori di rete: esce il `httpx.ReadTimeout` (o altri
-# TransportError) grezzo. Vanno trattati come transitori, altrimenti uno stallo
-# di rete a metà stream sfugge al fallback e fa crashare il programma.
-try:
-    import httpx
-    _HTTPX_TRANSIENT: tuple[type[Exception], ...] = (httpx.TransportError,)
-except Exception:  # pragma: no cover
-    httpx = None  # type: ignore[assignment]
-    _HTTPX_TRANSIENT = ()
+# Libreria HTTP sotto l'SDK. Durante l'iterazione di uno stream l'SDK NON riavvolge
+# i timeout/errori di rete: esce il `ReadTimeout` (o altri TransportError) GREZZO,
+# che va trattato come transitorio — altrimenti uno stallo a metà stream sfugge al
+# fallback e fa crashare il programma. Dalla 3.0 l'SDK openai è passato da `httpx`
+# a `httpx2`, gerarchie di eccezioni SEPARATE (httpx2.TransportError NON è
+# httpx.TransportError): si raccolgono i TransportError di TUTTI i moduli presenti,
+# così la rete di sicurezza vale su entrambe le generazioni dell'SDK invece di
+# smettere di agganciare in silenzio.
+_HTTP_MODULES: tuple = ()
+for _name in ("httpx", "httpx2"):
+    try:
+        _HTTP_MODULES += (importlib.import_module(_name),)
+    except ImportError:  # pragma: no cover — almeno uno dei due c'è sempre
+        pass
+httpx = next((m for m in _HTTP_MODULES if m.__name__ == "httpx"), None)  # type: ignore[assignment]
+_HTTPX_TRANSIENT: tuple[type[Exception], ...] = tuple(
+    m.TransportError for m in _HTTP_MODULES if hasattr(m, "TransportError")
+)
+
+
+def _sdk_http_module():
+    """Il modulo HTTP che l'SDK openai INSTALLATO usa davvero (httpx2 dalla 3.0,
+    httpx prima). Il client del CA bundle deve venire da QUEL modulo: l'SDK
+    costruisce le richieste coi propri tipi e le passa al client che gli diamo,
+    quindi mescolare le due generazioni romperebbe il percorso self-signed.
+    Si legge il nome legato nel namespace di `openai._base_client` (l'unico posto
+    dove l'informazione esiste); se l'introspezione non riesce, si ripiega sul
+    primo modulo disponibile — comportamento identico a prima della 3.0."""
+    try:
+        from openai import _base_client as _bc
+        for name in ("httpx2", "httpx"):
+            mod = getattr(_bc, name, None)
+            if mod is not None and hasattr(mod, "Client"):
+                return mod
+    except Exception:  # noqa: BLE001 — API privata: se cambia, si ripiega
+        pass
+    return _HTTP_MODULES[0] if _HTTP_MODULES else None
 
 log = logging.getLogger(__name__)
 
@@ -249,10 +277,12 @@ def _build_http_client(cfg):
     oltre che sull'SDK, così vale qualunque dei due abbia la precedenza."""
     if not getattr(cfg, "ca_bundle", None):
         return None
-    if httpx is None:  # pragma: no cover — openai dipende da httpx; solo prudenza
-        raise RuntimeError("FLAIR_CA_BUNDLE requires the httpx package (installed with openai).")
+    mod = _sdk_http_module()
+    if mod is None:  # pragma: no cover — l'SDK porta sempre httpx o httpx2
+        raise RuntimeError("FLAIR_CA_BUNDLE requires the HTTP library of the openai SDK "
+                           "(httpx, or httpx2 from openai 3.0): reinstall with `pip install -e .`.")
     ctx = ssl.create_default_context(cafile=str(cfg.ca_bundle))
-    return httpx.Client(verify=ctx, timeout=cfg.request_timeout)
+    return mod.Client(verify=ctx, timeout=cfg.request_timeout)
 
 
 class OpenAICompatProvider(LLMProvider):

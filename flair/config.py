@@ -250,6 +250,9 @@ class Config:
     # l'encoder del server e torna nell'usage; questa serve solo alla compaction.
     image_max_side: int = 1536
     image_token_estimate: int = 1200
+    # Calibrazione della stima del contesto sui prompt_tokens reali (v.
+    # core/agent.py). False = stima statica chars//4, comportamento pre-esistente.
+    context_calibration: bool = True
 
     # Isteresi dello stadio 0: la potatura da sola evita il riassunto SOLO se porta
     # il contesto sotto soglia con questo margine (frazione della finestra). La
@@ -327,6 +330,30 @@ class Config:
             raise RuntimeError(f"FLAIR_ROOT does not exist: {self.root}")
         if self.ca_bundle is not None and not self.ca_bundle.is_file():
             raise RuntimeError(f"FLAIR_CA_BUNDLE does not exist: {self.ca_bundle}")
+        # Combinazioni IMPOSSIBILI, non semplicemente insolite: meglio un fail-fast
+        # con il rimedio nel messaggio che scoprirlo a metà sessione (o non scoprirlo,
+        # come per una finestra più piccola del tetto di output — dove il prompt non
+        # ha spazio per esistere e il modello tronca a metà generazione).
+        if self.context_window <= 0:
+            raise RuntimeError(f"FLAIR_CONTEXT_WINDOW must be > 0 (got {self.context_window}).")
+        if not 0 < self.compact_threshold_ratio <= 1:
+            raise RuntimeError(
+                f"FLAIR_COMPACT_RATIO must be in (0, 1] (got {self.compact_threshold_ratio}): "
+                "it is the fraction of the window past which the context gets compacted.")
+        if not 0 <= self.prune_hysteresis_ratio < 1:
+            raise RuntimeError(
+                f"FLAIR_PRUNE_HYSTERESIS must be in [0, 1) (got {self.prune_hysteresis_ratio}).")
+        if self.max_tokens >= self.context_window:
+            raise RuntimeError(
+                f"FLAIR_MAX_TOKENS ({self.max_tokens}) must be smaller than "
+                f"FLAIR_CONTEXT_WINDOW ({self.context_window}): prompt and generation share "
+                "the same window, so an output cap that big leaves no room for the context.")
+        if self.max_steps <= 0:
+            raise RuntimeError(f"FLAIR_MAX_STEPS must be > 0 (got {self.max_steps}).")
+        if self.compact_keep_recent < 0 or self.compact_summary_max_tokens <= 0:
+            raise RuntimeError(
+                "FLAIR_COMPACT_KEEP must be >= 0 and FLAIR_COMPACT_SUMMARY_MAX > 0 "
+                f"(got {self.compact_keep_recent} and {self.compact_summary_max_tokens}).")
 
 
 def _think_steps() -> str:
@@ -396,6 +423,7 @@ def load_config() -> Config:
         prune_hysteresis_ratio=_float("FLAIR_PRUNE_HYSTERESIS", 0.10),
         image_max_side=_int("FLAIR_IMAGE_MAX_SIDE", 1536),
         image_token_estimate=_int("FLAIR_IMAGE_TOKENS", 1200),
+        context_calibration=_bool("FLAIR_CTX_CALIBRATION", True),
         root=Path(os.getenv("FLAIR_ROOT", ".")).expanduser().resolve(),
         read_file_max_chars=_int("FLAIR_READ_MAX", 12000),
         grep_max_chars=_int("FLAIR_GREP_MAX", 6000),

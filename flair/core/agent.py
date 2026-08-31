@@ -50,8 +50,15 @@ class StoppedByUser(Exception):
 # Testi iniettati in conversazione dalla compaction (superficie model-facing:
 # la guardia test_english_surface li asserisce direttamente).
 _SUMMARY_HEADER = "[Summary of the work done so far]\n\n"
-_ATTACHED_IMAGES_PREFIX = "[Images attached by view_image: "
+_ATTACHED_IMAGES_PREFIX = prune.ATTACHED_IMAGES_PREFIX  # unica fonte: la potatura lo riconosce
 _IMAGE_REJECTED_NOTE = "[image removed: the endpoint rejected it]"
+
+# Calibrazione del fattore caratteri→token (v. Conversation.token_ratio):
+# peso del campione più recente, campione minimo per essere informativo, e limiti
+# oltre i quali non si va nemmeno se le misure sono strane.
+_RATIO_ALPHA = 0.3
+_RATIO_MIN_SAMPLE = 200
+_RATIO_MIN, _RATIO_MAX = 0.7, 2.5
 _SUMMARIZE_PREAMBLE = "Conversation to summarize:\n\n"
 
 _COMPACT_PROMPT = (
@@ -147,6 +154,15 @@ class Conversation:
     # listino a fasce ogni rottura è un evento economico: contarle le rende
     # visibili (/cost, JSONL) invece di doverle dedurre dal cache-hit% che cala.
     cache_breaks: int = 0
+    # Fattore caratteri→token APPRESO dalle richieste reali: la stima statica
+    # (chars//4) sottostima il codice denso, che tokenizza peggio della prosa — con
+    # la soglia di compaction creduta lontana e il muro del modello raggiunto per
+    # davvero (overflow → compaction d'emergenza, la più lossy). Qui si misura il
+    # rapporto tra i prompt_tokens VERI e la nostra stima, sul DELTA tra due
+    # chiamate: così le costanti presenti in entrambe (system prompt, schemi tool)
+    # si cancellano e resta solo la conversione che ci interessa. 1.0 = nessuna
+    # correzione (stato iniziale, e valore di ogni sessione senza dati).
+    token_ratio: float = 1.0
 
     def reset(self) -> None:
         self.messages = []
@@ -154,6 +170,7 @@ class Conversation:
         self.sent_upto = 0
         self.total_usage = Usage()
         self.cache_breaks = 0
+        self.token_ratio = 1.0
 
     def dump(self) -> dict:
         """Stato serializzabile (JSON) della conversazione e dell'uso cumulativo."""
@@ -406,8 +423,28 @@ class Agent:
     def _streaming(self) -> bool:
         return bool(self.cfg.stream and self.on_delta)
 
+    def _learn_token_ratio(self, before_tokens: int, before_upto: int, real_tokens: int) -> None:
+        """Aggiorna il fattore caratteri→token confrontando la crescita REALE del
+        prompt con quella STIMATA per gli stessi messaggi. Si impara solo quando il
+        confronto è sensato: prefisso precedente noto (nessuna compaction in mezzo),
+        delta stimato non trascurabile e delta reale positivo. Media esponenziale
+        (pesa il recente senza saltare su un singolo campione) e clamp: una stima
+        sballata deve poter correggere, mai impazzire."""
+        if before_tokens <= 0 or real_tokens <= 0:
+            return                                  # nessun prefisso di riferimento
+        est_delta = self._estimate_tokens(
+            self.convo.messages[before_upto:],
+            image_tokens=getattr(self.cfg, "image_token_estimate", 1200))
+        real_delta = real_tokens - before_tokens
+        if est_delta < _RATIO_MIN_SAMPLE or real_delta <= 0:
+            return                                  # campione troppo piccolo per essere informativo
+        sample = real_delta / est_delta
+        blended = (1 - _RATIO_ALPHA) * self.convo.token_ratio + _RATIO_ALPHA * sample
+        self.convo.token_ratio = min(_RATIO_MAX, max(_RATIO_MIN, blended))
+
     def _complete(self, tools, think, tool_choice: str | None = None) -> LLMResponse:
         self._maybe_compact()
+        before_tokens, before_upto = self.convo.last_prompt_tokens, self.convo.sent_upto
         try:
             resp = self._raw_complete(tools, think, tool_choice)
         except Exception as exc:  # noqa: BLE001
@@ -427,6 +464,8 @@ class Agent:
                 raise
         self.convo.total_usage = self.convo.total_usage + resp.usage
         if resp.usage.prompt_tokens:
+            if getattr(self.cfg, "context_calibration", True):
+                self._learn_token_ratio(before_tokens, before_upto, resp.usage.prompt_tokens)
             self.convo.last_prompt_tokens = resp.usage.prompt_tokens
         self.convo.sent_upto = len(self.convo.messages)
         return resp
@@ -465,9 +504,14 @@ class Agent:
         return chars // 4 + images * image_tokens
 
     def _ctx_estimate(self) -> int:
-        return self.convo.last_prompt_tokens + self._estimate_tokens(
+        """Token del contesto: la parte già inviata è ESATTA (prompt_tokens dell'ultima
+        risposta), il suffisso accodato dopo è stimato — e corretto col fattore appreso
+        dalle richieste reali di questa sessione (v. _learn_token_ratio)."""
+        suffix = self._estimate_tokens(
             self.convo.messages[self.convo.sent_upto:],
             image_tokens=getattr(self.cfg, "image_token_estimate", 1200))
+        ratio = self.convo.token_ratio if getattr(self.cfg, "context_calibration", True) else 1.0
+        return self.convo.last_prompt_tokens + int(suffix * ratio)
 
     def _maybe_compact(self) -> None:
         if self._ctx_estimate() <= self.cfg.compact_threshold:

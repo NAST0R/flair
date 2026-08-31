@@ -4,11 +4,11 @@ version = "3.0.0"
 description = "Agentic AI assistant (advanced coding + general desktop automation) on DeepSeek and OpenAI."
 requires-python = ">=3.10"
 dependencies = [
-    # Capped below 3.0: from that release the SDK moved from httpx to httpx2, so the
-    # network errors that escape it are httpx2.* and our transient-error
-    # classification (_HTTPX_TRANSIENT) would stop matching them — silently. Add and
-    # test httpx2 support before raising the cap.
-    "openai>=1.40.0,<3.0",
+    # Both SDK generations are supported: openai moved from httpx to httpx2 in 3.0,
+    # and flair now picks the HTTP library the installed SDK actually uses (see
+    # llm/base.py `_sdk_http_module`) and treats the raw TransportError of BOTH as
+    # transient. The full suite is verified green on 2.x and on 3.x.
+    "openai>=1.40.0,<4",
     # Used DIRECTLY (explicit client for a custom CA bundle on self-signed endpoints,
     # transient network error classification), so it is declared here rather than
     # inherited from openai: up to 2.x it arrived transitively, with 3.x it did not.

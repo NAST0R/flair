@@ -169,6 +169,10 @@ CATALOG: tuple[Field, ...] = (
     Field("Vision", "FLAIR_IMAGE_TOKENS", "int", "1200",
           "Estimated tokens per image for the context meter (drives proactive "
           "compaction; the real count comes back in the API usage).", min=1),
+    Field("Context", "FLAIR_CTX_CALIBRATION", "bool", "true",
+          "Learn the real chars-to-tokens ratio from the requests and correct the "
+          "estimate of the not-yet-sent suffix with it (dense code tokenizes worse "
+          "than prose). false = static chars/4 estimate."),
 
     # ── TLS ──────────────────────────────────────────────────────────────────
     Field("TLS", "FLAIR_CA_BUNDLE", "path", None,

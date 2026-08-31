@@ -11,7 +11,11 @@ sostituendo con uno stub i soli output **provabilmente superati**:
 2. letture rese stale — un `read_file` di un path poi **sovrascritto** da un
    `write_file` senza append: l'intero contenuto letto non esiste più su disco;
 3. letture parziali coperte — un `read_file` con offset/limit dello stesso path
-   riletto più avanti PER INTERO: la lettura completa contiene la parziale.
+   riletto più avanti PER INTERO: la lettura completa contiene la parziale;
+4. immagini ri-allegate — l'allegato di `view_image` per gli STESSI file quando più
+   avanti gli stessi file sono stati allegati di nuovo (tipico del monitoraggio a
+   screenshot ripetuti): l'immagine vecchia è la cosa più pesante che il contesto
+   possa portarsi dietro, e la sua versione aggiornata è già più avanti.
 
 Garanzie:
 - si sostituisce SOLO il campo `content` dei messaggi `tool` (il pairing
@@ -43,6 +47,13 @@ _MIN_CHARS = 200
 
 STUB = ("[superseded output: the same target was re-read or rewritten later — "
         "refer to the most recent version in the conversation]")
+
+# Marcatore del messaggio con cui il loop consegna le immagini (lo compone
+# core/agent.py, che lo importa da qui: la potatura deve poterlo riconoscere e
+# importare `agent` da `prune` sarebbe un ciclo).
+ATTACHED_IMAGES_PREFIX = "[Images attached by view_image: "
+IMAGE_STUB = ("[superseded image: the same file was attached again later — "
+              "refer to the most recent attachment]")
 
 
 def _norm_path(p) -> str | None:
@@ -143,8 +154,57 @@ def prune_superseded(messages: list[dict]) -> int:
     for idx in to_prune:
         m = messages[idx]
         content = m.get("content") or ""
-        if len(content) <= _MIN_CHARS or content == STUB:
+        if not isinstance(content, str) or len(content) <= _MIN_CHARS or content == STUB:
             continue
         m["content"] = STUB
+        pruned += 1
+    return pruned + _prune_superseded_images(messages)
+
+
+def _attached_labels(content) -> str | None:
+    """Le etichette dei file di un messaggio-allegato prodotto dal loop, o None se
+    il messaggio non è uno di quelli (identificato dal marcatore nella parte testo)."""
+    if not isinstance(content, list):
+        return None
+    has_image = any(isinstance(p, dict) and p.get("type") == "image_url" for p in content)
+    if not has_image:
+        return None
+    for part in content:
+        if isinstance(part, dict) and part.get("type") == "text":
+            text = part.get("text") or ""
+            if text.startswith(ATTACHED_IMAGES_PREFIX):
+                return text
+    return None
+
+
+def _prune_superseded_images(messages: list[dict]) -> int:
+    """Regola 4: se gli STESSI file sono stati allegati più volte, tiene solo
+    l'allegato più recente e sostituisce le parti immagine precedenti con uno stub
+    testuale. Provabilmente superato — è la stessa logica della regola 1 applicata
+    al canale multipart — e ad alto rendimento: un'immagine pesa ~1-2K token e viene
+    ri-caricata a ogni richiesta successiva finché resta in contesto. Gli allegati
+    dell'utente (/img, senza marcatore) NON si toccano: non c'è modo di provare che
+    siano superati, e sono una scelta esplicita di chi lavora."""
+    last_by_labels: dict[str, int] = {}
+    for i, m in enumerate(messages):
+        if m.get("role") != "user":
+            continue
+        labels = _attached_labels(m.get("content"))
+        if labels is not None:
+            last_by_labels[labels] = i
+
+    pruned = 0
+    for i, m in enumerate(messages):
+        if m.get("role") != "user":
+            continue
+        content = m.get("content")
+        labels = _attached_labels(content)
+        if labels is None or not isinstance(content, list) or last_by_labels.get(labels) == i:
+            continue
+        m["content"] = [
+            {"type": "text", "text": IMAGE_STUB}
+            if isinstance(p, dict) and p.get("type") == "image_url" else p
+            for p in content
+        ]
         pruned += 1
     return pruned

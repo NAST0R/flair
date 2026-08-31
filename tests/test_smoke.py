@@ -3568,8 +3568,6 @@ def test_ca_bundle():
     import ssl as _ssl
     import tempfile as _tf
 
-    import httpx as _httpx
-
     from flair.config import load_config
     from flair.llm.base import _build_http_client
     from flair.llm.factory import create_provider
@@ -3598,14 +3596,30 @@ def test_ca_bundle():
         check("ca: PEM di test nel trust store", sctx.cert_store_stats().get("x509", 0) >= 1,
               sctx.cert_store_stats())
 
-        # Builder: httpx.Client con verify a SSLContext (httpx>=0.28-proof).
+        # Builder: Client con verify a SSLContext (httpx>=0.28-proof) costruito dal
+        # modulo HTTP DELL'SDK INSTALLATO — httpx fino a openai 2.x, httpx2 dalla 3.0.
+        # Asserire httpx.Client fisso falliva sotto openai 3.x pur essendo tutto
+        # corretto: l'invariante vera è "stessa libreria dell'SDK", non "httpx".
+        from flair.llm.base import _sdk_http_module
+        sdk_http = _sdk_http_module()
         cfg.ca_bundle = pem
         client = _build_http_client(cfg)
         try:
-            check("ca: client httpx creato col bundle", isinstance(client, _httpx.Client))
+            check("ca: client creato col bundle, dal modulo HTTP dell'SDK",
+                  isinstance(client, sdk_http.Client), type(client).__module__)
+            check("ca: il modulo HTTP dell'SDK è uno dei due noti",
+                  sdk_http.__name__ in ("httpx", "httpx2"), sdk_http.__name__)
         finally:
             if client is not None:
                 client.close()
+
+        # Errori di rete GREZZI: transitori per entrambe le generazioni dell'SDK
+        # (httpx2.TransportError NON è httpx.TransportError: gerarchie separate).
+        from flair.llm.base import _HTTP_MODULES, _TRANSIENT
+        for mod in _HTTP_MODULES:
+            check(f"ca: {mod.__name__}.TransportError classificato transitorio",
+                  issubclass(mod.TransportError, _TRANSIENT) if isinstance(_TRANSIENT, type)
+                  else any(issubclass(mod.TransportError, t) for t in _TRANSIENT))
 
         # Il provider si costruisce senza errori col bundle attivo (nessuna rete).
         cfg.provider = "local"
@@ -4351,6 +4365,17 @@ def test_configurer():
         check("configurer: nessuna chiave del catalogo fuori da .env.example",
               all(f.key in (Path(__file__).resolve().parent.parent / ".env.example")
                   .read_text(encoding="utf-8") for f in conf.CATALOG))
+        # Parità nell'ALTRA direzione: ogni variabile d'ambiente LETTA da config.py
+        # deve essere nel catalogo. Senza questo lato, aggiungere un knob a flair e
+        # dimenticarlo nel configuratore passava inosservato (è appena successo).
+        import re as _re2
+
+        import flair.config as _fcfg
+        cfg_src = Path(_fcfg.__file__).read_text(encoding="utf-8")
+        read_env = set(_re2.findall(r'(?:os\.getenv|_int|_float|_bool)\(\s*"([A-Z][A-Z_0-9]*)"', cfg_src))
+        uncatalogued = sorted(read_env - {f.key for f in conf.CATALOG})
+        check("configurer: ogni env letta da config.py è nel catalogo",
+              uncatalogued == [], ", ".join(uncatalogued))
     finally:
         for k in [k for k in _os.environ
                   if k.startswith(("FLAIR_", "DEEPSEEK_", "OPENAI_", "LOCAL_", "TAVILY_"))]:
@@ -4541,6 +4566,190 @@ def test_config_error_is_clean():
             _os.environ["FLAIR_THINK_STEPS"] = saved
 
 
+def test_context_calibration():
+    """La stima del contesto impara il rapporto caratteri→token dalle richieste reali:
+    la parte già inviata è esatta (prompt_tokens), il suffisso viene corretto col
+    fattore appreso. Senza, il codice denso (che tokenizza peggio della prosa) porta
+    a credere la soglia lontana e a sbattere sul muro del modello."""
+    from flair.core.agent import _RATIO_MAX, _RATIO_MIN, Agent, Conversation
+
+    def resp(tokens: int) -> LLMResponse:
+        return LLMResponse(content="ok", usage=Usage(prompt_tokens=tokens, total_tokens=tokens))
+
+    # Prima chiamata: nessun prefisso di riferimento → niente da imparare.
+    cfg = cfg_for(Path("."))
+    convo = Conversation()
+    agent = coding_agent.build(cfg, FakeProvider([resp(1000)]), conversation=convo)
+    agent.run("primo task")
+    check("calibrazione: parte da 1.0 (nessuna correzione)", convo.token_ratio == 1.0)
+    check("calibrazione: contesto esatto dopo la prima risposta",
+          agent._ctx_estimate() == 1000, agent._ctx_estimate())
+
+    # Secondo turno: accodiamo ~2000 caratteri (stima 500 token) e il server ne
+    # conta 750 → rapporto reale 1.5, mediato con l'alpha configurato.
+    convo.messages.append({"role": "user", "content": "x" * 2000})
+    est_before = Agent._estimate_tokens(convo.messages[convo.sent_upto:])
+    check("calibrazione: stima statica del suffisso", est_before == 500, est_before)
+    agent.provider = FakeProvider([resp(1750)])
+    agent._complete(tools=None, think=False)
+    check("calibrazione: rapporto appreso tra 1.0 e il campione (media esponenziale)",
+          1.0 < convo.token_ratio < 1.5, convo.token_ratio)
+    learned = convo.token_ratio
+
+    # Il fattore appreso gonfia la stima del suffisso successivo (compaction più
+    # tempestiva, invece di un overflow).
+    convo.messages.append({"role": "user", "content": "y" * 4000})
+    raw = 1750 + 1000
+    check("calibrazione: il suffisso è corretto col fattore",
+          agent._ctx_estimate() > raw and agent._ctx_estimate() == 1750 + int(1000 * learned),
+          agent._ctx_estimate())
+
+    # Knob spento → stima statica, comportamento pre-esistente byte per byte.
+    cfg.context_calibration = False
+    check("calibrazione: FLAIR_CTX_CALIBRATION=false → stima statica",
+          agent._ctx_estimate() == raw, agent._ctx_estimate())
+    cfg.context_calibration = True
+
+    # Clamp: un campione assurdo non manda il fattore fuori scala.
+    convo.token_ratio = 1.0
+    convo.messages.append({"role": "user", "content": "z" * 4000})   # stima 1000
+    agent.provider = FakeProvider([resp(99999)])                     # reale enorme
+    agent._complete(tools=None, think=False)
+    check("calibrazione: clamp superiore rispettato", convo.token_ratio <= _RATIO_MAX, convo.token_ratio)
+    convo.token_ratio = 1.0
+    convo.messages.append({"role": "user", "content": "w" * 8000})   # stima 2000
+    agent.provider = FakeProvider([resp(convo.last_prompt_tokens + 1)])  # reale ~zero
+    agent._complete(tools=None, think=False)
+    check("calibrazione: clamp inferiore rispettato", convo.token_ratio >= _RATIO_MIN, convo.token_ratio)
+
+    # Dopo una compaction i contatori sono azzerati: non si impara da un confronto
+    # privo di riferimento (sarebbe un rapporto inventato).
+    convo2 = Conversation()
+    agent2 = coding_agent.build(cfg_for(Path(".")), FakeProvider([resp(500)]), conversation=convo2)
+    convo2.token_ratio = 1.4
+    agent2._learn_token_ratio(0, 0, 5000)
+    check("calibrazione: nessun apprendimento senza prefisso di riferimento",
+          convo2.token_ratio == 1.4)
+    check("calibrazione: reset azzera il fattore",
+          (convo2.reset(), convo2.token_ratio)[1] == 1.0)
+
+
+def test_prune_images():
+    """Regola 4 della potatura: le immagini ri-allegate per gli stessi file lasciano
+    solo l'allegato più recente. È la voce più pesante del contesto e viene
+    ri-caricata a ogni richiesta finché resta in conversazione."""
+    from flair.core import prune
+    from flair.core.agent import Agent
+
+    def attach(labels: str) -> dict:
+        return {"role": "user", "content": [
+            {"type": "text", "text": f"{prune.ATTACHED_IMAGES_PREFIX}{labels}]"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+        ]}
+
+    msgs = [
+        {"role": "user", "content": "monitora lo schermo"},
+        attach("screen.png"),
+        {"role": "assistant", "content": "vedo il desktop"},
+        attach("screen.png"),                      # stesso file: il primo è superato
+        {"role": "assistant", "content": "ora vedo un editor"},
+        attach("altro.png"),                       # file diverso: resta
+    ]
+    n = prune.prune_superseded(msgs)
+    check("prune img: un allegato potato", n == 1, n)
+    check("prune img: il PRIMO allegato non ha più l'immagine",
+          all(p.get("type") == "text" for p in msgs[1]["content"])
+          and any(prune.IMAGE_STUB == p.get("text") for p in msgs[1]["content"]))
+    check("prune img: l'allegato più recente dello stesso file è intatto",
+          any(p.get("type") == "image_url" for p in msgs[3]["content"]))
+    check("prune img: un file diverso non viene toccato",
+          any(p.get("type") == "image_url" for p in msgs[5]["content"]))
+    check("prune img: idempotente (secondo giro non pota nulla)",
+          prune.prune_superseded(msgs) == 0)
+
+    # Gli allegati dell'UTENTE (/img: nessun marcatore) non si toccano mai.
+    user_msgs = [
+        {"role": "user", "content": [{"type": "text", "text": "guarda questo"},
+                                     {"type": "image_url", "image_url": {"url": "data:x"}}]},
+        {"role": "assistant", "content": "ok"},
+        {"role": "user", "content": [{"type": "text", "text": "guarda questo"},
+                                     {"type": "image_url", "image_url": {"url": "data:x"}}]},
+    ]
+    check("prune img: gli allegati dell'utente restano intatti",
+          prune.prune_superseded(user_msgs) == 0
+          and all(any(p.get("type") == "image_url" for p in m["content"])
+                  for m in user_msgs if isinstance(m["content"], list)))
+
+    # Effetto sulla stima: ogni immagine potata libera il suo costo fisso.
+    heavy = [attach("a.png"), {"role": "assistant", "content": "x"}, attach("a.png")]
+    before = Agent._estimate_tokens(heavy, image_tokens=1200)
+    prune.prune_superseded(heavy)
+    after = Agent._estimate_tokens(heavy, image_tokens=1200)
+    # Il risparmio netto è il costo dell'immagine MENO lo stub testuale che la
+    # sostituisce (~20 token): non 1200 esatti, ma quasi tutti.
+    from flair.core.agent import _count_images
+    check("prune img: la stima del contesto scende di un'immagine",
+          1100 <= before - after < 1200, f"{before} → {after}")
+    check("prune img: in contesto resta una sola immagine",
+          sum(_count_images(m.get("content")) for m in heavy) == 1)
+
+    # Il testo dei messaggi 'tool' resta gestito dalle regole 1-3 (nessuna regressione).
+    a = tc("read_file", path="f.py")
+    b = tc("read_file", path="f.py")
+    mixed = [_asst_msg(a), _tool_msg(a.id, "x" * 500), _asst_msg(b), _tool_msg(b.id, "y" * 500),
+             attach("s.png"), {"role": "assistant", "content": "z"}, attach("s.png")]
+    check("prune img: regole testuali e immagini convivono",
+          prune.prune_superseded(mixed) == 2)
+
+
+def test_config_validate_impossible():
+    """validate() rifiuta le combinazioni IMPOSSIBILI con un messaggio azionabile,
+    all'avvio invece che a metà sessione. Solo casi rotti: le configurazioni
+    insolite-ma-legittime restano accettate (le segnala il configuratore)."""
+    def cfg_ok():
+        c = cfg_for(Path("."))
+        c.provider = "local"          # nessuna API key richiesta
+        return c
+
+    check("validate: configurazione sana passa", cfg_ok().validate() is None)
+
+    cases = [
+        ("context_window", 0, "FLAIR_CONTEXT_WINDOW"),
+        ("compact_threshold_ratio", 0.0, "FLAIR_COMPACT_RATIO"),
+        ("compact_threshold_ratio", 1.5, "FLAIR_COMPACT_RATIO"),
+        ("prune_hysteresis_ratio", 1.0, "FLAIR_PRUNE_HYSTERESIS"),
+        ("prune_hysteresis_ratio", -0.1, "FLAIR_PRUNE_HYSTERESIS"),
+        ("max_steps", 0, "FLAIR_MAX_STEPS"),
+        ("compact_summary_max_tokens", 0, "FLAIR_COMPACT_SUMMARY_MAX"),
+    ]
+    for field, value, expected in cases:
+        c = cfg_ok()
+        setattr(c, field, value)
+        try:
+            c.validate()
+            check(f"validate: {field}={value} rifiutato", False)
+        except RuntimeError as exc:
+            check(f"validate: {field}={value} rifiutato", expected in str(exc), str(exc)[:70])
+
+    # Il caso di campo: tetto di output più grande della finestra → il prompt non ha
+    # spazio, e sul server locale la generazione viene tagliata a metà.
+    c = cfg_ok()
+    c.context_window, c.max_tokens = 64000, 64000
+    try:
+        c.validate()
+        check("validate: max_tokens >= context_window rifiutato", False)
+    except RuntimeError as exc:
+        check("validate: max_tokens >= context_window rifiutato",
+              "FLAIR_MAX_TOKENS" in str(exc) and "share" in str(exc), str(exc)[:90])
+    c.max_tokens = 8000
+    check("validate: tetto di output sensato accettato", c.validate() is None)
+
+    # Insolito ma legittimo: isteresi >= soglia (il riassunto non viene mai evitato).
+    c2 = cfg_ok()
+    c2.compact_threshold_ratio, c2.prune_hysteresis_ratio = 0.8, 0.9
+    check("validate: combinazione insolita ma non impossibile accettata", c2.validate() is None)
+
+
 def main():
     test_arg_parse()
     test_usage_normalization()
@@ -4627,6 +4836,9 @@ def main():
     test_tool_choice_none()
     test_session_log_record()
     test_config_error_is_clean()
+    test_context_calibration()
+    test_prune_images()
+    test_config_validate_impossible()
     test_budget_abort()
     test_read_only_mode()
     test_automation_helpers()

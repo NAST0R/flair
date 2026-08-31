@@ -867,7 +867,7 @@ def run_check(env_path: Path) -> int:
         for m in w:
             print(e + m)
     if not errors and not warnings:
-        print("  OK — no problems found")
+        print("  OK - no problems found")
     return 1 if errors else 0
 
 

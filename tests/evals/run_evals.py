@@ -25,7 +25,16 @@ from pathlib import Path
 # qualunque sia il modo di invocazione.
 _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE))
+sys.path.insert(0, str(_HERE.parent))      # tests/ → il modulo _output condiviso
 sys.path.insert(0, str(_HERE.parents[1]))
+
+from _output import prepare_output  # noqa: E402
+
+# Stream a prova di encoding PRIMA di qualunque stampa: la tabella usa simboli
+# (─, ✅, ⚠) che su Windows con stdout non interattivo (cp1252 in CI) facevano
+# morire il runner a metà output. La protezione è condivisa con test_smoke.py:
+# stava in un solo file e l'altro entry point è morto allo stesso modo.
+prepare_output()
 
 from tasks import TASKS, EvalTask  # noqa: E402
 

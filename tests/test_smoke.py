@@ -21,6 +21,8 @@ from openai import APITimeoutError, BadRequestError
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from _output import prepare_output
+
 from flair.agents import coding as coding_agent
 from flair.agents import general as general_agent
 from flair.config import load_config
@@ -37,32 +39,7 @@ from flair.tools.fs import apply_edit
 PASS = []
 
 
-def _prepare_output() -> tuple[str, str]:
-    """Prepara gli stream per l'output della suite e ritorna i marcatori da usare.
-
-    Su Windows uno stdout NON interattivo usa il code page locale (cp1252 nella CI di
-    GitHub), che non sa codificare '✓': il primo print faceva morire la suite con
-    UnicodeEncodeError PRIMA di eseguire un solo test — mentre in locale, con la
-    console in UTF-8, girava tutta. Vale anche per stderr: il messaggio di un
-    fallimento contiene un em dash e spesso l'output di un tool con emoji.
-
-    Si portano entrambi gli stream a UTF-8 (i log di CI lo gestiscono) e, se non è
-    possibile, si ripiega su marcatori ASCII — la stessa logica con cui la CLI scarta
-    lo spinner Braille sui terminali che non lo reggono (cli._pick_spinner)."""
-    for stream in (sys.stdout, sys.stderr):
-        try:
-            stream.reconfigure(encoding="utf-8", errors="replace")   # type: ignore[union-attr]
-        except (AttributeError, ValueError, OSError):   # stream sostituito o non riconfigurabile
-            pass
-    enc = getattr(sys.stdout, "encoding", None) or "ascii"
-    try:
-        "✓ ✅ —".encode(enc)
-    except (UnicodeEncodeError, LookupError):
-        return "[ok]", "PASSATI"
-    return "✓", "PASSATI ✅"
-
-
-OK_MARK, DONE_MARK = _prepare_output()
+OK_MARK, DONE_MARK = prepare_output()
 
 
 def check(name: str, cond: bool, detail: str = "") -> None:
@@ -4801,7 +4778,7 @@ def test_output_portable():
     try:
         fake = _io.StringIO()          # nessun reconfigure, encoding assente → 'ascii'
         sys.stdout = fake              # type: ignore[assignment]
-        ok_mark, done_mark = _prepare_output()
+        ok_mark, done_mark = prepare_output()
     finally:
         sys.stdout = real
     check("output: fallback ASCII quando l'encoding non regge i simboli",
@@ -4810,6 +4787,32 @@ def test_output_portable():
     check("output: stream portati a UTF-8 dove possibile",
           (getattr(sys.stdout, "encoding", "") or "").lower().startswith("utf"),
           str(getattr(sys.stdout, "encoding", None)))
+
+    # GUARDIA della classe, non del singolo caso: la protezione stava in UN file e
+    # l'altro entry point (il runner degli eval) è morto allo stesso modo il giorno
+    # dopo. Qui si verifica che OGNI script eseguito dalla CI la applichi — e che
+    # chi non la applica non stampi simboli non-ASCII (es. il configuratore, che è
+    # standalone by design e tiene l'output headless in ASCII).
+    import re as _re3
+    repo = Path(__file__).resolve().parent.parent
+    entry_points = {
+        "tests/test_smoke.py": True,          # deve importare la protezione
+        "tests/evals/run_evals.py": True,
+        "tests/evals/tasks.py": False,        # non stampa nulla
+        "tools/configurer.py": False,         # standalone: output ASCII per costruzione
+    }
+    for rel, must_protect in entry_points.items():
+        src = (repo / rel).read_text(encoding="utf-8")
+        protected = "prepare_output" in src
+        prints_unicode = [
+            ln for ln in src.splitlines()
+            if _re3.search(r"(print\(|std(out|err)\.write)", ln) and any(ord(c) > 127 for c in ln)
+        ]
+        if must_protect:
+            check(f"output: {rel} applica la protezione", protected)
+        else:
+            check(f"output: {rel} non stampa simboli non-ASCII senza protezione",
+                  protected or not prints_unicode, str(prints_unicode[:1]))
 
 
 def main():

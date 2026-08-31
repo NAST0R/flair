@@ -37,10 +37,38 @@ from flair.tools.fs import apply_edit
 PASS = []
 
 
+def _prepare_output() -> tuple[str, str]:
+    """Prepara gli stream per l'output della suite e ritorna i marcatori da usare.
+
+    Su Windows uno stdout NON interattivo usa il code page locale (cp1252 nella CI di
+    GitHub), che non sa codificare '✓': il primo print faceva morire la suite con
+    UnicodeEncodeError PRIMA di eseguire un solo test — mentre in locale, con la
+    console in UTF-8, girava tutta. Vale anche per stderr: il messaggio di un
+    fallimento contiene un em dash e spesso l'output di un tool con emoji.
+
+    Si portano entrambi gli stream a UTF-8 (i log di CI lo gestiscono) e, se non è
+    possibile, si ripiega su marcatori ASCII — la stessa logica con cui la CLI scarta
+    lo spinner Braille sui terminali che non lo reggono (cli._pick_spinner)."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")   # type: ignore[union-attr]
+        except (AttributeError, ValueError, OSError):   # stream sostituito o non riconfigurabile
+            pass
+    enc = getattr(sys.stdout, "encoding", None) or "ascii"
+    try:
+        "✓ ✅ —".encode(enc)
+    except (UnicodeEncodeError, LookupError):
+        return "[ok]", "PASSATI"
+    return "✓", "PASSATI ✅"
+
+
+OK_MARK, DONE_MARK = _prepare_output()
+
+
 def check(name: str, cond: bool, detail: str = "") -> None:
-    assert cond, f"FALLITO: {name} — {detail}"
+    assert cond, f"FALLITO: {name} - {detail}"
     PASS.append(name)
-    print(f"✓ {name}")
+    print(f"{OK_MARK} {name}")
 
 
 
@@ -4750,7 +4778,29 @@ def test_config_validate_impossible():
     check("validate: combinazione insolita ma non impossibile accettata", c2.validate() is None)
 
 
+def test_output_portable():
+    """L'harness non deve dipendere dall'encoding della console: un `print` che non
+    si codifica uccideva la suite prima del primo test (CI Windows, cp1252). Qui si
+    verifica il ramo di fallback su uno stdout che accetta solo ASCII."""
+    import io as _io
+
+    real = sys.stdout
+    try:
+        fake = _io.StringIO()          # nessun reconfigure, encoding assente → 'ascii'
+        sys.stdout = fake              # type: ignore[assignment]
+        ok_mark, done_mark = _prepare_output()
+    finally:
+        sys.stdout = real
+    check("output: fallback ASCII quando l'encoding non regge i simboli",
+          ok_mark == "[ok]" and "✅" not in done_mark, f"{ok_mark!r} {done_mark!r}")
+    check("output: marcatori correnti utilizzabili", bool(OK_MARK) and bool(DONE_MARK))
+    check("output: stream portati a UTF-8 dove possibile",
+          (getattr(sys.stdout, "encoding", "") or "").lower().startswith("utf"),
+          str(getattr(sys.stdout, "encoding", None)))
+
+
 def main():
+    test_output_portable()
     test_arg_parse()
     test_usage_normalization()
     test_reasoning_detection()
@@ -4848,7 +4898,7 @@ def main():
     test_ca_bundle()
     test_pricing_bands()
     test_evals_harness()
-    print(f"\nTUTTI I {len(PASS)} TEST PASSATI ✅")
+    print(f"\nTUTTI I {len(PASS)} TEST {DONE_MARK}")
 
 
 if __name__ == "__main__":

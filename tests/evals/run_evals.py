@@ -49,7 +49,9 @@ def _estimate_cost(provider, usage, cfg) -> float:
 
 
 def _run_one(task: EvalTask, provider_factory, cfg, think: bool) -> dict:
-    wd = Path(tempfile.mkdtemp(prefix=f"flaireval_{task.name}_"))
+    # .resolve(): su Windows TEMP può contenere un nome 8.3 che il prodotto espande,
+    # e i confronti di path del task non combacerebbero (stessa classe del symlink su POSIX).
+    wd = Path(tempfile.mkdtemp(prefix=f"flaireval_{task.name}_")).resolve()
     try:
         task.setup(wd)
         cfg.root = wd.resolve()

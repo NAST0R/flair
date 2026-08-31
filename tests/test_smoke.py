@@ -251,9 +251,8 @@ def test_coding_agent():
     # lettera di drive, e la sandbox (relative_to su path risolti) rigetterebbe
     # ogni file — gli edit non si applicherebbero mai. Vale per tutti i test.
     root = Path(tempfile.gettempdir(), "flair3_coding").resolve()
-    if root.exists():
-        shutil.rmtree(root)
-    root.mkdir(parents=True)
+    shutil.rmtree(root, ignore_errors=True)
+    root.mkdir(parents=True, exist_ok=True)
     (root / "app.py").write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
 
     cfg = cfg_for(root)
@@ -308,9 +307,8 @@ def test_coding_agent():
 
 def test_general_agent():
     root = Path(tempfile.gettempdir(), "flair3_general").resolve()
-    if root.exists():
-        shutil.rmtree(root)
-    root.mkdir(parents=True)
+    shutil.rmtree(root, ignore_errors=True)
+    root.mkdir(parents=True, exist_ok=True)
     (root / "song_test.mp3").write_text("fake", encoding="utf-8")
     (root / "note.txt").write_text("ciao\nmondo\n", encoding="utf-8")
 
@@ -324,7 +322,21 @@ def test_general_agent():
         LLMResponse(content="Ecco i risultati.", usage=Usage(total_tokens=1)),
     ])
     agent = general_agent.build(cfg, fake)
-    res = agent.run("che ore sono, info di sistema, trova la canzone, leggi note")
+    # `open_url` è l'unico tool del batch che farebbe un'azione REALE sul sistema
+    # (avvia il browser predefinito). Nei test si intercetta webbrowser.open: così
+    # l'esito è deterministico su OGNI piattaforma — su un runner CI Windows il
+    # lancio di Edge può riuscire, fallire o sollevare, e comunque non è ciò che
+    # questo test vuole misurare (che il tool non crasha e riporta l'esito). È la
+    # stessa scelta già fatta per PowerShell in test_powershell_script_cleanup.
+    import webbrowser as _wb
+
+    from flair.tools import system as _st
+    real_open, opened = _wb.open, []
+    _st.webbrowser.open = lambda url, *a, **k: (opened.append(url), True)[1]
+    try:
+        res = agent.run("che ore sono, info di sistema, trova la canzone, leggi note")
+    finally:
+        _st.webbrowser.open = real_open
 
     tmsgs = [m["content"] for m in agent.messages if m["role"] == "tool"]
     check("general: termina 'done'", res.stopped_reason == "done", res.stopped_reason)
@@ -333,15 +345,16 @@ def test_general_agent():
     check("general: search_files trova mp3", any("song_test.mp3" in t for t in tmsgs))
     check("general: read_file legge note", any("mondo" in t for t in tmsgs))
     check("general: open_url non crasha", any(("browser" in t.lower() or "about:blank" in t) for t in tmsgs))
+    check("general: open_url ha chiesto l'URL giusto, senza toccare il sistema",
+          opened == ["about:blank"], str(opened))
 
 
 # ── 7. gate di approvazione ───────────────────────────────────────────────────
 
 def test_approval_gate():
     root = Path(tempfile.gettempdir(), "flair3_approval").resolve()
-    if root.exists():
-        shutil.rmtree(root)
-    root.mkdir(parents=True)
+    shutil.rmtree(root, ignore_errors=True)
+    root.mkdir(parents=True, exist_ok=True)
     (root / "f.py").write_text("a=1\n", encoding="utf-8")
 
     cfg = cfg_for(root)
@@ -1457,7 +1470,7 @@ def test_tool_robustness():
 
     from flair.tools import coding
 
-    root = Path(tempfile.mkdtemp(prefix="flair_toolrob_"))
+    root = Path(tempfile.mkdtemp(prefix="flair_toolrob_")).resolve()
     (root / "alpha.py").write_text("def foo():\n    return 1\n\nclass Bar:\n    pass\n", encoding="utf-8")
     (root / "sub").mkdir()
     (root / "sub" / "beta.txt").write_text("hello foo world\n", encoding="utf-8")
@@ -2317,7 +2330,7 @@ def test_atomic_writes():
     import tempfile as _tf
 
     from flair.tools import fs
-    d = Path(_tf.mkdtemp(prefix="flair_atomic_"))
+    d = Path(_tf.mkdtemp(prefix="flair_atomic_")).resolve()
     f = d / "code.py"
 
     # Creazione (file nuovo): scrittura diretta, contenuto corretto.
@@ -2394,7 +2407,7 @@ def test_session_memory():
 
     # ── SessionStore: sidecar atomico, rimozione a vuoto ─────────────────────
     from flair.session_store import SessionStore
-    d = Path(_tf.mkdtemp(prefix="flair_mem_"))
+    d = Path(_tf.mkdtemp(prefix="flair_mem_")).resolve()
     st = SessionStore(d)
     st.save_memory("lavoro", m2.to_text())
     check("store: sidecar scritto", (d / "lavoro.memory.md").exists())
@@ -2538,7 +2551,7 @@ def test_honest_reads_and_inventory():
     from flair.tools import fs
 
     # ── read_file onesto: header = range CONSEGNATO, hint sempre presente ────
-    d = Path(_tf.mkdtemp(prefix="flair_hr_"))
+    d = Path(_tf.mkdtemp(prefix="flair_hr_")).resolve()
     big = d / "big.py"
     big.write_text("\n".join(f"riga_{i} = {i}" for i in range(1, 2001)))
     out = fs.read_file_impl(None, str(big), offset=1, limit=None, max_chars=2000)

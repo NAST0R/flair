@@ -531,7 +531,7 @@ class Agent:
                 shrunk = self._prune_superseded() > 0
                 shrunk = self._compact(aggressive=True) or shrunk
                 if shrunk:
-                    log.warning("Overflow di contesto: compattato e ritento.")
+                    log.warning("Context overflow: compacted, retrying once.")
                     resp = self._raw_complete(tools, think, tool_choice)
                 else:
                     raise
@@ -648,7 +648,7 @@ class Agent:
         try:
             summary = self._summarize(to_summarize, aggressive=aggressive)
         except Exception as exc:  # noqa: BLE001
-            log.warning("Compaction fallita (%s): mantengo il contesto invariato.", exc)
+            log.warning("Compaction failed (%s): keeping the context unchanged.", exc)
             return False
         # Il riassunto LLM è lossy e NON conserva l'inventario: senza questo, dopo una
         # compattazione il modello ricostruisce "cosa esiste" da glob parziali e finisce
@@ -704,11 +704,11 @@ class Agent:
                 self.convo.total_usage = self.convo.total_usage + resp.usage
                 if (resp.content or "").strip() and not resp.tool_calls:
                     return resp.content
-                log.warning("Riassunto sul prefisso anomalo (tool call o vuoto): ripiego sul render.")
+                log.warning("Summary on the cached prefix came back unusable (tool call or empty): falling back to the rendered summary.")
             except Exception as exc:  # noqa: BLE001
                 if not is_context_overflow(exc):
                     raise
-                log.warning("Riassunto sul prefisso in overflow: ripiego sul render compresso.")
+                log.warning("Summary on the cached prefix overflowed the window: falling back to the compressed render.")
         return self._summarize_rendered(msgs)
 
     def _summarize_rendered(self, msgs: list[dict]) -> str:

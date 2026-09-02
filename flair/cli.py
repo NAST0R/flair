@@ -255,7 +255,7 @@ class CLI:
         try:
             stopped = self.jobs.stop_all()
         except Exception as exc:  # noqa: BLE001 — l'uscita non deve mai fallire per questo
-            logging.getLogger("flair.cli").warning("Chiusura dei job non completata: %s", exc)
+            logging.getLogger("flair.cli").warning("Background jobs shutdown incomplete: %s", exc)
             return
         if stopped:
             self.console.print(f"[dim]stopped {stopped} background job(s).[/dim]")

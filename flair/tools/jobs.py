@@ -108,7 +108,7 @@ def _terminate_tree(proc: subprocess.Popen, grace: float) -> None:
         try:
             proc.wait(timeout=grace + 5)
         except subprocess.TimeoutExpired:
-            log.warning("Il processo %s non risponde nemmeno a taskkill /F.", proc.pid)
+            log.warning("Process %s does not respond even to taskkill /F.", proc.pid)
         return
 
     pgid = proc.pid
@@ -118,7 +118,7 @@ def _terminate_tree(proc: subprocess.Popen, grace: float) -> None:
         except ProcessLookupError:
             break                      # gruppo già vuoto: nulla da forzare
         except OSError as exc:
-            log.warning("Segnale %s al gruppo %s fallito: %s", sig, pgid, exc)
+            log.warning("Signal %s to process group %s failed: %s", sig, pgid, exc)
             try:
                 proc.kill()
             except OSError:
@@ -132,7 +132,7 @@ def _terminate_tree(proc: subprocess.Popen, grace: float) -> None:
     try:
         proc.wait(timeout=2.0)         # raccoglie lo zombie del figlio diretto
     except subprocess.TimeoutExpired:
-        log.warning("Il processo %s non risponde nemmeno a SIGKILL.", proc.pid)
+        log.warning("Process %s does not respond even to SIGKILL.", proc.pid)
 
 
 class Job:
@@ -303,7 +303,7 @@ class BackgroundJobs:
                 job.close()
                 job.release_buffer()
             elif self.max_lifetime and job.elapsed > self.max_lifetime:
-                log.warning("Job %s oltre la vita massima (%ss): terminato.", job.id, self.max_lifetime)
+                log.warning("Job %s exceeded its maximum lifetime (%ss): terminated.", job.id, self.max_lifetime)
                 job.stop(self.stop_grace)
         with self._lock:
             finished = sorted((j for j in self._jobs.values() if not j.running),

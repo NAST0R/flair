@@ -148,7 +148,7 @@ def parse_tool_args(raw: Any) -> dict:
     except (json.JSONDecodeError, ValueError):
         pass
 
-    log.warning("Argomenti tool call non parsabili: %.120s", raw)
+    log.warning("Unparsable tool call arguments: %.120s", raw)
     return {"_raw": raw}
 
 

@@ -2985,6 +2985,37 @@ def test_english_surface():
     check(f"superficie inglese: stringhe emesse ({len(scanned)} moduli scansionati)",
           offenders == [], "; ".join(offenders[:4]))
 
+    # ── I LOG sono user-facing, non dev-facing ────────────────────────────────
+    # Senza un file di log configurato, Python stampa i WARNING su stderr: l'utente
+    # li vede in sessione. Erano rimasti in italiano per mesi («Riassunto sul
+    # prefisso anomalo…», visto sul campo) proprio perché li consideravamo interni.
+    # Qui si scandisce ogni chiamata a un logger in tutto il package. Il lessico usa
+    # parole italiane INEQUIVOCABILI: 'non' o 'la' darebbero falsi positivi su
+    # 'non-streaming' e simili.
+    log_italian = _re.compile(
+        r"\b(?:della|dello|delle|degli|dalla|dallo|nella|nello|negli|dei|"
+        r"fallita|fallito|fallite|terminato|terminata|ripiego|anomalo|anomala|"
+        r"prefisso|contesto|riassunto|argomenti|chiusura|nemmeno|risponde|"
+        r"mantengo|ritento|compattato|oltre|massima|albero|gruppo|processo|"
+        r"parsabili|invariato|impossibile)\b", _re.I)
+    levels = {"debug", "info", "warning", "error", "exception", "critical"}
+    log_offenders: list[str] = []
+    import flair.config as _fcfg2
+    package_root = Path(_fcfg2.__file__).resolve().parent
+    for mod_path in sorted(package_root.rglob("*.py")):
+        for node in _ast.walk(_ast.parse(mod_path.read_text(encoding="utf-8"))):
+            if not (isinstance(node, _ast.Call) and isinstance(node.func, _ast.Attribute)
+                    and node.func.attr in levels and node.args):
+                continue
+            for part in _ast.walk(node.args[0]):
+                if isinstance(part, _ast.Constant) and isinstance(part.value, str):
+                    hit = log_italian.search(part.value)
+                    if hit:
+                        log_offenders.append(
+                            f"{mod_path.name}:{node.lineno} «{hit.group(0)}» {part.value[:50]!r}")
+    check("superficie inglese: messaggi di log (visibili su stderr all'utente)",
+          log_offenders == [], "; ".join(log_offenders[:4]))
+
 
 def test_reasoning_stream_feedback():
     import inspect as _inspect

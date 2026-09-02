@@ -5122,11 +5122,13 @@ def test_background_jobs():
             body = result.split(marker, 1)[1]
             for tail in ("[job finished", "[no new output"):
                 body = body.split(tail, 1)[0]
-            # CRLF → LF: lo stdout di un figlio su Windows termina le righe con
-            # \r\n, e confrontarlo con uno stream atteso in \n falliva SOLO là.
-            # La normalizzazione è del test, non del prodotto: in conversazione
+            # Via OGNI \r, non solo la coppia \r\n: su Windows lo stdout di un
+            # figlio termina le righe con \r\n, e se il figlio scrive lui stesso
+            # \r\n in modalità testo la traduzione del sistema si somma alla sua
+            # (\r\r\n) — sostituire solo la coppia lascerebbe un CR orfano.
+            # È una normalizzazione del TEST, non del prodotto: in conversazione
             # l'output va consegnato come il comando l'ha prodotto.
-            return body.replace("\r\n", "\n")
+            return body.replace("\r", "")
 
         first = _ct.job(ctx, action="check", id="j1", wait_seconds=5)
         check("job: check restituisce output nuovo", "--- new output ---" in first, first[:150])
@@ -5153,9 +5155,17 @@ def test_background_jobs():
         # dopo il push. Qui un figlio emette CRLF esplicitamente: la stessa
         # invariante viene verificata anche su POSIX, quindi la regressione non può
         # più nascondersi dietro una piattaforma.
-        crlf_child = child("import sys,time; [(sys.stdout.write('line %d\\r\\n' % i), "
-                           "sys.stdout.flush(), time.sleep(0.02)) for i in range(20)]")
+        # Scrittura BINARIA: su Windows il livello testo tradurrebbe di nuovo il
+        # newline, producendo \r\r\n — così il figlio emette esattamente CRLF su
+        # entrambi i sistemi ed è il test a dire cosa sta verificando. Niente '%'
+        # nel comando (cmd.exe lo interpreta) e grazia minima, così l'avvio non si
+        # mangia lo stream che i check devono ricomporre.
+        crlf_child = child("import sys,time; [(sys.stdout.buffer.write(b'line ' + str(i).encode() "
+                           "+ b'\\r\\n'), sys.stdout.buffer.flush(), time.sleep(0.05)) "
+                           "for i in range(30)]")
+        cfg.bg_start_grace = 0.05
         crlf_started = _ct.run_background(ctx, command=crlf_child)
+        cfg.bg_start_grace = 0.3
         # Id dedotto dal messaggio, non cablato: aggiungere un job prima di questo
         # blocco non deve poter rompere il test.
         crlf_id = crlf_started.split()[2]
@@ -5166,13 +5176,23 @@ def test_background_jobs():
             crlf_out += new_output(_ct.job(ctx, action="check", id=crlf_id, wait_seconds=2))
             if len(crlf_out) > 20:
                 break
-        crlf_expected = "".join(f"line {i}\n" for i in range(20))
+        crlf_expected = "".join(f"line {i}\n" for i in range(30))
         crlf_body = crlf_out.lstrip()
         crlf_at = crlf_expected.find(crlf_body[:7]) if crlf_body.strip() else -1
         check("job: output CRLF ricomposto correttamente (caso Windows)",
               crlf_at >= 0 and crlf_expected[crlf_at:crlf_at + len(crlf_body)] == crlf_body,
               f"at={crlf_at} out={crlf_out[:50]!r}")
         check("job: nessun \\r residuo dopo la normalizzazione", "\r" not in crlf_out, repr(crlf_out[:40]))
+        # Il caso ESATTO che è passato in CI su Windows e non qui: un figlio che
+        # scrive \r\n in modalità testo produce \r\r\n, e una normalizzazione che
+        # sostituisce solo la coppia lascia un CR orfano. Asserito su stringa
+        # sintetica: nessun processo, nessun tempo, nessuna piattaforma.
+        double_cr = "--- new output ---\nline 0\r\r\nline 1\r\r\n"
+        check("job: normalizzazione robusta al CR doppio di Windows",
+              new_output(double_cr) == "line 0\nline 1\n", repr(new_output(double_cr)))
+        check("job: normalizzazione robusta al CR solitario",
+              new_output("--- new output ---\na\rb\n") == "ab\n",
+              repr(new_output("--- new output ---\na\rb\n")))
         _ct.job(ctx, action="stop", id=crlf_id)
 
         # ── list ─────────────────────────────────────────────────────────────

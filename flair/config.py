@@ -263,6 +263,17 @@ class Config:
     # core/agent.py). False = stima statica chars//4, comportamento pre-esistente.
     context_calibration: bool = True
 
+    # Job in background (run_background / job): tetti e tempi. Esistono perché un
+    # processo lungo e loquace, senza limiti, mangia RAM e contesto — e perché un
+    # job dimenticato non deve restare vivo per sempre.
+    bg_max_jobs: int = 8              # job contemporanei per sessione
+    bg_buffer_chars: int = 262_144    # output conservato per job (ring: si scarta il più vecchio)
+    bg_max_wait: int = 30             # tetto di wait_seconds su job(check)
+    bg_start_grace: float = 1.5       # attesa allo start: un comando che muore subito lo dice subito
+    bg_stop_grace: float = 3.0        # tra la terminazione gentile e quella forzata
+    bg_max_lifetime: int = 3600       # oltre, il job viene chiuso alla prima interazione utile
+    bg_keep_finished: int = 5         # job CONCLUSI trattenuti: oltre, i più vecchi escono dalla lista
+
     # Isteresi dello stadio 0: la potatura da sola evita il riassunto SOLO se porta
     # il contesto sotto soglia con questo margine (frazione della finestra). La
     # mutazione ha comunque rotto il prefisso in cache: uscire a ridosso della
@@ -433,6 +444,13 @@ def load_config() -> Config:
         image_max_side=_int("FLAIR_IMAGE_MAX_SIDE", 1536),
         image_token_estimate=_int("FLAIR_IMAGE_TOKENS", 1200),
         context_calibration=_bool("FLAIR_CTX_CALIBRATION", True),
+        bg_max_jobs=_int("FLAIR_BG_MAX_JOBS", 8),
+        bg_buffer_chars=_int("FLAIR_BG_BUFFER_CHARS", 262_144),
+        bg_max_wait=_int("FLAIR_BG_MAX_WAIT", 30),
+        bg_start_grace=_float("FLAIR_BG_START_GRACE", 1.5),
+        bg_stop_grace=_float("FLAIR_BG_STOP_GRACE", 3.0),
+        bg_max_lifetime=_int("FLAIR_BG_MAX_LIFETIME", 3600),
+        bg_keep_finished=_int("FLAIR_BG_KEEP_FINISHED", 5),
         root=Path(os.getenv("FLAIR_ROOT", ".")).expanduser().resolve(),
         read_file_max_chars=_int("FLAIR_READ_MAX", 12000),
         grep_max_chars=_int("FLAIR_GREP_MAX", 6000),

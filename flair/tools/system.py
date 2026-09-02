@@ -18,7 +18,7 @@ from datetime import datetime
 from pathlib import Path
 
 from ..core.tool import ToolContext, tool
-from . import fs, images, shell
+from . import fs, images, jobs, shell
 
 _OS = platform.system()  # 'Windows' | 'Darwin' | 'Linux'
 
@@ -463,8 +463,52 @@ def view_image(ctx: ToolContext, path: str) -> str:
     return images.view_image_impl(ctx, path, root=None)
 
 
+@tool(
+    "run_background",
+    "Start a long command in the background and return immediately, instead of "
+    "blocking the turn: scans, encodings, backups, long downloads. You get a job "
+    "id and read its output later with `job`. Use it when a command may take more "
+    "than ~30s; for quick commands use run_command. NOT for interactive or "
+    "full-screen programs (top, vim, prompts): they get a pipe instead of a "
+    "terminal and will hang or misbehave.",
+    {
+        "type": "object",
+        "properties": {
+            "command": {"type": "string", "description": "Command to start in the background."},
+        },
+        "required": ["command"],
+    },
+    destructive=True,
+    background=True,
+)
+def run_background(ctx: ToolContext, command: str) -> str:
+    return jobs.run_background_impl(ctx, command, cwd=None)
+
+
+@tool(
+    "job",
+    "Inspect the background jobs you started. action=\"check\" returns ONLY the output "
+    "produced since your last check (add wait_seconds to block briefly instead of "
+    "polling in a loop), action=\"list\" shows every job with its status, "
+    "action=\"stop\" terminates one (the whole process tree). Jobs live only for "
+    "this session.",
+    {
+        "type": "object",
+        "properties": {
+            "action": {"type": "string", "description": "check (read new output) | list (all jobs) | stop (terminate one)."},
+            "id": {"type": "string", "description": "Job id, e.g. 'j1'. Required for check and stop."},
+            "wait_seconds": {"type": "integer", "description": "On check: block up to N seconds waiting for new output or for the command to finish. Default 0 (return immediately)."},
+        },
+        "required": ["action"],
+    },
+    background=True,
+)
+def job(ctx: ToolContext, action: str, id: str = "", wait_seconds: int = 0) -> str:
+    return jobs.job_impl(ctx, action, id, wait_seconds)
+
+
 TOOLS = [
     open_url, open_path, open_application, search_files, list_directory,
     read_file, write_file, edit_file, run_command, run_powershell, system_info,
-    get_datetime, clipboard_get, clipboard_set, view_image,
+    get_datetime, clipboard_get, clipboard_set, view_image, run_background, job,
 ]

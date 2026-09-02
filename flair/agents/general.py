@@ -17,7 +17,9 @@ def build(cfg, provider, conversation=None, **callbacks) -> Agent:
         tools = [*tools, memory_tools.remember]
     if getattr(cfg, "read_only", False):
         # Esecuzione non presidiata: niente write/edit/comandi sull'intera macchina.
-        tools = [t for t in tools if not t.destructive]
+        # Cade anche la famiglia dei job in background: senza poter AVVIARE un
+        # processo, i tool per gestirli sarebbero schemi inviati per nulla.
+        tools = [t for t in tools if not (t.destructive or t.background)]
     return Agent(
         name="general",
         cfg=cfg,

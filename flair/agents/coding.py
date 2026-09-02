@@ -23,8 +23,10 @@ def build(cfg, provider, conversation=None, **callbacks) -> Agent:
         # A flag spento il tool NON esiste (niente schema inviato al modello).
         tools = [*tools, memory_tools.remember]
     if getattr(cfg, "read_only", False):
-        # Esecuzione non presidiata: nessuna modifica al filesystem né comandi.
-        tools = [t for t in tools if not t.destructive]
+        # Esecuzione non presidiata: nessuna modifica al filesystem né comandi. Cade
+        # anche la famiglia dei job in background: senza poter AVVIARE un processo,
+        # i tool per gestirli sarebbero schemi inviati a ogni richiesta per nulla.
+        tools = [t for t in tools if not (t.destructive or t.background)]
     return Agent(
         name="coding",
         cfg=cfg,

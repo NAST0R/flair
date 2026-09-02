@@ -5061,6 +5061,360 @@ def test_tool_schema_contract():
                       f"{pname}: {pspec}")
 
 
+def test_background_jobs():
+    """Job in background: dispatch non bloccante, output incrementale col cursore,
+    attesa limitata, terminazione dell'albero, e — il requisito che conta più di
+    tutti — nessun processo lasciato vivo all'uscita.
+
+    Disciplina anti-intermittenza: i figli sono script `sys.executable -c` con flush
+    espliciti e la sincronizzazione avviene su SENTINELLE con deadline, mai su
+    sleep — in CI un test di concorrenza che si fida dei tempi diventa un rosso
+    casuale, che è peggio di nessun test."""
+    import os as _os
+    import sys as _sys
+    import time as _time
+
+    from flair.tools import coding as _ct
+    from flair.tools import jobs as _jobs
+    from flair.tools import system as _st
+
+    def child(code: str) -> str:
+        """Comando che esegue `code` con l'interprete corrente. Le virgolette esterne
+        NON si aggiungono: subprocess(shell=True) compone già `cmd /c "..."` su
+        Windows (lezione del test sulla decodifica della shell)."""
+        return f'"{_sys.executable}" -c "{code}"'
+
+    def until(predicate, timeout: float = 20.0, label: str = "") -> bool:
+        deadline = _time.monotonic() + timeout
+        while _time.monotonic() < deadline:
+            if predicate():
+                return True
+            _time.sleep(0.05)
+        return False
+
+    cfg = cfg_for(Path("."))
+    cfg.bg_start_grace = 0.3      # i test non devono pagare la grazia intera
+    cfg.bg_stop_grace = 1.0
+    reg = _jobs.BackgroundJobs(max_jobs=2, buffer_chars=8192,
+                               max_lifetime=3600, stop_grace=1.0)
+    ctx = ToolContext(cfg=cfg)
+    ctx.jobs = reg
+    try:
+        # ── Dispatch: ritorna subito, il processo continua ────────────────────
+        # Programma su UNA riga: una newline dentro -c "..." non sopravvive a cmd.exe.
+        ticker = child("import time; [print('tick', i, flush=True) or time.sleep(0.05) "
+                       "for i in range(40)]")
+        out = _ct.run_background(ctx, command=ticker)
+        check("job: dispatch riuscito con id", out.startswith("✅ job j1 started"), out[:80])
+        check("job: dichiara che sta ancora girando", "still running" in out, out[-80:])
+        j1 = reg.get("j1")
+        check("job: registrato e vivo", j1 is not None and j1.running)
+
+        # ── Output incrementale: ogni check consegna SOLO il nuovo ────────────
+        # L'invariante che conta è che la CONCATENAZIONE dei check sia un prefisso
+        # esatto dello stream atteso: prova insieme "niente ri-consegnato" e
+        # "niente perso". Confrontare riga per riga sarebbe fragile, perché l'output
+        # arriva a frammenti e una riga può spezzarsi tra due check.
+        def new_output(result: str) -> str:
+            marker = "--- new output ---\n"
+            if marker not in result:
+                return ""
+            body = result.split(marker, 1)[1]
+            for tail in ("[job finished", "[no new output"):
+                body = body.split(tail, 1)[0]
+            return body
+
+        first = _ct.job(ctx, action="check", id="j1", wait_seconds=5)
+        check("job: check restituisce output nuovo", "--- new output ---" in first, first[:150])
+        check("job: intestazione con stato e durata", "j1 · running ·" in first, first[:60])
+        collected = new_output(first)
+        for _ in range(6):
+            collected += new_output(_ct.job(ctx, action="check", id="j1", wait_seconds=2))
+            if len(collected) > 40:
+                break
+        expected = "".join(f"tick {i}\n" for i in range(40))
+        # `run_background` ha già consumato il primo frammento: la concatenazione dei
+        # check è un prefisso di ciò che resta dello stream.
+        started_at = expected.index(collected.lstrip()[:8]) if collected.strip() else -1
+        check("job: i check concatenati sono un prefisso esatto dello stream",
+              started_at >= 0 and expected[started_at:started_at + len(collected.lstrip())] == collected.lstrip(),
+              repr(collected[:60]))
+        check("job: output cresciuto tra i check (nessuna ri-consegna)",
+              len(collected) > 20, repr(collected[:40]))
+
+        # ── list ─────────────────────────────────────────────────────────────
+        listed = _ct.job(ctx, action="list")
+        check("job: list mostra il job con stato e conteggio",
+              "j1 ·" in listed and "1 still running" in listed, listed[:100])
+
+        # ── stop: il processo muore ──────────────────────────────────────────
+        stopped = _ct.job(ctx, action="stop", id="j1")
+        check("job: stop conferma", stopped.startswith("🛑 job j1 stopped"), stopped[:60])
+        check("job: dopo lo stop non è più vivo", not j1.running)
+        check("job: check su job concluso lo dice",
+              "nothing more will arrive" in _ct.job(ctx, action="check", id="j1"))
+
+        # ── Un comando che muore subito NON finge di essere partito ───────────
+        dead = _ct.run_background(ctx, command=child("import sys; sys.exit(3)"))
+        check("job: comando morto all'istante segnalato nello stesso turno",
+              "already finished with exit code 3" in dead, dead)
+
+        # ── Exit code di un comando breve ma non istantaneo ───────────────────
+        ok = _ct.run_background(ctx, command=child("print('done', flush=True)"))
+        jid = ok.split()[2]
+        job_ok = reg.get(jid)
+        check("job: il figlio termina da solo", until(lambda: not job_ok.running), ok)
+        res = _ct.job(ctx, action="check", id=jid)
+        check("job: exit 0 riportato", "exited 0" in res, res[:80])
+        check("job: output del figlio consegnato", "done" in res, res)
+
+        # ── Errori azionabili ────────────────────────────────────────────────
+        check("job: id inesistente → errore con gli id noti",
+              _ct.job(ctx, action="check", id="j99").startswith("❌ No job with id 'j99'"))
+        check("job: azione sconosciuta → errore azionabile",
+              _ct.job(ctx, action="frobnicate", id="j1").startswith("❌ Unknown action"))
+        check("job: senza registro nel contesto → messaggio chiaro",
+              _ct.job(ToolContext(cfg=cfg), action="list").startswith("❌ Background jobs are not available"))
+
+        # ── Tetto dei job concorrenti (max_jobs=2) ───────────────────────────
+        sleeper = child("import time; time.sleep(30)")
+        a = _ct.run_background(ctx, command=sleeper)
+        b = _ct.run_background(ctx, command=sleeper)
+        c = _ct.run_background(ctx, command=sleeper)
+        check("job: due job concorrenti accettati",
+              a.startswith("✅") and b.startswith("✅"), f"{a[:20]} {b[:20]}")
+        check("job: il terzo è rifiutato con il rimedio nel messaggio",
+              c.startswith("❌") and "FLAIR_BG_MAX_JOBS" in c, c)
+
+        # ── stop_all: il requisito che conta ─────────────────────────────────
+        pids = [j.proc.pid for j in reg.active()]
+        check("job: due processi vivi prima della chiusura", len(pids) == 2, str(pids))
+        check("job: stop_all ne ferma due", reg.stop_all() == 2)
+        check("job: nessun job vivo dopo stop_all", reg.active() == [])
+        if _os.name != "nt":
+            def gone(pid: int) -> bool:
+                try:
+                    _os.kill(pid, 0)
+                except ProcessLookupError:
+                    return True
+                except PermissionError:
+                    return False
+                return False
+            check("job: i processi sono davvero terminati (POSIX)",
+                  until(lambda: all(gone(p) for p in pids), 5.0), str(pids))
+        check("job: stop_all è idempotente", reg.stop_all() == 0)
+
+        # ── Buffer a tetto: si scarta il più vecchio e lo si dichiara ─────────
+        small = _jobs.BackgroundJobs(max_jobs=1, buffer_chars=4096, stop_grace=1.0)
+        ctx2 = ToolContext(cfg=cfg)
+        ctx2.jobs = small
+        try:
+            # Deterministico rispetto ai TEMPI: se il figlio riversa tutto entro la
+            # finestra di grazia è il messaggio di avvio a dichiarare la perdita,
+            # altrimenti il check successivo. Il test verifica che sia dichiarata da
+            # UNO dei due, non che l'output arrivi con una certa tempistica.
+            started2 = _ct.run_background(ctx2, command=child("print('x' * 20000, flush=True)"))
+            noisy = small.get("j1")
+            check("job: figlio loquace terminato", until(lambda: not noisy.running), "")
+            res2 = _ct.job(ctx2, action="check", id="j1")
+            check("job: il troncamento del buffer è dichiarato (allo start o al check)",
+                  "were dropped" in started2 or "were dropped" in res2,
+                  f"start={started2[-90:]!r} check={res2[-90:]!r}")
+            check("job: il buffer ha davvero scartato output", noisy._dropped > 10000, str(noisy._dropped))
+            check("job: nessuna consegna oltre il tetto del buffer",
+                  len(started2) + len(res2) < 12000, f"{len(started2)}+{len(res2)}")
+        finally:
+            small.stop_all()
+
+        # ── Reaping: la vita massima chiude i job dimenticati ────────────────
+        short = _jobs.BackgroundJobs(max_jobs=1, max_lifetime=1, stop_grace=1.0)
+        ctx3 = ToolContext(cfg=cfg)
+        ctx3.jobs = short
+        try:
+            _ct.run_background(ctx3, command=sleeper)
+            forgotten = short.get("j1")
+            check("job: partito", forgotten.running)
+            check("job: oltre la vita massima viene chiuso al reaping",
+                  until(lambda: (short.reap(), not forgotten.running)[1], 8.0))
+        finally:
+            short.stop_all()
+    finally:
+        reg.stop_all()
+
+    # ── Contratto dei tool nei due agenti ────────────────────────────────────
+    check("job: run_background è distruttivo (gate di approvazione)",
+          _ct.run_background.destructive and _st.run_background.destructive)
+    check("job: la famiglia è marcata background",
+          _ct.run_background.background and _ct.job.background
+          and _st.run_background.background and _st.job.background)
+    check("job: il tool di gestione NON è distruttivo (nessun gate sul check)",
+          not _ct.job.destructive and not _st.job.destructive)
+    check("job: coding lo esegue nella radice, general nella directory di processo",
+          "ctx.cfg.root" in __import__("inspect").getsource(_ct.run_background.func)
+          and "cwd=None" in __import__("inspect").getsource(_st.run_background.func))
+
+    # ── read_only: l'intera famiglia scompare ────────────────────────────────
+    ro = cfg_for(Path("."))
+    ro.read_only = True
+    for label, mod in (("coding", coding_agent), ("general", general_agent)):
+        names = [t["function"]["name"] for t in mod.build(ro, None).toolset.schemas()]
+        check(f"job: in read_only {label} non espone né avvio né gestione",
+              "run_background" not in names and "job" not in names, str(names))
+
+    # ── Esenzione dal rilevatore di loop ─────────────────────────────────────
+    agent = coding_agent.build(cfg_for(Path(".")), FakeProvider([]))
+    check("job: il tool di gestione è esente dal rilevatore di loop",
+          agent._loop_exempt("job") is True)
+    check("job: l'avvio NON è esente (quattro avvii identici sono un loop vero)",
+          agent._loop_exempt("run_background") is False)
+    check("job: i tool normali restano sotto il rilevatore",
+          agent._loop_exempt("read_file") is False and agent._loop_exempt("run_command") is False)
+
+    # E il caso vero: cinque check identici non chiudono il turno.
+    calls = [tc("job", action="check", id="j1") for _ in range(5)]
+    prov = FakeProvider([*[LLMResponse(tool_calls=[c]) for c in calls], LLMResponse(content="fine")])
+    cfg4 = cfg_for(Path("."))
+    agent4 = coding_agent.build(cfg4, prov)
+    agent4.ctx.jobs = _jobs.BackgroundJobs(max_jobs=1)
+    try:
+        res4 = agent4.run("controlla il job")
+        check("job: cinque check identici NON fanno scattare l'anti-loop",
+              res4.stopped_reason == "done", res4.stopped_reason)
+    finally:
+        agent4.ctx.jobs.stop_all()
+
+    # ── Il caso cattivo: un NIPOTE che ignora la terminazione gentile ────────
+    # Con shell=True il figlio diretto è la shell e il processo che conta è un
+    # nipote. Attendere la morte della SHELL non dice nulla: un nipote che ignora
+    # SIGTERM sopravviveva allo `stop` perché la shell moriva subito, `wait()`
+    # tornava e l'escalation a SIGKILL non avveniva mai. Ora al gruppo arriva
+    # sempre anche SIGKILL.
+    if _os.name != "nt":       # su Windows il PID del nipote non è osservabile così
+        stubborn = _jobs.BackgroundJobs(max_jobs=1, stop_grace=0.5)
+        ctxs = ToolContext(cfg=cfg)
+        ctxs.jobs = stubborn
+        try:
+            started_s = _ct.run_background(ctxs, command=child(
+                "import os,signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                "print(os.getpid(), flush=True); [time.sleep(1) for _ in range(9999)]"))
+            pids = [int(t) for t in started_s.split() if t.isdigit() and int(t) > 100]
+            check("stop: il nipote ha dichiarato il proprio pid", bool(pids), started_s[:120])
+            grandchild = pids[0]
+
+            def gone_pid(pid: int) -> bool:
+                try:
+                    _os.kill(pid, 0)
+                except ProcessLookupError:
+                    return True
+                except PermissionError:
+                    return False
+                return False
+
+            check("stop: il nipote è vivo prima dello stop", not gone_pid(grandchild))
+            _ct.job(ctxs, action="stop", id="j1")
+            check("stop: il nipote che IGNORA SIGTERM viene comunque terminato",
+                  until(lambda: gone_pid(grandchild), 10.0), str(grandchild))
+        finally:
+            stubborn.stop_all()
+
+    # ── Ritenzione: i job conclusi non si accumulano per sempre ──────────────
+    # In una sessione lunga ogni job concluso resterebbe nella lista (righe di
+    # rumore in contesto a ogni `list`) e terrebbe il suo buffer in RAM (256 KB di
+    # default a job). Politica: si trattengono i più recenti, i vecchi vengono
+    # sfrattati e CONTATI, e il buffer si libera quando è stato letto per intero —
+    # mai prima, perché non si scarta output che il modello non ha visto.
+    keep = _jobs.BackgroundJobs(max_jobs=4, buffer_chars=65536, keep_finished=3, stop_grace=1.0)
+    ctxk = ToolContext(cfg=cfg)
+    ctxk.jobs = keep
+    try:
+        noisy = child("print('y' * 20000)")
+        for _ in range(6):
+            keep.start(noisy, None)
+            check("ritenzione: figlio concluso",
+                  until(lambda: not any(j.running for j in keep.all()), 15.0))
+            keep.reap()
+        check("ritenzione: trattenuti solo i più recenti", len(keep.all()) == 3, str(len(keep.all())))
+        check("ritenzione: gli sfrattati sono contati", keep.evicted == 3, str(keep.evicted))
+        listed_k = _ct.job(ctxk, action="list")
+        check("ritenzione: list dichiara gli sfrattati invece di farli sparire",
+              "older finished job(s) no longer tracked" in listed_k, listed_k[-80:])
+        gone = _ct.job(ctxk, action="check", id="j1")
+        check("ritenzione: id sfrattato → spiegazione, non un id inventato",
+              "no longer tracked" in gone and "most recent finished" in gone, gone[:120])
+
+        # Buffer: trattenuto finché non letto, liberato dopo.
+        survivor = keep.all()[-1]
+        check("ritenzione: buffer trattenuto se non letto", len(survivor._text) > 10000,
+              str(len(survivor._text)))
+        _ct.job(ctxk, action="check", id=survivor.id)
+        keep.reap()
+        check("ritenzione: buffer liberato dopo la lettura completa",
+              survivor._text == "" and survivor.unread() == 0, str(len(survivor._text)))
+        check("ritenzione: i metadati del job letto restano in list",
+              survivor.id in _ct.job(ctxk, action="list"))
+
+        # Un job VIVO non viene mai sfrattato, per quanti conclusi ci siano.
+        alive = keep.start(child("import time; time.sleep(20)"), None)
+        for _ in range(3):
+            keep.start(child("print('z')"), None)
+            until(lambda: not any(j.running for j in keep.all() if j is not alive), 15.0)
+            keep.reap()
+        check("ritenzione: il job vivo sopravvive allo sfratto",
+              keep.get(alive.id) is not None and alive.running)
+        check("ritenzione: list mette i job vivi per primi",
+              _ct.job(ctxk, action="list").splitlines()[1].strip().startswith(alive.id),
+              _ct.job(ctxk, action="list")[:120])
+    finally:
+        keep.stop_all()
+
+    # ── Batch PARALLELO: il registro deve essere visibile ai worker ──────────
+    # Regressione trovata sul campo: `job` non è distruttivo, quindi più check nello
+    # stesso batch prendono il percorso parallelo, che usa un ToolContext ISOLATO.
+    # Il registro non veniva condiviso e i check rispondevano "no registry attached"
+    # mentre i job giravano — le chiamate singole (sequenziali) funzionavano, il che
+    # rendeva il sintomo intermittente e la diagnosi fuorviante.
+    cfg5 = cfg_for(Path("."))
+    cfg5.bg_start_grace = 0.3
+    reg5 = _jobs.BackgroundJobs(max_jobs=3, stop_grace=1.0)
+    sleeper5 = child("import time; time.sleep(20)")
+    prov5 = FakeProvider([
+        LLMResponse(tool_calls=[tc("run_background", command=sleeper5)]),
+        LLMResponse(tool_calls=[tc("job", action="check", id="j1"),
+                                tc("job", action="list"),
+                                tc("job", action="check", id="j1", wait_seconds=1)]),
+        LLMResponse(content="visto"),
+    ])
+    agent5 = coding_agent.build(cfg5, prov5)
+    agent5.ctx.jobs = reg5
+    try:
+        batch = [tc("job", action="check", id="j1"), tc("job", action="list")]
+        check("job: un batch di check è parallelizzabile (non distruttivi)",
+              agent5._should_parallelize(batch) is True)
+        res5 = agent5.run("avvia e controlla")
+        outs = [m.get("content") or "" for m in agent5.convo.messages if m.get("role") == "tool"]
+        check("job: nessun worker parallelo ha perso il registro",
+              not any("no registry attached" in o for o in outs),
+              next((o[:80] for o in outs if "no registry attached" in o), ""))
+        check("job: i check paralleli hanno visto il job vivo",
+              sum(1 for o in outs if "j1 ·" in o) >= 2, str(len(outs)))
+        check("job: turno concluso", res5.stopped_reason == "done", res5.stopped_reason)
+    finally:
+        reg5.stop_all()
+
+    # ── Il CLI termina i job su ogni uscita ──────────────────────────────────
+    import inspect as _ins
+
+    from flair.cli import CLI
+    for method in (CLI.repl, CLI.run_once):
+        check(f"job: {method.__name__} passa dalla chiusura dei job",
+              "_shutdown_jobs" in _ins.getsource(method), method.__name__)
+    check("job: run_once la chiama in finally (qualunque esito)",
+          "finally:" in _ins.getsource(CLI.run_once).split("_shutdown_jobs")[0][-60:],
+          _ins.getsource(CLI.run_once)[-200:])
+    check("job: il registro si registra anche in atexit (ultima rete)",
+          "atexit.register" in _ins.getsource(_jobs.BackgroundJobs.__init__))
+
+
 def main():
     test_output_portable()
     test_arg_parse()
@@ -5154,6 +5508,7 @@ def main():
     test_repl_dispatch()
     test_think_price_override()
     test_tool_schema_contract()
+    test_background_jobs()
     test_budget_abort()
     test_read_only_mode()
     test_automation_helpers()

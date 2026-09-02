@@ -118,6 +118,9 @@ class ToolContext:
     # solo-testo, quindi il tool deposita qui la parte multipart e il loop la
     # consegna come messaggio utente dopo i risultati del batch. None = spenta.
     pending_images: Any = None
+    # Registro dei job in background (BackgroundJobs), condiviso per riferimento
+    # con i worker paralleli e con gli altri agenti. None = feature non disponibile.
+    jobs: Any = None
 
 
 @dataclass
@@ -131,6 +134,13 @@ class Tool:
     # nel percorso SEQUENZIALE, sul ctx condiviso — i worker paralleli usano ctx
     # isolati e il deposito andrebbe perso.
     stages_media: bool = False
+    # Il tool gestisce processi in background. Due conseguenze: (1) in modalità
+    # read_only l'intera famiglia scompare, perché senza poter AVVIARE un job
+    # gestirli non ha senso; (2) se NON è distruttivo (cioè è il tool di gestione,
+    # non quello di avvio) è esente dal rilevatore di loop: interrogare più volte
+    # lo stesso job è il suo mestiere, mentre quattro avvii identici sarebbero
+    # davvero quattro processi identici e devono restare sotto il rilevatore.
+    background: bool = False
     _accepts: frozenset = field(init=False, repr=False, compare=False)
     _var_kw: bool = field(init=False, repr=False, compare=False)
     _types: dict = field(init=False, repr=False, compare=False)
@@ -197,11 +207,12 @@ class Tool:
 
 
 def tool(name: str, description: str, parameters: dict, destructive: bool = False,
-         stages_media: bool = False):
+         stages_media: bool = False, background: bool = False):
     """Decoratore che trasforma una funzione `(ctx, **args) -> str` in un Tool."""
     def deco(fn: Callable[..., str]) -> Tool:
         return Tool(name=name, description=description, parameters=parameters,
-                    func=fn, destructive=destructive, stages_media=stages_media)
+                    func=fn, destructive=destructive, stages_media=stages_media,
+                    background=background)
     return deco
 
 

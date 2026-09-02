@@ -273,6 +273,28 @@ CATALOG: tuple[Field, ...] = (
           "Override: input price during peak hours.", min=0.0),
     Field("Pricing", "FLAIR_PRICE_OUTPUT_PEAK", "float", None,
           "Override: output price during peak hours.", min=0.0),
+    Field("Background jobs", "FLAIR_BG_MAX_JOBS", "int", "8",
+          "How many background commands (run_background) can run at the same time.", min=1, max=64),
+    Field("Background jobs", "FLAIR_BG_BUFFER_CHARS", "int", "262144",
+          "Output kept per job, in characters. It is a ring: past the cap the oldest "
+          "output is dropped and the job says how much.", min=4096),
+    Field("Background jobs", "FLAIR_BG_MAX_WAIT", "int", "30",
+          "Cap for wait_seconds on job(check): how long a single call may block "
+          "waiting for new output instead of polling in a loop.", min=0, max=600),
+    Field("Background jobs", "FLAIR_BG_START_GRACE", "float", "1.5",
+          "Seconds waited right after starting a job, so a command that dies "
+          "immediately reports the error in the same turn.", min=0.0, max=30.0),
+    Field("Background jobs", "FLAIR_BG_STOP_GRACE", "float", "3.0",
+          "Seconds between the graceful termination of a job's process tree and the "
+          "forced kill.", min=0.0, max=60.0),
+    Field("Background jobs", "FLAIR_BG_MAX_LIFETIME", "int", "3600",
+          "Maximum lifetime of a background job in seconds: past it the job is "
+          "terminated at the next interaction. 0 = no limit (not recommended).", min=0),
+    Field("Background jobs", "FLAIR_BG_KEEP_FINISHED", "int", "5",
+          "How many FINISHED jobs stay in the list. A finished job is still useful "
+          "for a moment (its tail gets read after it ends), but keeping them all "
+          "makes job(action=\"list\") grow with every long session and holds their "
+          "output buffers in memory. Older ones are dropped and counted.", min=0),
     Field("Pricing", "FLAIR_PRICE_CACHE_HIT_THINK", "float", None,
           "Override for requests served by the THINKING model only (highest "
           "precedence). Needed when fast and thinking sit on different third-party "

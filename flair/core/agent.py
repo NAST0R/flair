@@ -737,6 +737,16 @@ class Agent:
             msg["reasoning_content"] = resp.reasoning
         return msg
 
+    def _loop_exempt(self, name: str) -> bool:
+        """I tool di GESTIONE dei job in background sono interrogati più volte con
+        gli stessi argomenti per natura (`job(action="check", id="j1")`): il
+        rilevatore di loop, che conta le chiamate identiche e chiude il turno alla
+        quarta, li fermerebbe proprio mentre stanno facendo il loro lavoro. L'avvio
+        (distruttivo) resta invece sotto il rilevatore: quattro avvii identici sono
+        quattro processi identici, e quello è un loop vero."""
+        t = self.toolset.get(name)
+        return bool(t and t.background and not t.destructive)
+
     @staticmethod
     def _sig(name: str, args: dict) -> str:
         """Firma stabile di una chiamata (nome + argomenti) per il rilevamento dei loop."""
@@ -770,6 +780,13 @@ class Agent:
         # identiche nello stesso batch che scavalcano il dedup) produce al più un
         # doppione, ripulito alla serializzazione (SessionMemory.to_text).
         ctx.memory = self.ctx.memory
+        # Stessa ragione, stessa eccezione: il registro dei job in background è UNO
+        # per sessione e va condiviso per riferimento, altrimenti un batch di
+        # `job(action="check")` — non distruttivo, quindi parallelizzabile — finisce
+        # su un contesto isolato senza registro e risponde "no registry attached"
+        # mentre i job stanno girando. È sicuro: BackgroundJobs ha il suo lock, e
+        # ogni Job protegge il proprio buffer.
+        ctx.jobs = self.ctx.jobs
         try:
             out = t(ctx, **args)
             ok = not out.startswith("❌")
@@ -824,8 +841,9 @@ class Agent:
             elif self.toolset.get(tc.name) is None:
                 precomputed[tc.id] = f"❌ Unknown tool: {tc.name}"
             else:
-                sig = self._sig(tc.name, tc.arguments)
-                recent[sig] = recent.get(sig, 0) + 1
+                if not self._loop_exempt(tc.name):
+                    sig = self._sig(tc.name, tc.arguments)
+                    recent[sig] = recent.get(sig, 0) + 1
                 to_run.append(tc)
 
         results: dict[str, tuple[str, bool, Usage]] = {}
@@ -886,8 +904,9 @@ class Agent:
                 self.on_result(name, out, False)
             return out, False
 
-        sig = self._sig(name, args)
-        recent[sig] = recent.get(sig, 0) + 1
+        if not self._loop_exempt(name):
+            sig = self._sig(name, args)
+            recent[sig] = recent.get(sig, 0) + 1
 
         if t.destructive and not self.cfg.auto_approve and self.approve:
             decision = self.approve(name, args)

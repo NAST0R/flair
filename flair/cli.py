@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import difflib
 import json
+import logging
 import os
 import sys
 import time
@@ -36,6 +37,7 @@ from .memory import SessionMemory
 from .session_log import SessionLogger, setup_file_logging
 from .session_store import SessionStore
 from .tools import fs, images
+from .tools.jobs import BackgroundJobs
 
 _TOOL_ICON = {
     "read_file": "📄", "list_directory": "📁", "glob": "🔎", "grep": "🔎",
@@ -178,6 +180,7 @@ _COMMANDS: tuple[tuple[str, str, str, str], ...] = (
     ("reset", "/reset", "reset the shared conversation", "_cmd_reset"),
     ("root", "/root <path>", "change the working folder (coding + general; reloads instructions)", "_cmd_root"),
     ("img", "/img <path> [prompt]", "attach an image to the turn (vision endpoints only)", "_cmd_img"),
+    ("jobs", "/jobs [stop <id>]", "background jobs still running (or stop one)", "_cmd_jobs"),
     ("help", "/help", "this help", "_cmd_help"),
 )
 _QUIT_WORDS = ("exit", "quit", "q")
@@ -231,9 +234,31 @@ class CLI:
         self._think_chars = 0
         self._think_t0 = 0.0
         self._base_prompts = {k: ag.system_prompt for k, ag in self.agents.items()}
+        # Registro dei job in background: uno per sessione, condiviso per riferimento
+        # con entrambi gli agenti (e con i worker paralleli, che ricevono un ctx
+        # isolato ma la stessa istanza). I processi vengono terminati su OGNI uscita
+        # (v. _shutdown_jobs): un comando che sopravvive a flair è un bug, non una
+        # feature.
+        self.jobs = BackgroundJobs(max_jobs=cfg.bg_max_jobs, buffer_chars=cfg.bg_buffer_chars,
+                                   max_lifetime=cfg.bg_max_lifetime, stop_grace=cfg.bg_stop_grace,
+                                   keep_finished=cfg.bg_keep_finished)
         for ag in self.agents.values():
             ag.ctx.memory = self.memory
+            ag.ctx.jobs = self.jobs
         self._refresh_memory_prompts()
+
+    def _shutdown_jobs(self) -> None:
+        """Termina i job ancora vivi. Chiamata su TUTTE le uscite (fine del REPL,
+        EOF/Ctrl-C, one-shot) più `atexit` dentro il registro come ultima rete: senza
+        questo, una scansione lanciata in background continuerebbe a girare dopo la
+        chiusura di flair, invisibile e non più fermabile dall'interfaccia."""
+        try:
+            stopped = self.jobs.stop_all()
+        except Exception as exc:  # noqa: BLE001 — l'uscita non deve mai fallire per questo
+            logging.getLogger("flair.cli").warning("Chiusura dei job non completata: %s", exc)
+            return
+        if stopped:
+            self.console.print(f"[dim]stopped {stopped} background job(s).[/dim]")
 
     def _callbacks(self) -> dict:
         return dict(
@@ -564,32 +589,38 @@ class CLI:
         0 done, 2 max-step, 3 loop, 4 fermato (serviva approvazione o stop), 5 budget,
         1 errore, 130 interruzione. In modalità --json emette SEMPRE un oggetto su stdout
         (anche su errore/interruzione), così il contratto resta affidabile per l'automazione."""
+        # try/finally su TUTTO il corpo: qualunque via d'uscita (successo, errore,
+        # Ctrl-C, budget) deve passare dalla terminazione dei job in background,
+        # altrimenti un one-shot in uno script lascerebbe processi vivi a ogni giro.
         try:
-            result = self.run_task(task, agent_key=agent_key, think=think, attachments=attachments)
-        except KeyboardInterrupt:
-            self._newline_if_needed()
-            if self.output_mode == "json":
-                self._emit_json({"ok": False, "agent": self.last_agent, "stopped_reason": "interrupted",
-                                 "response": "", "error": "interrupted"})
-            elif self.output_mode == "human":
-                self.console.print("[yellow]⏹ Interrupted.[/yellow]")
-            return 130
-        except Exception as exc:  # noqa: BLE001
-            self._newline_if_needed()
-            if self.output_mode == "json":
-                self._emit_json({"ok": False, "agent": self.last_agent, "stopped_reason": "error",
-                                 "response": "", "error": f"{type(exc).__name__}: {exc}"})
-            elif self.output_mode == "human":
-                self.console.print(f"[red]⚠ Error: {type(exc).__name__}: {exc}[/red]")
-            return 1
+            try:
+                result = self.run_task(task, agent_key=agent_key, think=think, attachments=attachments)
+            except KeyboardInterrupt:
+                self._newline_if_needed()
+                if self.output_mode == "json":
+                    self._emit_json({"ok": False, "agent": self.last_agent, "stopped_reason": "interrupted",
+                                     "response": "", "error": "interrupted"})
+                elif self.output_mode == "human":
+                    self.console.print("[yellow]⏹ Interrupted.[/yellow]")
+                return 130
+            except Exception as exc:  # noqa: BLE001
+                self._newline_if_needed()
+                if self.output_mode == "json":
+                    self._emit_json({"ok": False, "agent": self.last_agent, "stopped_reason": "error",
+                                     "response": "", "error": f"{type(exc).__name__}: {exc}"})
+                elif self.output_mode == "human":
+                    self.console.print(f"[red]⚠ Error: {type(exc).__name__}: {exc}[/red]")
+                return 1
 
-        if self.output_mode == "json":
-            cost = self.provider.estimate_cost(result.usage, self.cfg)
-            self._emit_json(build_result_json(self.last_agent, task, result, self._turn_tools, cost))
-        elif self.output_mode == "quiet":
-            sys.stdout.write((result.content or "") + "\n")
-            sys.stdout.flush()
-        return exit_code_for(result.stopped_reason)
+            if self.output_mode == "json":
+                cost = self.provider.estimate_cost(result.usage, self.cfg)
+                self._emit_json(build_result_json(self.last_agent, task, result, self._turn_tools, cost))
+            elif self.output_mode == "quiet":
+                sys.stdout.write((result.content or "") + "\n")
+                sys.stdout.flush()
+            return exit_code_for(result.stopped_reason)
+        finally:
+            self._shutdown_jobs()
 
     def run_task(self, task: str, agent_key: str | None = None, think: bool = False,
                  attachments: list[dict] | None = None):
@@ -890,6 +921,31 @@ class CLI:
         self.console.print(f"[dim]📎 {note}[/dim]")
         self.run_task(prompt, attachments=[part], think=self.default_think)
 
+    def _cmd_jobs(self, arg: str) -> None:
+        """Vista UMANA dei job: quando il turno torna a te, dice cosa sta ancora
+        girando — informazione che altrimenti resterebbe solo nel contesto del
+        modello. `/jobs stop <id>` ferma un job dall'interfaccia."""
+        from .tools.jobs import _job_line
+        self.jobs.reap()
+        parts = arg.split(None, 1)
+        if parts and parts[0].lower() == "stop":
+            if len(parts) != 2:
+                self.console.print("[dim]usage: /jobs stop <id>[/dim]\n")
+                return
+            job = self.jobs.stop(parts[1].strip())
+            if job is None:
+                self.console.print(f"[yellow]no job with id '{parts[1].strip()}'.[/yellow]\n")
+            else:
+                self.console.print(f"[yellow]job {job.id} stopped ({job.status()}).[/yellow]\n")
+            return
+        rows = self.jobs.all()
+        if not rows:
+            self.console.print("[dim]no background jobs in this session.[/dim]\n")
+            return
+        body = "\n".join(f"  {_job_line(j)}" for j in rows)
+        running = sum(1 for j in rows if j.running)
+        self.console.print(f"[dim]{len(rows)} job(s), {running} running:[/dim]\n{body}\n")
+
     def _cmd_code(self, arg: str) -> None:
         if arg:
             self._safe_run_task(arg, agent_key="coding", think=self.default_think)
@@ -954,10 +1010,12 @@ class CLI:
                 line = self.console.input("[bold green]▶[/bold green] ").strip()
             except (EOFError, KeyboardInterrupt):
                 self.console.print("\n[dim]bye![/dim]")
+                self._shutdown_jobs()
                 return
             if not line:
                 continue
             if not self._dispatch(line):
+                self._shutdown_jobs()
                 return
 
 

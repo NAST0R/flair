@@ -5122,7 +5122,11 @@ def test_background_jobs():
             body = result.split(marker, 1)[1]
             for tail in ("[job finished", "[no new output"):
                 body = body.split(tail, 1)[0]
-            return body
+            # CRLF → LF: lo stdout di un figlio su Windows termina le righe con
+            # \r\n, e confrontarlo con uno stream atteso in \n falliva SOLO là.
+            # La normalizzazione è del test, non del prodotto: in conversazione
+            # l'output va consegnato come il comando l'ha prodotto.
+            return body.replace("\r\n", "\n")
 
         first = _ct.job(ctx, action="check", id="j1", wait_seconds=5)
         check("job: check restituisce output nuovo", "--- new output ---" in first, first[:150])
@@ -5135,12 +5139,41 @@ def test_background_jobs():
         expected = "".join(f"tick {i}\n" for i in range(40))
         # `run_background` ha già consumato il primo frammento: la concatenazione dei
         # check è un prefisso di ciò che resta dello stream.
-        started_at = expected.index(collected.lstrip()[:8]) if collected.strip() else -1
+        body = collected.lstrip()
+        started_at = expected.find(body[:8]) if body.strip() else -1
         check("job: i check concatenati sono un prefisso esatto dello stream",
-              started_at >= 0 and expected[started_at:started_at + len(collected.lstrip())] == collected.lstrip(),
-              repr(collected[:60]))
+              started_at >= 0 and expected[started_at:started_at + len(body)] == body,
+              f"start={started_at} collected={collected[:60]!r}")
         check("job: output cresciuto tra i check (nessuna ri-consegna)",
               len(collected) > 20, repr(collected[:40]))
+
+        # ── Fine-riga CRLF: il caso Windows, esercitato su OGNI piattaforma ──
+        # Su Windows lo stdout di un figlio termina le righe con \r\n e il
+        # confronto con uno stream atteso in \n falliva SOLO là — scoperto in CI
+        # dopo il push. Qui un figlio emette CRLF esplicitamente: la stessa
+        # invariante viene verificata anche su POSIX, quindi la regressione non può
+        # più nascondersi dietro una piattaforma.
+        crlf_child = child("import sys,time; [(sys.stdout.write('line %d\\r\\n' % i), "
+                           "sys.stdout.flush(), time.sleep(0.02)) for i in range(20)]")
+        crlf_started = _ct.run_background(ctx, command=crlf_child)
+        # Id dedotto dal messaggio, non cablato: aggiungere un job prima di questo
+        # blocco non deve poter rompere il test.
+        crlf_id = crlf_started.split()[2]
+        check("job: id del secondo job dedotto dall'avvio",
+              crlf_id.startswith("j") and crlf_id != "j1", crlf_started[:60])
+        crlf_out = new_output(_ct.job(ctx, action="check", id=crlf_id, wait_seconds=5))
+        for _ in range(4):
+            crlf_out += new_output(_ct.job(ctx, action="check", id=crlf_id, wait_seconds=2))
+            if len(crlf_out) > 20:
+                break
+        crlf_expected = "".join(f"line {i}\n" for i in range(20))
+        crlf_body = crlf_out.lstrip()
+        crlf_at = crlf_expected.find(crlf_body[:7]) if crlf_body.strip() else -1
+        check("job: output CRLF ricomposto correttamente (caso Windows)",
+              crlf_at >= 0 and crlf_expected[crlf_at:crlf_at + len(crlf_body)] == crlf_body,
+              f"at={crlf_at} out={crlf_out[:50]!r}")
+        check("job: nessun \\r residuo dopo la normalizzazione", "\r" not in crlf_out, repr(crlf_out[:40]))
+        _ct.job(ctx, action="stop", id=crlf_id)
 
         # ── list ─────────────────────────────────────────────────────────────
         listed = _ct.job(ctx, action="list")
@@ -5155,7 +5188,14 @@ def test_background_jobs():
               "nothing more will arrive" in _ct.job(ctx, action="check", id="j1"))
 
         # ── Un comando che muore subito NON finge di essere partito ───────────
+        # Grazia generosa SOLO qui: la raccolta ritorna appena il processo esce,
+        # quindi non costa attesa reale — ma con una grazia stretta su Windows
+        # (dove lo spawn costa 200-300 ms) il comando risulterebbe "ancora in
+        # corso" pur essendo già morto. Asserire sui tempi è il modo più rapido di
+        # ottenere un test intermittente.
+        cfg.bg_start_grace = 8.0
         dead = _ct.run_background(ctx, command=child("import sys; sys.exit(3)"))
+        cfg.bg_start_grace = 0.3
         check("job: comando morto all'istante segnalato nello stesso turno",
               "already finished with exit code 3" in dead, dead)
 

@@ -273,6 +273,14 @@ CATALOG: tuple[Field, ...] = (
           "Override: input price during peak hours.", min=0.0),
     Field("Pricing", "FLAIR_PRICE_OUTPUT_PEAK", "float", None,
           "Override: output price during peak hours.", min=0.0),
+    Field("Pricing", "FLAIR_PRICE_CACHE_HIT_THINK", "float", None,
+          "Override for requests served by the THINKING model only (highest "
+          "precedence). Needed when fast and thinking sit on different third-party "
+          "hosts, where one flat set of prices would misprice --think turns.", min=0.0),
+    Field("Pricing", "FLAIR_PRICE_CACHE_MISS_THINK", "float", None,
+          "Override: input/cache-miss price of the thinking model.", min=0.0),
+    Field("Pricing", "FLAIR_PRICE_OUTPUT_THINK", "float", None,
+          "Override: output price of the thinking model.", min=0.0),
 )
 
 CATALOG_BY_KEY = {f.key: f for f in CATALOG}

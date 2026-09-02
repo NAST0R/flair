@@ -389,7 +389,11 @@ class OpenAICompatProvider(LLMProvider):
         (gli override FLAIR_PRICE_* mantengono la precedenza, campo per campo).
         Le fasce orarie si applicano solo se il provider compra dal listino che
         le ha (banded_pricing): i terzi prezzano flat anche in ora peak."""
-        hit, miss, out = price_for(self.cfg.provider, model, banded=self.banded_pricing)
+        # `think`: la richiesta è stata servita dal modello thinking dello slot
+        # attivo? Serve agli override FLAIR_PRICE_*_THINK (v. config.price_for).
+        is_think = bool(model) and model == getattr(self.cfg.active, "think_model", None)
+        hit, miss, out = price_for(self.cfg.provider, model,
+                                   banded=self.banded_pricing, think=is_think)
         return _usage_cost(usage, hit, miss, out)
 
     # ── interni ───────────────────────────────────────────────────────────

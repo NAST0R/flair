@@ -153,6 +153,36 @@ def build_result_json(agent_key: str | None, task: str, result, tool_events: lis
     }
 
 
+# Comandi del REPL: (nome, come si scrive nell'help, cosa fa, metodo che lo esegue).
+# UNICA fonte: da qui nascono sia il dispatch sia la tabella di /help, quindi un
+# comando non documentato o una voce di help senza handler sono impossibili (c'è un
+# test che lo verifica). Il dispatch avviene sul PRIMO TOKEN esatto: prima si
+# confrontavano i prefissi con startswith, e "/documenta il codice" finiva
+# all'handler di "/do" con il task mutilato in "cumenta il codice".
+_COMMANDS: tuple[tuple[str, str, str, str], ...] = (
+    ("code", "/code <task>", "force the coding agent", "_cmd_code"),
+    ("do", "/do <task>", "force the general agent", "_cmd_do"),
+    ("think", "/think <task>", "first step with the thinking model", "_cmd_think"),
+    ("agent", "/agent", "show the current (sticky) agent", "_cmd_agent"),
+    ("tools", "/tools", "list the active agent's tools", "_cmd_tools"),
+    ("provider", "/provider [name]", "show or switch provider (deepseek|openai)", "_cmd_provider"),
+    ("model", "/model <name>", "switch the fast model at runtime", "_cmd_model"),
+    ("think-model", "/think-model <name>", "switch the thinking model at runtime", "_cmd_think_model"),
+    ("compact", "/compact", "compact the active agent's context now", "_cmd_compact"),
+    ("cost", "/cost", "token/cost summary for the session", "_cmd_cost"),
+    ("save", "/save [name]", "save the session (default: current name)", "_cmd_save"),
+    ("load", "/load <name>", "resume a saved session", "_cmd_load"),
+    ("sessions", "/sessions", "list saved sessions", "_cmd_sessions"),
+    ("memory", "/memory [clear]", "show (or clear) the session memory", "_cmd_memory"),
+    ("remember", "/remember <note>", "jot a durable note into session memory yourself", "_cmd_remember"),
+    ("reset", "/reset", "reset the shared conversation", "_cmd_reset"),
+    ("root", "/root <path>", "change the working folder (coding + general; reloads instructions)", "_cmd_root"),
+    ("img", "/img <path> [prompt]", "attach an image to the turn (vision endpoints only)", "_cmd_img"),
+    ("help", "/help", "this help", "_cmd_help"),
+)
+_QUIT_WORDS = ("exit", "quit", "q")
+
+
 class CLI:
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
@@ -681,28 +711,11 @@ class CLI:
                       padding=(0, 3, 0, 0), border_style="dim")
         table.add_column("command", style="bold", no_wrap=True)
         table.add_column("what it does", style="dim")
-        for cmd, desc in (
-            ("/code <task>", "force the coding agent"),
-            ("/do <task>", "force the general agent"),
-            ("/think <task>", "first step with the thinking model"),
-            ("/agent", "show the current (sticky) agent"),
-            ("/tools", "list the active agent's tools"),
-            ("/provider [name]", "show or switch provider (deepseek|openai)"),
-            ("/model <name>", "switch the fast model at runtime"),
-            ("/think-model <name>", "switch the thinking model at runtime"),
-            ("/compact", "compact the active agent's context now"),
-            ("/cost", "token/cost summary for the session"),
-            ("/save [name]", "save the session (default: current name)"),
-            ("/load <name>", "resume a saved session"),
-            ("/sessions", "list saved sessions"),
-            ("/memory [clear]", "show (or clear) the session memory"),
-            ("/remember <note>", "jot a durable note into session memory yourself"),
-            ("/reset", "reset the shared conversation"),
-            ("/root <path>", "change the working folder (coding + general; reloads instructions)"),
-            ("/img <path> [prompt]", "attach an image to the turn (vision endpoints only)"),
-            ("/help", "this help"),
-            ("exit | quit", "leave the REPL"),
-        ):
+        # Voci derivate da _COMMANDS (unica fonte con il dispatch) + le parole di
+        # uscita, che non sono comandi con handler.
+        rows = [(disp, desc) for _n, disp, desc, _m in _COMMANDS]
+        rows.append(("exit | quit", "leave the REPL"))
+        for cmd, desc in rows:
             table.add_row(Text(cmd), desc)
         self.console.print(table)
         self.console.print(
@@ -726,6 +739,196 @@ class CLI:
             f"[dim]Tools of the «{key}» agent"
             f"{' (sticky)' if self.last_agent else ' (default; no turn yet)'}. "
             "Switch agent with /code, /do.[/dim]\n")
+
+    # ── Handler dei comandi ──────────────────────────────────────────────────
+    # Uno per voce di _COMMANDS. Ognuno riceve gli ARGOMENTI già separati dal nome
+    # (stringa vuota se assenti): il parsing della riga sta tutto in _dispatch, così
+    # ogni handler è una funzione piccola e testabile da sola.
+
+    def _cmd_help(self, arg: str) -> None:
+        self._print_help()
+
+    def _cmd_tools(self, arg: str) -> None:
+        self._print_tools()
+
+    def _cmd_agent(self, arg: str) -> None:
+        self.console.print(f"[dim]current agent (sticky): {self.last_agent or 'none'}[/dim]\n")
+
+    def _cmd_reset(self, arg: str) -> None:
+        self.convo.reset()
+        self.last_agent = None
+        self.console.print("[yellow]conversation cleared.[/yellow]\n")
+
+    def _cmd_cost(self, arg: str) -> None:
+        self.console.print(f"[dim]  session · {self._cost_line(self._session_usage())} "
+                           f"| prefix breaks {self.convo.cache_breaks}[/dim]\n")
+
+    def _cmd_sessions(self, arg: str) -> None:
+        items = self.session.list()
+        if not items:
+            self.console.print("[dim]no saved sessions.[/dim]\n")
+        else:
+            body = "\n".join(f"  • {n}  [dim]{ts}[/dim]" for n, ts in items)
+            self.console.print(f"[dim]saved sessions:[/dim]\n{body}\n")
+
+    def _cmd_remember(self, arg: str) -> None:
+        self._remember_note(arg)
+
+    def _cmd_memory(self, arg: str) -> None:
+        if not self.cfg.memory_enabled:
+            self.console.print("[dim]memory disabled (FLAIR_MEMORY=false).[/dim]\n")
+            return
+        sub = arg.strip().lower()
+        if sub == "clear":
+            if not self.memory.notes:
+                self.console.print("[dim]memory already empty.[/dim]\n")
+                return
+            try:
+                ans = self.console.input(f"    clear {len(self.memory.notes)} notes? \\[y]es / \\[n]o ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                self.console.print()
+                return
+            if ans in ("y", "yes", "si", "sì"):
+                self.memory.clear()
+                self._refresh_memory_prompts()   # confine esplicito: il prompt perde il blocco
+                self._save_session()             # se la sessione è salvata, rimuove anche il sidecar
+                self.console.print("[yellow]memory cleared.[/yellow]\n")
+            return
+        if sub:
+            self.console.print("[dim]usage: /memory  or  /memory clear[/dim]\n")
+            return
+        if not self.memory.notes:
+            self.console.print("[dim]memory is empty. The agent jots durable facts here with the "
+                               "`remember` tool; notes follow the session (/save, /load).[/dim]\n")
+            return
+        body = "\n".join(f"  {i}. {n}" for i, n in enumerate(self.memory.notes, 1))
+        self.console.print(f"[dim]session memory "
+                           f"({self.memory.used_chars()}/{self.memory.max_chars} chars):[/dim]\n{body}\n")
+
+    def _cmd_save(self, arg: str) -> None:
+        name = arg.strip() or (self.session_name or "default")
+        self.session_name = name
+        path = self.session.save(name, self._session_state())
+        msg = f"[green]session saved: {name}[/green]" if path else "[red]save failed (see the log).[/red]"
+        self.console.print(msg + "\n")
+
+    def _cmd_load(self, arg: str) -> None:
+        name = arg.strip()
+        if not name:
+            self.console.print("[dim]usage: /load <name>[/dim]\n")
+        elif self._load_session(name):
+            self.console.print(f"[green]session resumed: {self.session_name}[/green]\n")
+            self._print_session_recap()
+        else:
+            self.console.print(f"[yellow]session '{name}' not found.[/yellow]\n")
+
+    def _cmd_compact(self, arg: str) -> None:
+        if self.last_agent:
+            if not self.agents[self.last_agent].compact():
+                self.console.print("[dim]nothing to compact.[/dim]\n")
+        else:
+            self.console.print("[dim]no active conversation.[/dim]\n")
+
+    def _cmd_provider(self, arg: str) -> None:
+        target = arg.strip().lower()
+        if target:
+            if not self._switch_provider(target):
+                self.console.print("[yellow]invalid provider (deepseek|openai|local).[/yellow]\n")
+            else:
+                pc = self.cfg.active
+                self.console.print(f"[yellow]provider → {target} | model: {pc.model} | thinking: {pc.think_model}[/yellow]\n")
+        else:
+            pc = self.cfg.active
+            self.console.print(f"[dim]provider: {self.cfg.provider} | model: {pc.model} | thinking: {pc.think_model}[/dim]\n")
+
+    def _cmd_think_model(self, arg: str) -> None:
+        if arg.strip():
+            self.cfg.active.think_model = arg.strip()
+            self.console.print(f"[yellow]thinking model → {self.cfg.active.think_model}[/yellow]\n")
+        else:
+            self.console.print("[dim]usage: /think-model <name>[/dim]\n")
+
+    def _cmd_model(self, arg: str) -> None:
+        if arg.strip():
+            self.cfg.active.model = arg.strip()
+            self.cfg.refresh_pricing()
+            self.console.print(f"[yellow]model → {self.cfg.active.model}[/yellow]\n")
+        else:
+            self.console.print("[dim]usage: /model <name>[/dim]\n")
+
+    def _cmd_root(self, arg: str) -> None:
+        if not arg.strip():
+            return
+        new_root = Path(arg.strip()).expanduser().resolve()
+        if not new_root.is_dir():
+            self.console.print(f"[yellow]nonexistent folder: {new_root}[/yellow]\n")
+        else:
+            self._apply_root(new_root)
+            self.console.print(
+                f"[yellow]root → {self.cfg.root} "
+                "(working folder for coding and general)[/yellow]\n")
+
+    def _cmd_img(self, arg: str) -> None:
+        parts = arg.split(None, 1)
+        if not parts:
+            self.console.print("[yellow]usage: /img <path> [prompt][/yellow]\n")
+            return
+        if not getattr(self.cfg.active, "vision", False):
+            self.console.print(
+                "[yellow]The current provider/endpoint has no vision support: enable it "
+                "only if the endpoint accepts images (e.g. llama-server with --mmproj) "
+                "via DEEPSEEK_VISION / OPENAI_VISION / LOCAL_VISION=true in .env.[/yellow]\n")
+            return
+        prompt = parts[1].strip() if len(parts) == 2 else "Describe what you see in this image."
+        try:
+            # Path scelto dall'UTENTE sulla propria macchina: niente sandbox
+            # (come aprire un file a mano), solo expanduser+resolve.
+            part, note = images.load_image_part(self.cfg, Path(parts[0]).expanduser().resolve())
+        except ToolError as exc:
+            self.console.print(f"[yellow]{exc}[/yellow]\n")
+            return
+        self.console.print(f"[dim]📎 {note}[/dim]")
+        self.run_task(prompt, attachments=[part], think=self.default_think)
+
+    def _cmd_code(self, arg: str) -> None:
+        if arg:
+            self._safe_run_task(arg, agent_key="coding", think=self.default_think)
+
+    def _cmd_do(self, arg: str) -> None:
+        if arg:
+            self._safe_run_task(arg, agent_key="general", think=self.default_think)
+
+    def _cmd_think(self, arg: str) -> None:
+        if arg:
+            self._safe_run_task(arg, think=True)
+
+    def _dispatch(self, line: str) -> bool:
+        """Esegue una riga del REPL; ritorna False quando la sessione va chiusa.
+
+        Il match è sul PRIMO TOKEN ESATTO, non per prefisso: la vecchia catena di
+        `low.startswith("/do")` intercettava anche "/documenta il codice" e mandava
+        all'agente generico il task mutilato "cumenta il codice". E una riga che
+        inizia con "/" ma non è un comando non viene più spedita al modello come
+        task — un typo (`/comapct`) costava un turno a pagamento: ora riceve un
+        suggerimento, calcolato sui nomi della tabella."""
+        low = line.lower()
+        if low in _QUIT_WORDS:
+            self.console.print("[dim]bye![/dim]")
+            return False
+        if not line.startswith("/"):
+            self._safe_run_task(line, think=self.default_think)
+            return True
+        parts = line.split(None, 1)
+        name = parts[0][1:].lower()
+        arg = parts[1].strip() if len(parts) == 2 else ""
+        handler = {n: getattr(self, m) for n, _d, _h, m in _COMMANDS}.get(name)
+        if handler is None:
+            close = difflib.get_close_matches(name, [n for n, *_ in _COMMANDS], n=1)
+            hint = f" Did you mean /{close[0]}?" if close else " Type /help for the list of commands."
+            self.console.print(f"[yellow]unknown command: {parts[0]}.{hint}[/yellow]\n")
+            return True
+        handler(arg)
+        return True
 
     def repl(self) -> None:
         pc = self.cfg.active
@@ -754,178 +957,8 @@ class CLI:
                 return
             if not line:
                 continue
-            low = line.lower()
-
-            if low in ("exit", "quit", "q"):
-                self.console.print("[dim]bye![/dim]")
+            if not self._dispatch(line):
                 return
-            if low == "/help":
-                self._print_help()
-                continue
-            if low == "/tools":
-                self._print_tools()
-                continue
-            if low == "/reset":
-                self.convo.reset()
-                self.last_agent = None
-                self.console.print("[yellow]conversation cleared.[/yellow]\n")
-                continue
-            if low == "/cost":
-                self.console.print(f"[dim]  session · {self._cost_line(self._session_usage())} "
-                                   f"| prefix breaks {self.convo.cache_breaks}[/dim]\n")
-                continue
-            if low == "/agent":
-                self.console.print(f"[dim]current agent (sticky): {self.last_agent or 'none'}[/dim]\n")
-                continue
-            if low == "/sessions":
-                items = self.session.list()
-                if not items:
-                    self.console.print("[dim]no saved sessions.[/dim]\n")
-                else:
-                    body = "\n".join(f"  • {n}  [dim]{ts}[/dim]" for n, ts in items)
-                    self.console.print(f"[dim]saved sessions:[/dim]\n{body}\n")
-                continue
-            if low.startswith("/remember"):
-                parts = line.split(maxsplit=1)
-                self._remember_note(parts[1].strip() if len(parts) == 2 else "")
-                continue
-            if low.startswith("/memory"):
-                if not self.cfg.memory_enabled:
-                    self.console.print("[dim]memory disabled (FLAIR_MEMORY=false).[/dim]\n")
-                    continue
-                arg = line.split(maxsplit=1)[1].strip().lower() if len(line.split(maxsplit=1)) == 2 else ""
-                if arg == "clear":
-                    if not self.memory.notes:
-                        self.console.print("[dim]memory already empty.[/dim]\n")
-                        continue
-                    try:
-                        ans = self.console.input(f"    clear {len(self.memory.notes)} notes? \\[y]es / \\[n]o ").strip().lower()
-                    except (EOFError, KeyboardInterrupt):
-                        self.console.print()
-                        continue
-                    if ans in ("y", "yes", "si", "sì"):
-                        self.memory.clear()
-                        self._refresh_memory_prompts()   # confine esplicito: il prompt perde il blocco
-                        self._save_session()             # se la sessione è salvata, rimuove anche il sidecar
-                        self.console.print("[yellow]memory cleared.[/yellow]\n")
-                    continue
-                if arg:
-                    self.console.print("[dim]usage: /memory  or  /memory clear[/dim]\n")
-                    continue
-                if not self.memory.notes:
-                    self.console.print("[dim]memory is empty. The agent jots durable facts here with the "
-                                       "`remember` tool; notes follow the session (/save, /load).[/dim]\n")
-                    continue
-                body = "\n".join(f"  {i}. {n}" for i, n in enumerate(self.memory.notes, 1))
-                self.console.print(f"[dim]session memory "
-                                   f"({self.memory.used_chars()}/{self.memory.max_chars} chars):[/dim]\n{body}\n")
-                continue
-            if low.startswith("/save"):
-                parts = line.split(maxsplit=1)
-                name = parts[1].strip() if len(parts) == 2 else (self.session_name or "default")
-                self.session_name = name
-                path = self.session.save(name, self._session_state())
-                msg = f"[green]session saved: {name}[/green]" if path else "[red]save failed (see the log).[/red]"
-                self.console.print(msg + "\n")
-                continue
-            if low.startswith("/load"):
-                parts = line.split(maxsplit=1)
-                if len(parts) != 2:
-                    self.console.print("[dim]usage: /load <name>[/dim]\n")
-                elif self._load_session(parts[1].strip()):
-                    self.console.print(f"[green]session resumed: {self.session_name}[/green]\n")
-                    self._print_session_recap()
-                else:
-                    self.console.print(f"[yellow]session '{parts[1].strip()}' not found.[/yellow]\n")
-                continue
-            if low == "/compact":
-                if self.last_agent:
-                    if not self.agents[self.last_agent].compact():
-                        self.console.print("[dim]nothing to compact.[/dim]\n")
-                else:
-                    self.console.print("[dim]no active conversation.[/dim]\n")
-                continue
-            if low.startswith("/provider"):
-                parts = line.split(maxsplit=1)
-                if len(parts) == 2:
-                    target = parts[1].strip().lower()
-                    if not self._switch_provider(target):
-                        self.console.print("[yellow]invalid provider (deepseek|openai|local).[/yellow]\n")
-                    else:
-                        pc = self.cfg.active
-                        self.console.print(f"[yellow]provider → {target} | model: {pc.model} | thinking: {pc.think_model}[/yellow]\n")
-                else:
-                    pc = self.cfg.active
-                    self.console.print(f"[dim]provider: {self.cfg.provider} | model: {pc.model} | thinking: {pc.think_model}[/dim]\n")
-                continue
-            if low.startswith("/think-model"):
-                parts = line.split(maxsplit=1)
-                if len(parts) == 2:
-                    self.cfg.active.think_model = parts[1].strip()
-                    self.console.print(f"[yellow]thinking model → {self.cfg.active.think_model}[/yellow]\n")
-                else:
-                    self.console.print("[dim]usage: /think-model <name>[/dim]\n")
-                continue
-            if low.startswith("/model"):
-                parts = line.split(maxsplit=1)
-                if len(parts) == 2:
-                    self.cfg.active.model = parts[1].strip()
-                    self.cfg.refresh_pricing()
-                    self.console.print(f"[yellow]model → {self.cfg.active.model}[/yellow]\n")
-                else:
-                    self.console.print("[dim]usage: /model <name>[/dim]\n")
-                continue
-            if low.startswith("/root"):
-                parts = line.split(maxsplit=1)
-                if len(parts) == 2:
-                    new_root = Path(parts[1]).expanduser().resolve()
-                    if not new_root.is_dir():
-                        self.console.print(f"[yellow]nonexistent folder: {new_root}[/yellow]\n")
-                    else:
-                        self._apply_root(new_root)
-                        self.console.print(
-                            f"[yellow]root → {self.cfg.root} "
-                            "(working folder for coding and general)[/yellow]\n")
-                continue
-            if low.startswith("/img"):
-                parts = line.split(maxsplit=2)
-                if len(parts) < 2:
-                    self.console.print("[yellow]usage: /img <path> [prompt][/yellow]\n")
-                    continue
-                if not getattr(self.cfg.active, "vision", False):
-                    self.console.print(
-                        "[yellow]The current provider/endpoint has no vision support: enable it "
-                        "only if the endpoint accepts images (e.g. llama-server with --mmproj) "
-                        "via DEEPSEEK_VISION / OPENAI_VISION / LOCAL_VISION=true in .env.[/yellow]\n")
-                    continue
-                prompt = parts[2].strip() if len(parts) == 3 else "Describe what you see in this image."
-                try:
-                    # Path scelto dall'UTENTE sulla propria macchina: niente sandbox
-                    # (come aprire un file a mano), solo expanduser+resolve.
-                    part, note = images.load_image_part(self.cfg, Path(parts[1]).expanduser().resolve())
-                except ToolError as exc:
-                    self.console.print(f"[yellow]{exc}[/yellow]\n")
-                    continue
-                self.console.print(f"[dim]📎 {note}[/dim]")
-                self.run_task(prompt, attachments=[part], think=self.default_think)
-                continue
-            if low.startswith("/code"):
-                task = line[len("/code"):].strip()
-                if task:
-                    self._safe_run_task(task, agent_key="coding", think=self.default_think)
-                continue
-            if low.startswith("/do"):
-                task = line[len("/do"):].strip()
-                if task:
-                    self._safe_run_task(task, agent_key="general", think=self.default_think)
-                continue
-            if low.startswith("/think"):
-                task = line[len("/think"):].strip()
-                if task:
-                    self._safe_run_task(task, think=True)
-                continue
-
-            self._safe_run_task(line, think=self.default_think)
 
 
 def _build_config(args) -> Config:

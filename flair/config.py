@@ -167,13 +167,18 @@ def resolve_pricing(provider: str, model: str, when: datetime | None = None,
 
 
 def price_for(provider: str, model: str, when: datetime | None = None,
-              banded: bool = True) -> tuple[float, float, float]:
+              banded: bool = True, think: bool = False) -> tuple[float, float, float]:
     """Prezzi effettivi per UNA richiesta: listino del modello indicato nella
     fascia oraria corrente (se `banded`), con gli override env sempre vincenti
-    campo per campo. In fascia peak vale la catena FLAIR_PRICE_*_PEAK >
-    FLAIR_PRICE_* > listino peak; in off-peak (o su listini flat) FLAIR_PRICE_* >
-    listino base. Serve all'attribuzione dei costi per-richiesta: in un turno
-    --think si alternano fast e thinking, e un listino unico sottostimerebbe."""
+    campo per campo. Catena, dal meno al più specifico: listino (band-aware) <
+    FLAIR_PRICE_* < FLAIR_PRICE_*_PEAK (solo in fascia alta e su listini a fasce)
+    < FLAIR_PRICE_*_THINK (solo per le richieste servite dal modello thinking).
+
+    Il gradino _THINK esiste per un caso reale: con fast e thinking pinnati su host
+    TERZI diversi — dove il listino interno non aggancia e gli override sono
+    obbligatori — un tris unico prezzava i turni --think coi numeri del flash,
+    sbagliando di un ordine di grandezza. Senza le variabili _THINK impostate il
+    comportamento è identico a prima."""
     hit, miss, out = resolve_pricing(provider, model, when, banded=banded)
     hit = _float("FLAIR_PRICE_CACHE_HIT", hit)
     miss = _float("FLAIR_PRICE_CACHE_MISS", miss)
@@ -182,6 +187,10 @@ def price_for(provider: str, model: str, when: datetime | None = None,
         hit = _float("FLAIR_PRICE_CACHE_HIT_PEAK", hit)
         miss = _float("FLAIR_PRICE_CACHE_MISS_PEAK", miss)
         out = _float("FLAIR_PRICE_OUTPUT_PEAK", out)
+    if think:
+        hit = _float("FLAIR_PRICE_CACHE_HIT_THINK", hit)
+        miss = _float("FLAIR_PRICE_CACHE_MISS_THINK", miss)
+        out = _float("FLAIR_PRICE_OUTPUT_THINK", out)
     return (hit, miss, out)
 
 

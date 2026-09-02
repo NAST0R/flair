@@ -3067,7 +3067,6 @@ def test_reasoning_stream_feedback():
 
 
 def test_remember_command():
-    import inspect as _inspect
     import io as _io
     import tempfile as _tf
 
@@ -3108,12 +3107,19 @@ def test_remember_command():
     check("/remember: memoria disattivata → messaggio, nessun crash",
           "memory disabled" in cli2.console.file.getvalue())
 
-    check("/remember: presente nell'help", "/remember <note>" in _inspect.getsource(CLI._print_help))
+    # L'help è RESO dalla tabella dei comandi: si verifica l'output, non il sorgente
+    # (che dopo il refactor non contiene più le stringhe, e giustamente).
+    cli.console = _Console(file=_io.StringIO(), width=200)
+    cli._print_help()
+    check("/remember: presente nell'help", "/remember <note>" in cli.console.file.getvalue())
 
 
 def test_think_session_default():
     import inspect as _inspect
+    import io as _io
     import tempfile as _tf
+
+    from rich.console import Console as _Console
 
     from flair.cli import CLI
 
@@ -3127,15 +3133,32 @@ def test_think_session_default():
     cli._safe_run_task("x", think=True)
     check("--think REPL: think inoltrato al turno", seen.get("think") is True, seen)
 
-    # Il dispatch del REPL usa il default di sessione su ogni via non-/think
-    # (task nudo, /code, /do) e forza True su /think: contratto ancorato al sorgente.
-    src = _inspect.getsource(CLI.repl)
-    check("--think REPL: task nudo eredita il default",
-          'self._safe_run_task(line, think=self.default_think)' in src)
-    check("--think REPL: /code, /do e /img ereditano il default",
-          src.count("think=self.default_think") == 4)
-    check("--think REPL: /think resta rinforzo esplicito", "think=True" in src)
-    check("--think REPL: banner dichiara lo stato", "think: ON every turn" in src)
+    # Contratto verificato sul DISPATCH REALE (prima si contavano le occorrenze nel
+    # sorgente di repl(): fragile e indiretto). Ogni via non-/think eredita il
+    # default di sessione, /think lo forza.
+    cli2 = CLI(cfg_for(Path(".")))
+    cli2.console = _Console(file=_io.StringIO())
+    cli2.default_think = True
+    seen2: list[tuple] = []
+    cli2._safe_run_task = lambda task, agent_key=None, think=False: seen2.append((task, agent_key, think))  # type: ignore[method-assign]
+    for line, expected in (("un task nudo", (None, True)),
+                           ("/code sistema il bug", ("coding", True)),
+                           ("/do apri il browser", ("general", True)),
+                           ("/think ragiona", (None, True))):
+        seen2.clear()
+        cli2._dispatch(line)
+        agent_key, think = expected
+        check(f"--think REPL: '{line.split()[0]}' eredita/forza il think",
+              seen2 and seen2[0][1] == agent_key and seen2[0][2] is think, str(seen2))
+    cli2.default_think = False
+    seen2.clear()
+    cli2._dispatch("/code x")
+    check("--think REPL: default spento → /code non forza", seen2[0][2] is False, str(seen2))
+    seen2.clear()
+    cli2._dispatch("/think x")
+    check("--think REPL: /think forza anche col default spento", seen2[0][2] is True, str(seen2))
+    check("--think REPL: banner dichiara lo stato",
+          "think: ON every turn" in _inspect.getsource(CLI.repl))
 
 
 def test_session_recap():
@@ -3180,8 +3203,9 @@ def test_session_recap():
     check("recap render: intestazione e contenuti", "where you left off" in out
           and "task con [markup] rich" in out and "risposta breve" in out, out)
 
-    src = _inspect.getsource(CLI.repl)
-    check("recap: agganciato al /load", src.count("self._print_session_recap()") == 2, src.count("self._print_session_recap()"))
+    check("recap: agganciato al /load e alla ripresa di sessione",
+          "self._print_session_recap()" in _inspect.getsource(CLI._cmd_load)
+          and "self._print_session_recap()" in _inspect.getsource(CLI.repl))
 
 
 def test_edit_invisible_chars():
@@ -4078,7 +4102,6 @@ def test_vision():
     token a costo fisso, render/recap con placeholder, e neutralizzazione degli
     allegati che l'endpoint rigetta (la sessione si auto-ripara, mai murata)."""
     import base64 as _b64
-    import inspect as _ins
     import io as _io
     import tempfile as _tf
 
@@ -4256,7 +4279,9 @@ def test_vision():
         cli.console = Console(file=_io.StringIO())
         calls: list[tuple] = []
         cli.run_task = lambda task, **kw: calls.append((task, kw))  # type: ignore[method-assign]
-        check("vision: /img documentato in help", "/img <path>" in _ins.getsource(CLI._print_help))
+        cli.console = Console(file=_io.StringIO(), width=200)
+        cli._print_help()
+        check("vision: /img documentato in help", "/img <path>" in cli.console.file.getvalue())
         cfg2.deepseek.vision = True
         p2, _n2 = _im.load_image_part(cfg2, root / "shot.png")
         cli.run_task("cosa vedi?", attachments=[p2])
@@ -4815,6 +4840,227 @@ def test_output_portable():
                   protected or not prints_unicode, str(prints_unicode[:1]))
 
 
+def test_repl_dispatch():
+    """Dispatch dei comandi REPL: match sul PRIMO TOKEN esatto, comandi sconosciuti
+    respinti con suggerimento (non spediti al modello), e tabella unica fonte per
+    dispatch e /help."""
+    import io as _io
+    import os as _os
+    import tempfile as _tf
+
+    from rich.console import Console as _Console
+
+    from flair.cli import _COMMANDS, _QUIT_WORDS, CLI
+
+    root = Path(_tf.mkdtemp(prefix="flair_disp_")).resolve()
+    cwd = _os.getcwd()
+    try:
+        cli = CLI(cfg_for(root))
+        cli.console = _Console(file=_io.StringIO(), width=200)
+        tasks: list[tuple] = []
+        cli._safe_run_task = lambda task, agent_key=None, think=False: tasks.append((task, agent_key))  # type: ignore[method-assign]
+
+        def out() -> str:
+            text = cli.console.file.getvalue()
+            cli.console.file.truncate(0)
+            cli.console.file.seek(0)
+            return text
+
+        # ── Il bug che il refactor chiude: il prefisso non basta più ──────────
+        tasks.clear()
+        out()
+        cli._dispatch("/documenta il codice")
+        check("dispatch: '/documenta' NON finisce all'handler di /do",
+              tasks == [] and "unknown command: /documenta" in out(), str(tasks))
+        tasks.clear()
+        out()
+        cli._dispatch("/models")
+        check("dispatch: '/models' NON finisce all'handler di /model",
+              "unknown command: /models" in out())
+
+        # ── Un typo non costa più un turno a pagamento, e viene suggerito ─────
+        tasks.clear()
+        out()
+        cli._dispatch("/comapct")
+        text = out()
+        check("dispatch: typo non inoltrato al modello", tasks == [], str(tasks))
+        check("dispatch: typo riceve un suggerimento", "Did you mean /compact?" in text, text)
+        tasks.clear()
+        out()
+        cli._dispatch("/xyzzy")
+        check("dispatch: comando irriconoscibile rimanda a /help",
+              "/help" in out() and tasks == [])
+
+        # ── Le vie normali continuano a funzionare ───────────────────────────
+        tasks.clear()
+        out()
+        cli._dispatch("/code sistema il bug")
+        check("dispatch: /code instrada al coding con il task intero",
+              tasks == [("sistema il bug", "coding")], str(tasks))
+        tasks.clear()
+        out()
+        cli._dispatch("/do apri il browser")
+        check("dispatch: /do instrada al general", tasks == [("apri il browser", "general")], str(tasks))
+        tasks.clear()
+        out()
+        cli._dispatch("un task qualunque")
+        check("dispatch: riga senza slash = task", tasks == [("un task qualunque", None)], str(tasks))
+        tasks.clear()
+        out()
+        cli._dispatch("/code")
+        check("dispatch: /code senza task non fa nulla", tasks == [] and out().strip() == "")
+
+        # ── /think-model non viene mangiato da /think (chiavi distinte) ───────
+        out()
+        cli._dispatch("/think-model qwen-thinker")
+        check("dispatch: /think-model distinto da /think",
+              cli.cfg.active.think_model == "qwen-thinker" and tasks == [], str(tasks))
+
+        # ── Uscita ───────────────────────────────────────────────────────────
+        for word in _QUIT_WORDS:
+            check(f"dispatch: '{word}' chiude la sessione", cli._dispatch(word) is False)
+        check("dispatch: un comando normale non chiude", cli._dispatch("/cost") is True)
+
+        # ── Case-insensitive come prima ──────────────────────────────────────
+        tasks.clear()
+        out()
+        cli._dispatch("/CODE task in maiuscolo")
+        check("dispatch: nome del comando case-insensitive",
+              tasks == [("task in maiuscolo", "coding")], str(tasks))
+
+        # ── La tabella è l'unica fonte: dispatch e help non possono divergere ─
+        for name, display, desc, method in _COMMANDS:
+            check(f"tabella: /{name} ha un handler chiamabile",
+                  callable(getattr(cli, method, None)), method)
+            check(f"tabella: /{name} è documentato coerentemente",
+                  display.startswith(f"/{name}") and bool(desc), display)
+        cli._print_help()
+        help_text = out()
+        for name, display, _desc, _m in _COMMANDS:
+            check(f"help: /{name} presente nell'help reso", display in help_text, display)
+        check("help: le parole di uscita sono documentate", "exit | quit" in help_text)
+        check("tabella: nomi univoci", len({n for n, *_ in _COMMANDS}) == len(_COMMANDS))
+    finally:
+        _os.chdir(cwd)     # CLI.__init__ entra nella root: si esce prima di rimuoverla
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_think_price_override():
+    """Override prezzi per il modello THINKING: con fast e thinking su host terzi
+    diversi, un tris unico prezzava i turni --think coi numeri del flash. Il gradino
+    _THINK è il più specifico della catena; senza le variabili, nulla cambia."""
+    import os as _os
+
+    import flair.config as _fc
+    from flair.config import price_for
+
+    keys = ("FLAIR_PRICE_CACHE_HIT", "FLAIR_PRICE_CACHE_MISS", "FLAIR_PRICE_OUTPUT",
+            "FLAIR_PRICE_CACHE_HIT_PEAK", "FLAIR_PRICE_CACHE_MISS_PEAK", "FLAIR_PRICE_OUTPUT_PEAK",
+            "FLAIR_PRICE_CACHE_HIT_THINK", "FLAIR_PRICE_CACHE_MISS_THINK", "FLAIR_PRICE_OUTPUT_THINK")
+    saved = {k: _os.environ.get(k) for k in keys}
+    for k in keys:
+        _os.environ.pop(k, None)
+    _os.environ["DEEPSEEK_API_KEY"] = "sk-test"
+    real_peak = _fc.is_peak_hour
+    _fc.is_peak_hour = lambda when=None: False
+    try:
+        # Senza override: comportamento identico a prima, think o non think.
+        base = price_for("deepseek", "deepseek-v4-flash", banded=False)
+        check("prezzi think: senza override nulla cambia",
+              price_for("deepseek", "deepseek-v4-flash", banded=False, think=True) == base)
+
+        # Scenario reale: entrambi su host terzi, prezzi diversi.
+        _os.environ.update({"FLAIR_PRICE_CACHE_HIT": "0.016", "FLAIR_PRICE_CACHE_MISS": "0.08",
+                            "FLAIR_PRICE_OUTPUT": "0.18"})
+        check("prezzi think: il tris flat vale per il fast",
+              price_for("deepseek", "@preset/flair-flash", banded=False) == (0.016, 0.08, 0.18))
+        check("prezzi think: senza _THINK il thinking eredita il flat (come prima)",
+              price_for("deepseek", "@preset/flair-pro", banded=False, think=True) == (0.016, 0.08, 0.18))
+        _os.environ.update({"FLAIR_PRICE_CACHE_HIT_THINK": "0.1015",
+                            "FLAIR_PRICE_CACHE_MISS_THINK": "1.218",
+                            "FLAIR_PRICE_OUTPUT_THINK": "2.436"})
+        check("prezzi think: _THINK vince sul thinking",
+              price_for("deepseek", "@preset/flair-pro", banded=False, think=True) == (0.1015, 1.218, 2.436))
+        check("prezzi think: il fast NON è toccato dagli override _THINK",
+              price_for("deepseek", "@preset/flair-flash", banded=False) == (0.016, 0.08, 0.18))
+
+        # _THINK è più specifico anche del gradino peak.
+        _fc.is_peak_hour = lambda when=None: True
+        _os.environ["FLAIR_PRICE_OUTPUT_PEAK"] = "9.9"
+        check("prezzi think: _THINK vince anche su _PEAK",
+              price_for("deepseek", "x", banded=True, think=True)[2] == 2.436)
+        check("prezzi think: in peak il fast usa _PEAK",
+              price_for("deepseek", "x", banded=True)[2] == 9.9)
+    finally:
+        _fc.is_peak_hour = real_peak
+        for k, v in saved.items():
+            if v is None:
+                _os.environ.pop(k, None)
+            else:
+                _os.environ[k] = v
+
+    # ── Attribuzione: il provider riconosce da sé quale modello ha servito ────
+    from flair.llm.deepseek import DeepSeekProvider
+    cfg = cfg_for(Path("."))
+    cfg.provider = "deepseek"
+    cfg.deepseek.model, cfg.deepseek.think_model = "fast-slug", "think-slug"
+    ds = DeepSeekProvider(cfg)
+    _os.environ["FLAIR_PRICE_OUTPUT"] = "1.0"
+    _os.environ["FLAIR_PRICE_OUTPUT_THINK"] = "10.0"
+    try:
+        u = Usage(completion_tokens=1_000_000)
+        fast_cost = ds._request_cost(u, "fast-slug")
+        think_cost = ds._request_cost(u, "think-slug")
+        check("prezzi think: attribuzione automatica dal nome del modello",
+              abs(fast_cost - 1.0) < 1e-9 and abs(think_cost - 10.0) < 1e-9,
+              f"{fast_cost} {think_cost}")
+    finally:
+        _os.environ.pop("FLAIR_PRICE_OUTPUT", None)
+        _os.environ.pop("FLAIR_PRICE_OUTPUT_THINK", None)
+
+
+def test_tool_schema_contract():
+    """Contratto sugli schemi dei tool. I sei tool presenti in entrambi gli agenti
+    (read_file, write_file, edit_file, list_directory, run_command, view_image) NON
+    sono duplicati da deduplicare: le descrizioni e i default sono deliberatamente
+    diversi (sandbox del progetto vs macchina intera, timeout 120 vs 60). Ciò che
+    deve restare allineato è la FORMA — nomi e tipi dei parametri, flag distruttivo —
+    perché è lì che il drift accidentale fa danno: un parametro aggiunto da un lato
+    e dimenticato dall'altro produce due tool omonimi con contratti diversi."""
+    from flair.agents import explorer as explorer_agent
+    from flair.tools import coding as _ct
+    from flair.tools import system as _st
+
+    shared = ("read_file", "write_file", "edit_file", "list_directory", "run_command", "view_image")
+    for name in shared:
+        a, b = getattr(_ct, name), getattr(_st, name)
+        pa, pb = a.parameters["properties"], b.parameters["properties"]
+        check(f"schemi: {name} ha gli stessi parametri nei due agenti",
+              set(pa) == set(pb), f"{sorted(set(pa) ^ set(pb))}")
+        check(f"schemi: {name} ha gli stessi tipi",
+              {k: v.get("type") for k, v in pa.items()} == {k: v.get("type") for k, v in pb.items()})
+        check(f"schemi: {name} ha gli stessi campi obbligatori",
+              a.parameters.get("required", []) == b.parameters.get("required", []))
+        check(f"schemi: {name} concorda sul flag distruttivo", a.destructive == b.destructive)
+        check(f"schemi: {name} concorda su stages_media", a.stages_media == b.stages_media)
+
+    # Qualità minima dello schema, su TUTTI i tool dei tre agenti: un parametro
+    # senza descrizione è un tool che il modello usa a indovinare.
+    cfg = cfg_for(Path("."))
+    for label, mod in (("coding", coding_agent), ("general", general_agent), ("explorer", explorer_agent)):
+        toolset = mod.build(cfg, None).toolset
+        names = [t["function"]["name"] for t in toolset.schemas()]
+        check(f"schemi: {label} espone nomi univoci", len(names) == len(set(names)), str(names))
+        for schema in toolset.schemas():
+            fn = schema["function"]
+            check(f"schemi: {label}/{fn['name']} ha una descrizione non vuota",
+                  bool(fn.get("description", "").strip()))
+            for pname, pspec in fn.get("parameters", {}).get("properties", {}).items():
+                check(f"schemi: {label}/{fn['name']}.{pname} è descritto",
+                      bool(pspec.get("description", "").strip()) and bool(pspec.get("type")),
+                      f"{pname}: {pspec}")
+
+
 def main():
     test_output_portable()
     test_arg_parse()
@@ -4905,6 +5151,9 @@ def main():
     test_context_calibration()
     test_prune_images()
     test_config_validate_impossible()
+    test_repl_dispatch()
+    test_think_price_override()
+    test_tool_schema_contract()
     test_budget_abort()
     test_read_only_mode()
     test_automation_helpers()

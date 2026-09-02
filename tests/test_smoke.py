@@ -5066,11 +5066,23 @@ def test_background_jobs():
     attesa limitata, terminazione dell'albero, e — il requisito che conta più di
     tutti — nessun processo lasciato vivo all'uscita.
 
-    Disciplina anti-intermittenza: i figli sono script `sys.executable -c` con flush
-    espliciti e la sincronizzazione avviene su SENTINELLE con deadline, mai su
-    sleep — in CI un test di concorrenza che si fida dei tempi diventa un rosso
-    casuale, che è peggio di nessun test."""
+    Disciplina anti-intermittenza, imparata a forza di rossi in CI su Windows:
+
+    1. i figli sono script `sys.executable -c` su UNA riga (una newline dentro
+       -c "..." non sopravvive a cmd.exe), con flush espliciti e senza '%' (che
+       cmd.exe interpreta);
+    2. la sincronizzazione avviene su SENTINELLE con deadline, mai su sleep;
+    3. mai asserire DOVE atterra l'output: la finestra di grazia dell'avvio corre
+       contro il tempo di spawn del processo — che su Windows è 5-10 volte più
+       lento — quindi lo stesso testo può comparire nel messaggio di avvio oppure
+       nel check successivo. Si asserisce che sia stato consegnato (`start + check`),
+       non in quale dei due;
+    4. mai confrontare fine-riga: lo stdout di un figlio è CRLF su Windows, e in
+       modalità testo un figlio che scrive lui stesso \r\n produce \r\r\n — si
+       normalizza togliendo OGNI \r;
+    5. gli id dei job si deducono dal messaggio, non si cablano."""
     import os as _os
+    import re as _re4
     import sys as _sys
     import time as _time
 
@@ -5226,7 +5238,12 @@ def test_background_jobs():
         check("job: il figlio termina da solo", until(lambda: not job_ok.running), ok)
         res = _ct.job(ctx, action="check", id=jid)
         check("job: exit 0 riportato", "exited 0" in res, res[:80])
-        check("job: output del figlio consegnato", "done" in res, res)
+        # `ok + res`, non solo `res`: un figlio brevissimo può aver già scritto
+        # tutto entro la finestra di grazia, e allora l'output sta nel messaggio di
+        # AVVIO — è consegnato al modello in entrambi i casi. Vedi la regola in
+        # testa a questo test: mai asserire DOVE atterra l'output.
+        check("job: output del figlio consegnato (avvio o check)", "done" in ok + res,
+              f"start={ok[-60:]!r} check={res[-60:]!r}")
 
         # ── Errori azionabili ────────────────────────────────────────────────
         check("job: id inesistente → errore con gli id noti",
@@ -5370,12 +5387,31 @@ def test_background_jobs():
         ctxs = ToolContext(cfg=cfg)
         ctxs.jobs = stubborn
         try:
+            # Marcatore inequivocabile: cercare "il primo numero > 100" pescherebbe
+            # anche le cifre del comando stesso, che viene ripetuto nel messaggio.
             started_s = _ct.run_background(ctxs, command=child(
                 "import os,signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
-                "print(os.getpid(), flush=True); [time.sleep(1) for _ in range(9999)]"))
-            pids = [int(t) for t in started_s.split() if t.isdigit() and int(t) > 100]
-            check("stop: il nipote ha dichiarato il proprio pid", bool(pids), started_s[:120])
-            grandchild = pids[0]
+                "print('MYPID=' + str(os.getpid()), flush=True); "
+                "[time.sleep(1) for _ in range(9999)]"))
+
+            def wait_for_pid(text: str, job_id: str, timeout: float = 20.0) -> int | None:
+                """Il pid dichiarato dal figlio può comparire nel messaggio di AVVIO o
+                in un check successivo, secondo la corsa tra finestra di grazia e
+                tempo di spawn: si accumula e si cerca in entrambi (regola 3 del
+                docstring). Il pattern MYPID=<cifre> non può collidere col comando
+                ripetuto nel testo, dove dopo '=' c'è una concatenazione."""
+                deadline = _time.monotonic() + timeout
+                while _time.monotonic() < deadline:
+                    found = _re4.search(r"MYPID=(\d+)", text)
+                    if found:
+                        return int(found.group(1))
+                    text += _ct.job(ctxs, action="check", id=job_id, wait_seconds=2)
+                return None
+
+            grandchild = wait_for_pid(started_s, "j1")
+            check("stop: il nipote ha dichiarato il proprio pid", grandchild is not None,
+                  started_s[:120])
+            assert grandchild is not None
 
             def gone_pid(pid: int) -> bool:
                 try:

@@ -37,6 +37,15 @@ jobs:
       - name: Type-check (mypy)
         run: mypy flair tools
 
+      # Codice con rami per-piattaforma (killpg/SIGKILL su POSIX, taskkill su
+      # Windows): mypy analizza SOLO la piattaforma su cui gira, quindi un errore
+      # di tipi nel ramo dell'altra sfugge finché non passa dal job corrispondente.
+      # Un secondo giro con --platform lo intercetta subito, su qualunque runner.
+      - name: Type-check (cross-platform)
+        run: |
+          mypy --platform win32 flair tools
+          mypy --platform linux flair tools
+
       - name: Tests
         run: python tests/test_smoke.py
 

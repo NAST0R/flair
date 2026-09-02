@@ -38,12 +38,19 @@ import os
 import shutil
 import signal
 import subprocess
+import sys
 import threading
 import time
 
 log = logging.getLogger("flair.tools.jobs")
 
-_IS_WINDOWS = os.name == "nt"
+# Il controllo di piattaforma esiste in DUE forme, di proposito: questa costante
+# per la leggibilità a runtime, e il letterale `sys.platform == "win32"` dentro
+# _terminate_tree — perché mypy sa restringere i tipi SOLO su quella forma. Su
+# Windows `signal.SIGKILL` e `os.killpg` non esistono nemmeno negli stub, quindi
+# senza il letterale il ramo POSIX viene type-checkato e va in errore pur non
+# essendo mai eseguito (rosso in CI su Windows, verde su Linux).
+_IS_WINDOWS = sys.platform == "win32"
 _READ_CHUNK = 4096
 _POLL_SLICE = 0.2      # granularità dell'attesa: piccola per restare reattivi a Ctrl-C
 
@@ -83,7 +90,10 @@ def _terminate_tree(proc: subprocess.Popen, grace: float) -> None:
     elegante, ma non è affidabile: uno zombie conta come membro, e dove PID 1 non
     raccoglie (container) il gruppo risulterebbe vivo per sempre. Chi ha chiesto
     `stop` vuole che il job finisca, non che finisca con eleganza."""
-    if _IS_WINDOWS:
+    # `sys.platform` letterale, non _IS_WINDOWS: è la sola forma su cui mypy
+    # restringe, e rende il ramo POSIX irraggiungibile (quindi non type-checkato)
+    # quando l'analisi gira su Windows, dove killpg e SIGKILL non esistono.
+    if sys.platform == "win32":
         if proc.poll() is None:
             taskkill = shutil.which("taskkill")
             if taskkill:

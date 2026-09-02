@@ -5283,6 +5283,22 @@ def test_background_jobs():
     finally:
         agent4.ctx.jobs.stop_all()
 
+    # ── Rami per-piattaforma: la forma del controllo conta ───────────────────
+    # `signal.SIGKILL` e `os.killpg` non esistono su Windows nemmeno negli stub:
+    # mypy, girando su Windows, type-checka il ramo POSIX e va in errore pur non
+    # eseguendolo mai. La narrowing avviene SOLO sul letterale sys.platform, quindi
+    # la funzione che li usa deve contenerlo — un `os.name == "nt"` o una costante
+    # non bastano, e l'errore si scopre solo in CI su Windows (già accaduto).
+    kill_src = __import__("inspect").getsource(_jobs._terminate_tree)
+    check("piattaforma: il ramo POSIX è protetto da un controllo restringibile",
+          'sys.platform == "win32"' in kill_src, kill_src[:200])
+    check("piattaforma: le chiamate POSIX-only stanno in quella funzione",
+          "SIGKILL" in kill_src and "killpg" in kill_src)
+    check("piattaforma: nessuna chiamata POSIX-only fuori dal ramo protetto",
+          all("killpg" not in line and "SIGKILL" not in line
+              for line in Path(_jobs.__file__).read_text(encoding="utf-8").splitlines()
+              if line.strip().startswith(("_IS_WINDOWS", "def _popen", "    kwargs"))))
+
     # ── Il caso cattivo: un NIPOTE che ignora la terminazione gentile ────────
     # Con shell=True il figlio diretto è la shell e il processo che conta è un
     # nipote. Attendere la morte della SHELL non dice nulla: un nipote che ignora

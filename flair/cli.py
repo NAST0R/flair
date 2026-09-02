@@ -30,7 +30,7 @@ from .agents import coding as coding_agent
 from .agents import general as general_agent
 from .config import Config, load_config
 from .core import router
-from .core.agent import _SUMMARY_HEADER, Conversation, content_text
+from .core.agent import _SUMMARY_HEADER, Approval, Conversation, content_text
 from .core.tool import ToolError
 from .llm import Usage, create_provider
 from .memory import SessionMemory
@@ -270,6 +270,7 @@ class CLI:
             on_compact=self._on_compact,
             on_prune=self._on_prune,
             approve=self._approve,
+            on_interrupt=self._on_interrupt,
         )
 
     def _chdir_root(self) -> None:
@@ -485,10 +486,10 @@ class CLI:
 
     # ── approvazione + anteprima diff ─────────────────────────────────────────
 
-    def _approve(self, name: str, args: dict) -> bool | str:
+    def _approve(self, name: str, args: dict) -> Approval:
         self._newline_if_needed()
         if name in self._always_allow:   # "always" vale per l'intero tool, per la sessione
-            return True
+            return Approval(allowed=True)
 
         preview = self._preview(name, args)
         if preview is not None:
@@ -499,18 +500,65 @@ class CLI:
 
         try:
             # Le parentesi quadre sono escape-ate: Rich le interpreterebbe come markup.
-            ans = self.console.input(r"    proceed? \[y]es / \[n]o / \[a]lways / \[s]top ").strip().lower()
+            raw = self.console.input(
+                r"    proceed? \[y]es / \[n]o / \[a]lways / \[s]top "
+                r"[dim](or answer with a message: «no, use port 8080»)[/dim] ").strip()
         except (EOFError, KeyboardInterrupt):
             self.console.print()
-            return "stop"   # Ctrl-C/EOF al prompt = ferma il flusso
-        if ans in ("s", "stop"):
-            return "stop"
-        if ans in ("a", "always", "sempre"):
+            return Approval(allowed=False, stop=True)   # Ctrl-C/EOF al prompt = ferma il flusso
+        # Prima parola = decisione, resto = messaggio per il modello. La virgola
+        # iniziale di «no, usa la porta 8080» non deve far parte della decisione.
+        head, _, rest = raw.partition(" ")
+        verb = head.strip().strip(",;:").lower()
+        note = rest.strip().lstrip(",;:").strip()
+        if verb in ("s", "stop"):
+            return Approval(allowed=False, stop=True)
+        if verb in ("a", "always", "sempre"):
             self._always_allow.add(name)
             self.console.print(f"[dim]  ok: I won't ask again for «{name}» in this session.[/dim]")
-            return True
-        # NB: 's' è riservato a stop; per il sì in italiano si usa 'si'/'sì'.
-        return ans in ("y", "yes", "si", "sì")
+            return Approval(allowed=True)
+        # NB: 's' è riservato a stop; per il sì in italiano si usa 'si'/'sì'. Una
+        # risposta non riconosciuta resta un NO (come prima), ma ora l'intero testo
+        # diventa il messaggio: rispondere con una frase è il modo naturale di dire
+        # «no, fai invece così», e prima quella frase andava perduta.
+        if verb in ("y", "yes", "si", "sì", "ok"):
+            return Approval(allowed=True, note=note)
+        if verb in ("n", "no"):
+            return Approval(allowed=False, note=note)
+        return Approval(allowed=False, note=raw)
+
+    def _on_interrupt(self) -> tuple[str, str]:
+        """Cosa fare dopo un Ctrl-C a metà turno. Prima l'interruzione chiudeva
+        sempre il turno; ora si può proseguire allegando un messaggio, che è il modo
+        di correggere la rotta senza perdere il lavoro già fatto.
+
+        In assenza di un terminale (headless, `-p`, pipe) NON si chiede nulla e si
+        conserva il comportamento storico: là non c'è nessuno a cui domandare, e un
+        prompt su stdin non interattivo si tradurrebbe in un EOF."""
+        if not sys.stdin or not sys.stdin.isatty():
+            return ("stop", "")
+        self._newline_if_needed()
+        try:
+            raw = self.console.input(
+                r"  [yellow]⏸ interrupted[/yellow] \[s]top / \[c]ontinue / or type a message "
+                r"[dim](it goes to the model and the turn continues)[/dim] ").strip()
+        except (EOFError, KeyboardInterrupt):
+            # Un secondo Ctrl-C significa «basta davvero».
+            self.console.print()
+            return ("stop", "")
+        head, _, rest = raw.partition(" ")
+        verb = head.strip().strip(",;:").lower()
+        if verb in ("", "s", "stop"):
+            return ("stop", "")
+        if verb in ("c", "continue", "continua"):
+            note = rest.strip().lstrip(",;:").strip()
+            self.console.print("[dim]  continuing…[/dim]" if not note else "[dim]  continuing with your note.[/dim]")
+            return ("continue", note)
+        # Qualunque altra frase = «continua, e tieni conto di questo»: è la forma
+        # naturale di interloquire, e chiederlo con una parola chiave in più
+        # renderebbe la feature scomoda proprio nel momento in cui serve.
+        self.console.print("[dim]  continuing with your message.[/dim]")
+        return ("continue", raw)
 
     def _preview(self, name: str, args: dict):
         """Anteprima dell'effetto per i tool distruttivi (diff per edit/write)."""

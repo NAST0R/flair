@@ -40,7 +40,34 @@ OnReasoning = Callable[[str], None]
 OnDelta = Callable[[str], None]
 OnCompact = Callable[[int, int], None]
 OnPrune = Callable[[int], None]
-Approve = Callable[[str, dict], bool | str]  # True = procedi, False = nega, "stop" = ferma il flusso
+# True/False/"stop" restano validi; un Approval permette di allegare un messaggio.
+Approve = Callable[[str, dict], "bool | str | Approval"]
+# Ctrl-C a metà turno: ritorna ("stop"|"continue", messaggio da consegnare al modello).
+OnInterrupt = Callable[[], tuple[str, str]]
+
+
+@dataclass(frozen=True)
+class Approval:
+    """Esito del gate di approvazione, con l'eventuale messaggio dell'umano.
+
+    Il messaggio viaggia nel RISULTATO del tool, non in un messaggio a parte: è
+    il posto dove il modello lo leggerà comunque, nell'istante giusto della
+    conversazione, senza toccare il pairing tool_call/tool né la cache. Negare
+    dicendo «no, usa la porta 8080» diventa così una correzione, non un muro."""
+    allowed: bool
+    stop: bool = False
+    note: str = ""
+
+
+def _as_approval(decision) -> Approval:
+    """Normalizza ciò che ritorna il callback del gate. Le forme storiche
+    (True/False/"stop") restano valide: i chiamanti che non hanno bisogno di
+    allegare un messaggio non devono cambiare."""
+    if isinstance(decision, Approval):
+        return decision
+    if decision == "stop":
+        return Approval(allowed=False, stop=True)
+    return Approval(allowed=bool(decision))
 
 
 class StoppedByUser(Exception):
@@ -52,6 +79,9 @@ class StoppedByUser(Exception):
 _SUMMARY_HEADER = "[Summary of the work done so far]\n\n"
 _ATTACHED_IMAGES_PREFIX = prune.ATTACHED_IMAGES_PREFIX  # unica fonte: la potatura lo riconosce
 _IMAGE_REJECTED_NOTE = "[image removed: the endpoint rejected it]"
+# Messaggio che l'umano inserisce a metà turno (Ctrl-C → "message"): entra come
+# messaggio utente, quindi append-only — nessuna rottura del prefisso in cache.
+_INTERJECT_PREFIX = "[The user interrupted you to say: "
 
 # Calibrazione del fattore caratteri→token (v. Conversation.token_ratio):
 # peso del campione più recente, campione minimo per essere informativo, e limiti
@@ -210,6 +240,7 @@ class Agent:
         on_compact: OnCompact | None = None,
         on_prune: OnPrune | None = None,
         approve: Approve | None = None,
+        on_interrupt: OnInterrupt | None = None,
     ) -> None:
         self.name = name
         self.cfg = cfg
@@ -225,6 +256,9 @@ class Agent:
         self.on_compact = on_compact
         self.on_prune = on_prune
         self.approve = approve
+        # Chiesto all'umano quando arriva un Ctrl-C: ("stop"|"continue", messaggio).
+        # L'agente non legge stdin — l'I/O resta al CLI, che sa se c'è un terminale.
+        self.on_interrupt = on_interrupt
 
         # La memoria è condivisa: chi passa la stessa Conversation ai due agenti li fa
         # ragionare sulla stessa storia. Il system prompt è anteposto alla chiamata.
@@ -298,7 +332,16 @@ class Agent:
                 # tutto il turno. Il knob modula SOLO i turni --think: senza --think
                 # non forza mai nulla.
                 deep = think and (step == 0 or self.cfg.think_steps == "all")
-                resp = self._complete(tools=schemas, think=deep)
+                try:
+                    resp = self._complete(tools=schemas, think=deep)
+                except KeyboardInterrupt:
+                    # Ctrl-C durante la chiamata: la risposta parziale è perduta (il
+                    # passo va ripetuto), ma il prefisso non è cambiato, quindi la
+                    # ripetizione è quasi tutta cache-hit.
+                    if not self._interjected(turn_usage):
+                        self.ctx.pending_images = []
+                        return AgentResult("", turn_usage, step, "stopped")
+                    continue
                 turn_usage = turn_usage + resp.usage
 
                 if resp.reasoning and self.on_reasoning and not self._streaming():
@@ -337,6 +380,17 @@ class Agent:
                     self._answer_unanswered(resp)
                     self.ctx.pending_images = []   # niente allegati fuori contesto al turno dopo
                     return AgentResult("", self._fold_delegated(turn_usage), step, "stopped")
+                except KeyboardInterrupt:
+                    # Ctrl-C a metà dei tool: la conversazione resta valida (ogni
+                    # tool_call riceve un esito) e si CHIEDE cosa fare, invece di
+                    # chiudere sempre il turno. Proseguire con un messaggio è il modo
+                    # di correggere la rotta senza perdere il lavoro già fatto.
+                    self._answer_unanswered(resp)
+                    turn_usage = self._fold_delegated(turn_usage)
+                    if not self._interjected(turn_usage):
+                        self.ctx.pending_images = []
+                        return AgentResult("", turn_usage, step, "stopped")
+                    continue
                 turn_usage = self._fold_delegated(turn_usage)
                 self._flush_pending_images()
 
@@ -372,6 +426,29 @@ class Agent:
         self.convo.total_usage = self.convo.total_usage + d
         self.ctx.delegated_usage = Usage()
         return turn_usage + d
+
+    def _interjected(self, turn_usage: Usage) -> bool:
+        """Chiede all'umano cosa fare dopo un Ctrl-C. Ritorna True se il turno deve
+        CONTINUARE (eventualmente con un messaggio appena inserito), False se va
+        chiuso — che è anche il comportamento quando nessun callback è configurato
+        (headless, script, `-p`): là non c'è nessuno a cui chiedere.
+
+        Il messaggio entra come messaggio UTENTE dopo i risultati dei tool, cioè
+        nello stesso punto già usato per gli allegati immagine: append-only,
+        pairing tool_call/tool intatto, prefisso in cache non toccato."""
+        if not self.on_interrupt:
+            return False
+        try:
+            decision, note = self.on_interrupt()
+        except Exception:  # noqa: BLE001 — un errore nel chiedere non deve nascondere il Ctrl-C
+            return False
+        if decision != "continue":
+            return False
+        if note:
+            self.convo.messages.append({"role": "user",
+                                        "content": f"{_INTERJECT_PREFIX}{note}]"})
+        self._flush_pending_images()
+        return True
 
     def _flush_pending_images(self) -> None:
         """Consegna al modello le immagini depositate dai tool (view_image). Il canale
@@ -908,14 +985,19 @@ class Agent:
             sig = self._sig(name, args)
             recent[sig] = recent.get(sig, 0) + 1
 
+        approval = Approval(allowed=True)
         if t.destructive and not self.cfg.auto_approve and self.approve:
-            decision = self.approve(name, args)
-            if decision == "stop":
+            approval = _as_approval(self.approve(name, args))
+            if approval.stop:
                 if self.on_result:
                     self.on_result(name, "⛔ stopped by the user", False)
                 raise StoppedByUser(name)
-            if not decision:
+            if not approval.allowed:
                 out = f"⚠️ Operation '{name}' was cancelled by the user."
+                if approval.note:
+                    # Il «perché» è più utile del rifiuto: il modello può correggere
+                    # la rotta invece di ritentare la stessa cosa.
+                    out += f" Their message: {approval.note}"
                 if self.on_result:
                     self.on_result(name, out, False)
                 return out, False
@@ -923,6 +1005,11 @@ class Agent:
         try:
             out = t(self.ctx, **args)
             ok = not out.startswith("❌")
+            if approval.note:
+                # SUFFISSO: l'esito si deduce dal primo carattere dell'output, e
+                # anteporre qualcosa trasformerebbe un fallimento in un successo
+                # apparente (già accaduto con la nota sui kwarg ignorati).
+                out += f"\nℹ️ Note from the user, who approved this: {approval.note}"
         except ToolError as exc:
             out, ok = f"❌ {exc}", False
         except TypeError as exc:

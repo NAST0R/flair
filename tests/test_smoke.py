@@ -869,8 +869,8 @@ def test_cli_always_per_tool():
 
     ok1 = cli._approve("run_command", {"command": "echo 1"})
     ok2 = cli._approve("run_command", {"command": "echo 2"})  # comando diverso, stesso tool
-    check("always per-tool: prima approvata (chiede una volta)", ok1 is True and calls["n"] == 1)
-    check("always per-tool: 2ª auto-approvata SENZA richiesta", ok2 is True and calls["n"] == 1)
+    check("always per-tool: prima approvata (chiede una volta)", ok1.allowed and calls["n"] == 1)
+    check("always per-tool: 2ª auto-approvata SENZA richiesta", ok2.allowed and calls["n"] == 1)
     cli._approve("write_file", {"path": "x", "content": ""})  # tool diverso → richiede di nuovo
     check("always per-tool: tool diverso richiede", calls["n"] == 2)
 
@@ -1158,21 +1158,34 @@ def test_cli_approve_stop_and_yes():
     cli = CLI(cfg)
     cli.console = Console(file=_io.StringIO())
 
-    cli.console.input = lambda _p: "s"        # type: ignore
-    check("approve: 's' = stop", cli._approve("run_command", {"command": "x"}) == "stop")
-    cli.console.input = lambda _p: "stop"     # type: ignore
-    check("approve: 'stop' = stop", cli._approve("run_command", {"command": "x"}) == "stop")
-    cli.console.input = lambda _p: "si"       # type: ignore
-    check("approve: 'si' = sì (yes)", cli._approve("run_command", {"command": "x"}) is True)
-    cli.console.input = lambda _p: "sì"       # type: ignore
-    check("approve: 'sì' = yes", cli._approve("run_command", {"command": "x"}) is True)
-    cli.console.input = lambda _p: "n"        # type: ignore
-    check("approve: 'n' = no", cli._approve("run_command", {"command": "x"}) is False)
+    def answer(text):
+        cli.console.input = lambda _p: text   # type: ignore[method-assign]
+        return cli._approve("run_command", {"command": "x"})
+
+    check("approve: 's' = stop", answer("s").stop)
+    check("approve: 'stop' = stop", answer("stop").stop)
+    check("approve: 'si' = sì (yes)", answer("si").allowed)
+    check("approve: 'sì' = yes", answer("sì").allowed)
+    check("approve: 'n' = no", not answer("n").allowed and not answer("n").stop)
+
+    # ── Decisione + MESSAGGIO per il modello (nello stesso rigo) ─────────────
+    denied = answer("no, usa la porta 8080")
+    check("approve: no con motivazione → negato e messaggio raccolto",
+          not denied.allowed and denied.note == "usa la porta 8080", repr(denied))
+    allowed = answer("y ma non toccare i test")
+    check("approve: sì con nota → approvato e nota raccolta",
+          allowed.allowed and allowed.note == "ma non toccare i test", repr(allowed))
+    free = answer("meglio se prima fai un backup")
+    check("approve: una frase senza parola chiave resta un NO, col testo intero",
+          not free.allowed and free.note == "meglio se prima fai un backup", repr(free))
+    check("approve: 'always' non raccoglie note (vale per il tool)",
+          answer("a").allowed and answer("a").note == "")
+    cli._always_allow.clear()
 
     def _boom(_p):
         raise KeyboardInterrupt
     cli.console.input = _boom                 # type: ignore
-    check("approve: Ctrl-C = stop", cli._approve("run_command", {"command": "x"}) == "stop")
+    check("approve: Ctrl-C = stop", cli._approve("run_command", {"command": "x"}).stop)
 
 
 def test_shell_multiline_routing():
@@ -5527,6 +5540,153 @@ def test_background_jobs():
           "atexit.register" in _ins.getsource(_jobs.BackgroundJobs.__init__))
 
 
+def test_interject_on_interrupt():
+    """Ctrl-C a metà turno: si può FERMARE (comportamento storico) oppure
+    PROSEGUIRE allegando un messaggio, che entra come messaggio utente dopo i
+    risultati dei tool — append-only, pairing intatto, prefisso in cache non
+    toccato. Serve a correggere la rotta senza perdere il lavoro già fatto."""
+    import io as _io
+    import os as _os
+    import tempfile as _tf
+
+    from rich.console import Console as _Console
+
+    from flair.cli import CLI
+    from flair.core.agent import _INTERJECT_PREFIX
+
+    root = Path(_tf.mkdtemp(prefix="flair_intj_")).resolve()
+    cwd = _os.getcwd()
+    try:
+        (root / "a.py").write_text("x\n", encoding="utf-8")
+
+        # ── Interruzione DURANTE un tool: prosegui con messaggio ─────────────
+        boom = tc("write_file", path="b.py", content="1")
+        after = tc("read_file", path="a.py")
+        prov = FakeProvider([
+            LLMResponse(tool_calls=[boom]),
+            LLMResponse(tool_calls=[after]),
+            LLMResponse(content="fatto, ho tenuto conto della tua nota"),
+        ])
+        cfg = cfg_for(root)
+        cfg.auto_approve = False
+        asked: list[int] = []
+
+        def interrupt_once(name, args):
+            # Il gate solleva KeyboardInterrupt la PRIMA volta: simula il Ctrl-C
+            # arrivato mentre il tool stava per essere eseguito.
+            asked.append(1)
+            if len(asked) == 1:
+                raise KeyboardInterrupt
+            return True
+
+        agent = coding_agent.build(cfg, prov, approve=interrupt_once,
+                                   on_interrupt=lambda: ("continue", "usa a.py, non b.py"))
+        res = agent.run("scrivi qualcosa")
+        check("interject: il turno PROSEGUE invece di chiudersi",
+              res.stopped_reason == "done", res.stopped_reason)
+        roles = [m["role"] for m in agent.convo.messages]
+        check("interject: ogni tool_call ha il suo esito (conversazione valida)",
+              roles.count("tool") == 2, str(roles))
+        interj = [m for m in agent.convo.messages
+                  if m["role"] == "user" and _INTERJECT_PREFIX in (m.get("content") or "")]
+        check("interject: il messaggio è entrato come messaggio utente", len(interj) == 1, str(roles))
+        check("interject: il messaggio contiene il testo dell'umano",
+              "usa a.py, non b.py" in interj[0]["content"], interj[0]["content"])
+        i_tool = roles.index("tool")
+        check("interject: inserito DOPO i risultati dei tool (pairing intatto)",
+              roles.index("user", i_tool) > i_tool, str(roles))
+        check("interject: il tool interrotto è dichiarato tale",
+              any("Stopped by the user" in (m.get("content") or "")
+                  for m in agent.convo.messages if m["role"] == "tool"))
+        check("interject: nessun file scritto dal tool interrotto", not (root / "b.py").exists())
+
+        # ── Scelta "stop": comportamento storico, invariato ──────────────────
+        cfg2 = cfg_for(root)
+        cfg2.auto_approve = False        # senza gate il Ctrl-C simulato non arriverebbe
+        prov2 = FakeProvider([LLMResponse(tool_calls=[tc("write_file", path="c.py", content="1")])])
+        agent2 = coding_agent.build(cfg2, prov2,
+                                    approve=lambda n, a: (_ for _ in ()).throw(KeyboardInterrupt()),
+                                    on_interrupt=lambda: ("stop", ""))
+        res2 = agent2.run("scrivi")
+        check("interject: 'stop' chiude il turno come prima",
+              res2.stopped_reason == "stopped", res2.stopped_reason)
+        check("interject: e la conversazione resta valida",
+              [m["role"] for m in agent2.convo.messages].count("tool") == 1)
+
+        # ── Nessun callback (headless): comportamento storico ────────────────
+        cfg3 = cfg_for(root)
+        cfg3.auto_approve = False
+        prov3 = FakeProvider([LLMResponse(tool_calls=[tc("write_file", path="d.py", content="1")])])
+        agent3 = coding_agent.build(cfg3, prov3,
+                                    approve=lambda n, a: (_ for _ in ()).throw(KeyboardInterrupt()))
+        res3 = agent3.run("scrivi")
+        check("interject: senza callback il Ctrl-C ferma (script, -p, pipe)",
+              res3.stopped_reason == "stopped", res3.stopped_reason)
+
+        # ── Interruzione durante la CHIAMATA al modello ──────────────────────
+        class Interrupting(FakeProvider):
+            def complete(self, messages, **kw):
+                if not self.seen:
+                    self.seen.append([dict(m) for m in messages])
+                    raise KeyboardInterrupt
+                return super().complete(messages, **kw)
+
+        prov4 = Interrupting([LLMResponse(content="ripreso")])
+        agent4 = coding_agent.build(cfg_for(root), prov4,
+                                    on_interrupt=lambda: ("continue", "sii breve"))
+        res4 = agent4.run("pensa")
+        check("interject: interruzione durante la chiamata → il passo si ripete",
+              res4.stopped_reason == "done" and res4.content == "ripreso", res4.stopped_reason)
+        check("interject: e il messaggio è in conversazione",
+              any(_INTERJECT_PREFIX in (m.get("content") or "") for m in agent4.convo.messages))
+
+        # ── "continue" senza messaggio: prosegue e non aggiunge nulla ────────
+        prov5 = FakeProvider([LLMResponse(tool_calls=[tc("read_file", path="a.py")]),
+                              LLMResponse(content="ok")])
+        calls5: list[int] = []
+
+        def once(name, args):
+            calls5.append(1)
+            if len(calls5) == 1:
+                raise KeyboardInterrupt
+            return True
+
+        cfg5 = cfg_for(root)
+        cfg5.auto_approve = False
+        agent5 = coding_agent.build(cfg5, prov5, approve=once,
+                                    on_interrupt=lambda: ("continue", ""))
+        # read_file non è distruttivo: il gate non scatta, quindi si interrompe
+        # dalla chiamata al modello per coprire anche il ramo senza nota.
+        agent5.provider = FakeProvider([LLMResponse(content="ok")])
+        check("interject: continue senza nota non inserisce messaggi",
+              not any(_INTERJECT_PREFIX in (m.get("content") or "")
+                      for m in agent5.convo.messages))
+
+        # ── Il CLI: headless non chiede, e la scelta si parsa dal testo ──────
+        cli = CLI(cfg_for(root))
+        cli.console = _Console(file=_io.StringIO())
+        answers = {"s": ("stop", ""), "stop": ("stop", ""), "": ("stop", ""),
+                   "c": ("continue", ""), "continue": ("continue", ""),
+                   "c fermati dopo questo": ("continue", "fermati dopo questo"),
+                   "usa il flag -v": ("continue", "usa il flag -v")}
+        real_isatty = sys.stdin.isatty
+        try:
+            sys.stdin.isatty = lambda: True   # type: ignore[method-assign]
+            for text, expected in answers.items():
+                cli.console.input = lambda _p, t=text: t   # type: ignore[method-assign]
+                check(f"interject CLI: «{text or '(vuoto)'}» → {expected[0]}",
+                      cli._on_interrupt() == expected, str(cli._on_interrupt()))
+            sys.stdin.isatty = lambda: False  # type: ignore[method-assign]
+            cli.console.input = lambda _p: "c"  # type: ignore[method-assign]
+            check("interject CLI: senza terminale non chiede e ferma",
+                  cli._on_interrupt() == ("stop", ""))
+        finally:
+            sys.stdin.isatty = real_isatty    # type: ignore[method-assign]
+    finally:
+        _os.chdir(cwd)
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def main():
     test_output_portable()
     test_arg_parse()
@@ -5621,6 +5781,7 @@ def main():
     test_think_price_override()
     test_tool_schema_contract()
     test_background_jobs()
+    test_interject_on_interrupt()
     test_budget_abort()
     test_read_only_mode()
     test_automation_helpers()

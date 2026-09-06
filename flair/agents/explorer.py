@@ -17,7 +17,11 @@ from ..tools import web as web_tools
 
 def build(cfg, provider, conversation=None, **callbacks) -> Agent:
     # Solo i tool di lettura del coding agent (niente edit/scrittura/comandi) + web.
-    readonly = [t for t in coding_tools.TOOLS if not t.destructive]
+    # Fuori anche la famiglia dei job in background: il registro è del genitore e non
+    # viene passato al sub-agente, quindi quegli schemi viaggerebbero a ogni explore
+    # per un tool che risponderebbe «non disponibile» — token spesi e un passo
+    # potenzialmente sprecato. Gestire processi non è il mestiere di un esploratore.
+    readonly = [t for t in coding_tools.TOOLS if not (t.destructive or t.background)]
     system_prompt = prompts.load("explorer") + prompts.project_instructions(cfg.root)
     return Agent(
         name="explorer",

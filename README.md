@@ -24,41 +24,63 @@ The original project fell into loops and burned tokens (a single analysis consum
 ```
 flair/
 ├── config.py            Config + nested ProviderConfig, loaded from .env
-│                        (context window/compaction, streaming, logging, per-model pricing)
+│                        (context window/compaction, streaming, logging, per-model
+│                        pricing with time bands, vision flags, background-job caps)
 ├── llm/                 LLM layer (provider abstraction)
 │   ├── base.py          Types (Usage/LLMResponse/ToolCall), robust arg parsing,
 │   │                    OpenAI-compatible provider (streaming, retry on transient
-│   │                    errors only, normalized usage, overflow detector)
-│   ├── deepseek.py      DeepSeek specifics (V4 thinking via parameter, max_tokens)
+│   │                    errors only, normalized usage, overflow detector, HTTP
+│   │                    library resolved from the installed SDK: httpx or httpx2)
+│   ├── deepseek.py      DeepSeek specifics: first-party protocol on api.deepseek.com
+│   │                    (thinking parameter, reasoning passback, banded pricing),
+│   │                    standard-compat profile on third-party hosts
 │   ├── openai.py        OpenAI specifics (o-series & GPT-5, max_completion_tokens)
 │   ├── local.py         Local OpenAI-compatible servers (llama.cpp, vLLM, LM Studio)
 │   └── factory.py       create_provider(cfg)
 ├── core/                Engine, independent of the concrete tools
 │   ├── tool.py          Tool, Toolset, ToolContext, ToolError, @tool
-│   ├── agent.py         Append-only agent loop + COMPACTION + anti-loop
-│   └── router.py        Agent selection: continuation stickiness + LLM (capped) + heuristic fallback
+│   ├── agent.py         Append-only agent loop + COMPACTION + anti-loop +
+│   │                    self-calibrating context accounting + mid-turn interjection
+│   ├── prune.py         Stage-0 pruning: superseded tool outputs and image attachments
+│   └── router.py        Agent selection: continuation stickiness + LLM (capped) + heuristic
 ├── tools/
 │   ├── fs.py            Filesystem helpers + resilient edit matcher (apply_edit)
 │   ├── coding.py        Coding tools (sandboxed to the project root)
 │   ├── system.py        Cross-platform desktop tools (whole machine)
+│   ├── shell.py         Command execution (cmd/sh, PowerShell via temp file)
+│   ├── repomap.py       Codebase outline across ~two dozen languages
+│   ├── documents.py     Text extraction from DOCX/XLSX/PPTX/ODT/PDF
+│   ├── images.py        Image validation/encoding for vision endpoints
+│   ├── jobs.py          Background commands: registry, incremental output,
+│   │                    optional stdin channel, process-tree termination
+│   ├── subagent.py      `explore`: read-only sub-agent with an isolated context
+│   ├── plan.py          Explicit step list for multi-step tasks
+│   ├── memory.py        `remember`: durable notes into the system prompt
 │   └── web.py           Web search + page fetch (Tavily / ddgs / DuckDuckGo)
 ├── agents/
 │   ├── coding.py        Builds the coding agent (+ project instructions, web tools)
-│   └── general.py       Builds the general agent (+ web_search/web_fetch)
+│   ├── general.py       Builds the general agent (+ desktop tools)
+│   └── explorer.py      Builds the read-only sub-agent used by `explore`
 ├── prompts/             System prompts (.md) + project-instructions loader
-├── session_log.py       JSONL session log + file logging
+├── memory.py            Session memory (dedup, secret filtering, hard cap, sidecar)
+├── session_log.py       JSONL session log (per-turn usage, cost, provider/model)
 ├── session_store.py     Save/resume conversation state across runs
-└── cli.py               CLI + REPL (rich): streaming, diff preview, cost, sessions
+└── cli.py               CLI + REPL (rich): streaming, diff preview, cost, sessions,
+                         command table, context counter, approval gate
+
+tools/configurer.py      Standalone .env editor (stdlib + optional Tkinter), with a
+                         headless `--check` validator
+tests/                   Offline suite, eval harness, shared output helper
 ```
 
 **One engine, two agents.** `core/agent.py` is generic: it takes a *toolset* and a *prompt*. The two agents differ only in those — no duplicated logic.
 
-- **Coding agent** — `read_file`, `list_directory`, `glob`, `grep` (with optional context lines and a files-only mode), `repo_map`, `edit_file`, `multi_edit`, `write_file`, `move_path`, `run_command`, `explore`, `plan`, `remember`, plus read-only `web_search` / `web_fetch` for information that lives online (library docs, API signatures, error messages). File tools are **sandboxed** to the project root (`--root`): it cannot escape it.
-- **General agent** — `open_url`, `open_path`, `open_application`, `search_files`, `list_directory`, `read_file`, `write_file`, `edit_file`, `run_command`, `run_powershell`, `system_info`, `get_datetime`, `clipboard_get/set`, `web_search`, `web_fetch`. Operates on the **whole machine** (that is its purpose: "open the browser", "find a song", "write a report to disk"). It can also **converse**: if no tool is needed, it just answers.
+- **Coding agent** — `read_file`, `list_directory`, `glob`, `grep` (with optional context lines and a files-only mode), `repo_map`, `edit_file`, `multi_edit`, `write_file`, `move_path`, `run_command`, `run_background` / `job` (long commands that must not block the turn), `view_image` (on vision-capable endpoints), `explore`, `plan`, `remember`, plus read-only `web_search` / `web_fetch` for information that lives online (library docs, API signatures, error messages). File tools are **sandboxed** to the project root (`--root`): it cannot escape it.
+- **General agent** — `open_url`, `open_path`, `open_application`, `search_files`, `list_directory`, `read_file`, `write_file`, `edit_file`, `run_command`, `run_powershell`, `run_background` / `job`, `view_image`, `system_info`, `get_datetime`, `clipboard_get/set`, `remember`, `web_search`, `web_fetch`. Operates on the **whole machine** (that is its purpose: "open the browser", "find a song", "write a report to disk"). It can also **converse**: if no tool is needed, it just answers.
 
 For complex/multi-line PowerShell on Windows, the agent uses `run_powershell`: the script is written to a temporary file, executed with `-File`, and the temp file is **always removed** (success, error, or timeout) — no escaping headaches, no leftovers. Multi-line commands sent through `run_command` are routed the same way internally, instead of through cmd.exe (which breaks on embedded newlines).
 
-**Safety.** Destructive tools (`edit_file`, `multi_edit`, `write_file`, `run_command`, `run_powershell`) ask for confirmation interactively, with a **diff preview**. `--yes` / `FLAIR_AUTO_APPROVE=true` disables it.
+**Safety.** Destructive tools (`edit_file`, `multi_edit`, `write_file`, `move_path`, `run_command`, `run_powershell`, `run_background`) ask for confirmation interactively, with a **diff preview**. `--yes` / `FLAIR_AUTO_APPROVE=true` disables it.
 
 **Three providers, one interface.** DeepSeek, OpenAI and any **local OpenAI-compatible server** all speak the same protocol; the differences (token parameter, reasoning models without `temperature`, cache fields, CoT) are isolated in minimal subclasses. The `local` provider is tuned for llama.cpp's `llama-server` and friends: no API key required, honest zero pricing, and `temperature` is **not sent** unless `LOCAL_TEMPERATURE` is set — so the server's own sampling flags (the ones recommended for the model you serve) stay in charge.
 
@@ -110,7 +132,20 @@ FLAIR_ROOT=.                       # working root for the coding agent
 FLAIR_AUTO_APPROVE=false           # confirmation for destructive tools
 ```
 
-All parameters (token limits, output caps, prices for cost estimation) are in `.env.example`, commented.
+All parameters are in `.env.example`, commented one by one — that file is the exhaustive
+reference (76 variables), this is only the minimum to get started. The families it covers:
+generation and loop caps, context management (window, compaction ratio, stage-0 pruning
+hysteresis, estimate calibration, `FLAIR_CTX_WARN`), **vision** (per-slot flags, image
+downscaling, token estimate), **background jobs** (`FLAIR_BG_*`: concurrency, output buffer,
+wait cap, grace periods, lifetime, retention of finished jobs), filesystem and tool output
+caps, web search, sessions and memory, safety (`FLAIR_AUTO_APPROVE`, `FLAIR_READ_ONLY`,
+`FLAIR_MAX_COST`), TLS (`FLAIR_CA_BUNDLE`) and cost estimation (per-model table, plus
+`FLAIR_PRICE_*` / `_PEAK` / `_THINK` overrides).
+
+> `python tools/configurer.py` opens a standalone editor for that file — every parameter with
+> its help text, type-aware inputs and validation — and `python tools/configurer.py --check`
+> validates an existing `.env` without a GUI (non-zero exit on errors), which also makes it
+> usable in CI.
 
 > Model names are only **defaults** and can be overridden from `.env` or the CLI.
 >
@@ -136,19 +171,28 @@ REPL commands:
 |---|---|
 | `/code <task>` | force the coding agent |
 | `/do <task>` | force the general agent |
-| `/think <task>` | use the thinking model on the first step |
-| `/agent` | show the current agent |
-| `/provider [name]` | show, or switch provider at runtime (`deepseek`/`openai`/`local`) |
+| `/think <task>` | first step with the thinking model |
+| `/agent` | show the current (sticky) agent |
+| `/tools` | list the active agent's tools |
+| `/provider [name]` | show or switch provider (deepseek|openai) |
 | `/model <name>` | switch the fast model at runtime |
 | `/think-model <name>` | switch the thinking model at runtime |
 | `/compact` | compact the active agent's context now |
-| `/cost` | session token/cost summary |
-| `/save [name]` | save the session (defaults to the current name) |
+| `/cost` | token/cost summary for the session |
+| `/save [name]` | save the session (default: current name) |
 | `/load <name>` | resume a saved session |
 | `/sessions` | list saved sessions |
-| `/reset` | clear the conversation |
-| `/root <path>` | change the working root |
-| `exit` | quit |
+| `/memory [clear]` | show (or clear) the session memory |
+| `/remember <note>` | jot a durable note into session memory yourself |
+| `/reset` | reset the shared conversation |
+| `/root <path>` | change the working folder (coding + general; reloads instructions) |
+| `/img <path> [prompt]` | attach an image to the turn (vision endpoints only) |
+| `/jobs [stop <id>]` | background jobs still running (or stop one) |
+| `/help` | this help |
+| `exit` / `quit` / `q` | leave the REPL |
+
+Commands are matched on the **exact first token**: an unknown one (or a typo) is
+rejected with a suggestion instead of being sent to the model as a task.
 
 ### One-shot
 
@@ -162,6 +206,9 @@ flair --no-stream -p "..."                                # disable streaming
 flair --log ./logs -p "..."                               # write the session log (JSONL)
 flair --session my-work                                   # use/create a session (auto-saved)
 flair --continue                                          # resume the last saved session
+flair --model deepseek-v4-pro -p "..."                    # override the fast model
+flair --think-model deepseek-v4-pro --think -p "..."      # override the thinking model
+flair --image shot.png -p "what is the error in this screenshot?"   # vision endpoints
 flair --version                                           # print version
 ```
 
@@ -201,11 +248,11 @@ For unattended runs prefer **stateless** invocations (no `--session`): two sched
 
 **Runtime switching.** Change provider or model mid-conversation without restarting: `/provider openai`, `/model <name>`, `/think-model <name>`. Histories are preserved; pricing re-aligns automatically.
 
-**Context indicator + manual compaction.** After each turn the status line shows how full the active agent's context is (e.g. `contesto · coding: 23% (28k/120k)`). `/compact` summarizes older messages on demand to reclaim space (it also happens automatically near the threshold).
+**Context counter + manual compaction.** The estimated context travels with the output you already see: appended to every tool line, in the reasoning spinner and in the REPL prompt (`45k/65k`), and summarized after each turn (`context · coding: 68% of the compaction threshold (45k/65k, window 80k)`). The reference is the **compaction threshold**, not the window — with a 0.82 ratio on 80K, compaction starts at 65K, and showing 80K would make an imminent limit look far away. Past `FLAIR_CTX_WARN` (85% of the threshold by default, 0 disables it) Flair says so once per turn, in time to interrupt and ask for a summary yourself before the automatic compaction — which on a local model can take minutes. `/compact` compacts on demand.
 
 **Codebase map.** `repo_map` returns a compact outline of the project — for every source file, its top-level definitions (functions, classes and signatures) — in a single call. The model uses it to orient itself cheaply instead of issuing many `list_directory`/`grep`/`read_file` calls, which both **lowers token usage** on real repositories and improves navigation. It is always generated fresh from the current files (never stale), confined to the project root, and size-capped. Python is parsed with `ast` (accurate); around twenty other languages — JS/TS, Go, Rust, Java, C#, C/C++, Ruby, PHP, Swift, Kotlin, Scala, shell, Lua, Dart, Elixir, and more — are covered with per-language patterns, so it works on virtually any codebase.
 
-**Read-only explorer sub-agent.** `explore` delegates a research question ("where and how is X implemented?", "which files handle Y?") to a **sub-agent with its own isolated context** and a **read-only** toolset (`repo_map`, `list_directory`, `glob`, `grep`, `read_file`, plus web). The sub-agent does the heavy reading in its own conversation and returns only a concise synthesis, so the parent agent's context stays lean — **lowering token usage** on large tasks while adding a focused-investigation capability. It is safe by construction: it cannot edit files or run commands, it cannot recurse (it does not have `explore` itself), it is bounded by `FLAIR_EXPLORER_MAX_STEPS`, and it is confined to the project root. Its token usage is rolled into the session total, so cost stays accurate. If the model never calls it, behaviour is unchanged.
+**Read-only explorer sub-agent.** `explore` delegates a research question ("where and how is X implemented?", "which files handle Y?") to a **sub-agent with its own isolated context** and a **read-only** toolset (`repo_map`, `list_directory`, `glob`, `grep`, `read_file`, `view_image`, plus web — no background jobs: the registry belongs to the parent). The sub-agent does the heavy reading in its own conversation and returns only a concise synthesis, so the parent agent's context stays lean — **lowering token usage** on large tasks while adding a focused-investigation capability. It is safe by construction: it cannot edit files or run commands, it cannot recurse (it does not have `explore` itself), it is bounded by `FLAIR_EXPLORER_MAX_STEPS`, and it is confined to the project root. Its token usage is rolled into the session total, so cost stays accurate. If the model never calls it, behaviour is unchanged.
 
 **Explicit plan (`plan`).** For multi-step tasks the model opens with a short, structured TODO list and rewrites it as it goes (`da_fare` / `in_corso` / `fatto`). A visible plan is the standard countermeasure to *flailing* — the real token killer, where a task takes 25 steps instead of 12 — and improves reliability on long tasks. The tool is stateless (each call rewrites the full list), tolerant of model quirks (plain strings, English statuses, JSON-string arrays), capped in size, and shown in full in the CLI. The compaction summarizer is instructed to preserve the current plan and step states.
 
@@ -217,7 +264,7 @@ For unattended runs prefer **stateless** invocations (no `--session`): two sched
 
 **File creation.** `write_file` creates whole files and intermediate folders; `edit_file` makes targeted changes. The coding agent can therefore both **create** and **modify**.
 
-**Diff preview + "always allow".** Before every destructive operation (when confirmations are on) Flair shows a **colored diff** of what will change (for `edit_file`/`write_file`) or the command (`run_command`). At the `[y]es / [n]o / [a]lways / [s]top` prompt, `a` stops asking **for that tool** for the rest of the session (so a long run of commands isn't interrupted at every step), and `s` (or `Ctrl-C`) **stops the whole agentic flow** and returns control to you — the interruption is recorded in the conversation, so the agent knows exactly where it was stopped and can pick up from there on your next message. If an `edit_file` match would fail, the preview says so up front instead of showing an empty diff.
+**Diff preview + "always allow".** Before every destructive operation (when confirmations are on) Flair shows a **colored diff** of what will change (for `edit_file`/`write_file`) or the command (`run_command`). At the `[y]es / [n]o / [a]lways / [s]top` prompt, `a` stops asking **for that tool** for the rest of the session (so a long run of commands isn't interrupted at every step), and `s` **stops the whole agentic flow** and returns control to you — the interruption is recorded in the conversation, so the agent knows exactly where it was stopped and can pick up from there on your next message. You can also answer with a sentence («no, use port 8080»): the decision *and* your message reach the model as the tool result (see *Talk to the agent while it works*). If an `edit_file` match would fail, the preview says so up front instead of showing an empty diff.
 
 **Project instructions.** If the root contains an `AGENTS.md` (or `FLAIR.md`, `CLAUDE.md`, `.flair.md`) file, its content is loaded into the coding agent's prompt: conventions, build/test commands, constraints. `/root` reloads it on the fly.
 
@@ -277,7 +324,22 @@ def screenshot(ctx: ToolContext, path: str) -> str:
     return f"✓ Saved {path}"
 ```
 
-Then add it to the `TOOLS` list of the right module (`tools/coding.py`, `tools/system.py` or `tools/web.py`). Nothing else to touch: dispatch and schema are automatic.
+Then add it to the `TOOLS` list of the right module (`tools/coding.py`, `tools/system.py` or
+`tools/web.py`). Nothing else to touch: dispatch and schema are automatic. The decorator takes
+three flags that the engine acts on: `destructive` (approval gate, and the tool disappears in
+`--read-only`), `stages_media` (the tool hands an image to the loop, so it runs on the shared
+context and never in a parallel worker) and `background` (the tool manages long-running
+processes: the whole family drops in `--read-only`, and the non-destructive member is exempt
+from the repeated-call loop detector, since polling a job is its job).
+
+**Add a configuration knob** — read it in `config.py` and add it to the catalogue in
+`tools/configurer.py`: a test checks the two in **both** directions, so a variable read by
+`config.py` but missing from the catalogue (or the reverse) fails the suite. Document it in
+`.env.example` too — that is where users look.
+
+**Add a REPL command** — one entry in the `_COMMANDS` table in `cli.py` (name, how it is
+written in the help, what it does, handler method). Dispatch, `/help` and the README table all
+derive from that single source.
 
 **Add a provider** — subclass `OpenAICompatProvider` (set `token_param` and `reasoning_regex`) and register it in `llm/factory.py`.
 
@@ -285,14 +347,55 @@ Then add it to the `TOOLS` list of the right module (`tools/coding.py`, `tools/s
 
 ## Tests
 
-Offline suite (no network, fake provider) with ~660 assertions covering: robust argument parsing, usage normalization for both providers, the **real provider request path** (parameters sent to the API: `max_tokens` vs `max_completion_tokens`, `temperature` omitted on reasoning models, DeepSeek V4 thinking enabled via parameter, retry on transient errors only), **streaming assembly**, **compaction** and overflow recovery, the resilient `edit_file` matcher and **atomic `multi_edit`**, **actionable missing-argument errors** (naming the missing arg and suggesting the intended one, e.g. `filename`→`path`), **parallel tool execution** (ordered append despite out-of-order completion, exact delegated-usage accounting, destructive batches kept sequential, correct result association, on/off flag), the **`repo_map`** outline across ~two dozen languages, the **read-only `explore` sub-agent** (isolation, read-only toolset, no recursion, leak-proof usage roll-up), the **`plan`** tool and **stage-0 context pruning** (rules, guarantees, summary-skip), web **search** (multi-backend cascade + errors) and **fetch**, **session persistence** (save/resume round-trip and **atomic writes**, at both the store and CLI level), **session memory** (dedup, secret filtering, hard cap, prompt injection only at session boundaries, sidecar round-trip, `/reset` keeping notes, off-flag), **`grep` context/files-only modes** (merged adjacent blocks, match vs context markers, clamped context, coercion) and the root-confined **`move_path`** (deterministic no-overwrite semantics, directory moves, escape attempts blocked), **honest `read_file` headers** (declared range always equals delivered lines, continuation hint on every partial read), **document text extraction** (DOCX/XLSX/PPTX/ODT and best-effort PDF behind a quality gate, edits on documents refused) and the **mechanical read-inventory appended to compaction summaries** (partial markers, dedup, cap), **runtime provider/model switching**, the context indicator, the router (including deterministic continuation stickiness), **headless execution** (significant exit codes, the `--json` result object, read-only tool filtering, the hard cost budget), and **both** agents on the real tools.
+Offline suite (no network, fake provider) with **1300+ assertions**, run as a plain script or
+under pytest. It covers, beyond the obvious: the **real provider request path** (parameters
+actually sent: `max_tokens` vs `max_completion_tokens`, `temperature` omitted on reasoning
+models, DeepSeek V4 thinking via parameter, `tool_choice="none"` on text-only completions,
+retry on transient errors only, both HTTP libraries of the SDK), **endpoint profiles** of the
+deepseek slot (first-party vs third-party, hostname detection, override, one-shot retry),
+**streaming assembly** and the fallback that never duplicates emitted output, **compaction**
+(summary on the cached prefix with its fallbacks, stage-0 pruning with hysteresis, mechanical
+read-inventory, prefix-break counting) and overflow recovery, the **self-calibrating context
+estimate**, **pricing** (per-model attribution, DeepSeek time bands, `_PEAK`/`_THINK`
+overrides), the resilient `edit_file` matcher and **atomic `multi_edit`** (including invisible
+characters and typographic folding), **actionable missing-argument errors**, **parallel tool
+execution** (ordered append, exact delegated-usage accounting, destructive batches sequential,
+shared registries by reference), `repo_map` across ~two dozen languages, the read-only
+**`explore`** sub-agent, `plan`, web **search**/**fetch**, **session persistence** and
+**session memory** (dedup, secret filtering, hard cap, prompt injection only at boundaries),
+`grep` context/files-only modes, root-confined `move_path`, **honest `read_file` headers**,
+**document extraction**, **vision** (multipart content, staged attachments, pre-send
+validation, poisoned-attachment neutralization, image pruning), **background jobs** (dispatch,
+incremental output with a read cursor, bounded waits, process-tree termination with SIGKILL
+escalation, no orphans on any exit path, retention, opt-in stdin channel), the **approval gate
+with messages** and **mid-turn interjection**, the **context counter and its warning**, the
+**REPL command table** (exact-token dispatch, unknown-command suggestions, help derived from
+the same source), **headless execution** (exit codes, `--json` contract, read-only filtering,
+hard cost budget), the **`tools/configurer.py`** catalogue kept in parity with `config.py` in
+both directions, and guards that keep the **English surface** honest (tool outputs, log
+messages, prompts) and the platform-specific branches type-safe.
+
+Discipline that keeps it green on every platform: the environment of the machine is not part of
+the test (run it from a directory without a `.env`), child processes are single-line
+`sys.executable -c` scripts synchronized on sentinels rather than sleeps, no assertion depends
+on *where* a job's output lands or on line endings, and temp roots are always resolved.
 
 ```bash
 python tests/test_smoke.py        # direct runner
 pytest -q                         # alternatively (dev extra)
 ```
 
-For lint and type-check (`dev` extra): `ruff check .` and `mypy flair`.
+For lint and type-check (`dev` extra):
+
+```bash
+ruff check flair tests tools
+mypy flair tools
+mypy --platform win32 flair tools    # the POSIX/Windows branches are checked both ways
+```
+
+CI runs all of the above on **ubuntu-latest** (Python 3.10 and 3.12) and on **windows-latest**:
+a good part of the code has `os.name == "nt"` branches (cmd quoting, PowerShell via temp file,
+process-tree kill, terminal encoding) that Linux never executes.
 
 ### Eval harness
 

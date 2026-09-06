@@ -5641,6 +5641,61 @@ def test_background_jobs():
           "atexit.register" in _ins.getsource(_jobs.BackgroundJobs.__init__))
 
 
+def test_readme_in_sync():
+    """Il README deve restare allineato al codice, e non per buona volontà: qui si
+    verifica meccanicamente che documenti OGNI comando del REPL, OGNI flag della
+    CLI, OGNI tool dei tre agenti e OGNI modulo di tools/. È la guardia che nasce da
+    una deriva reale — `/jobs` e `/img` esistevano da giorni senza comparire nella
+    tabella dei comandi, e le asserzioni dichiarate erano «~660» quando erano 1300."""
+    import re as _re
+
+    from flair.agents import explorer as explorer_agent
+    from flair.cli import _COMMANDS, _build_parser
+
+    readme = (Path(__file__).resolve().parent.parent / "README.md").read_text(encoding="utf-8")
+
+    # La verifica è sulla TABELLA dei comandi, non sul documento intero: cercare la
+    # stringa dappertutto è una guardia debole — `/jobs` compariva nella prosa delle
+    # feature mentre mancava dalla tabella, che è il posto dove si va a cercarlo (ed
+    # è proprio la deriva che ha motivato questo test).
+    start = readme.index("| Command | Effect |")
+    table = readme[start:readme.index("### One-shot", start)]
+    missing_cmds = [disp for _n, disp, _h, _m in _COMMANDS if disp not in table]
+    check("README: ogni comando del REPL è nella tabella dei comandi",
+          missing_cmds == [], str(missing_cmds))
+    check("README: la tabella cita anche le parole di uscita",
+          "`exit`" in table and "quit" in table, table[-120:])
+
+    # Per i flag basta una delle due forme (il README usa `-p`, non `--prompt`).
+    missing_flags = []
+    for action in _build_parser()._actions:
+        opts = [o for o in action.option_strings]
+        if opts and not any(o in readme for o in opts):
+            missing_flags.append("/".join(opts))
+    check("README: ogni flag della CLI è documentato", missing_flags == [], str(missing_flags))
+
+    cfg = cfg_for(Path("."))
+    tool_names: set[str] = set()
+    for mod in (coding_agent, general_agent, explorer_agent):
+        tool_names |= {t["function"]["name"] for t in mod.build(cfg, None).toolset.schemas()}
+    # `clipboard_get`/`clipboard_set` sono citati insieme come `clipboard_get/set`.
+    missing_tools = [n for n in sorted(tool_names)
+                     if n not in readme and n.replace("clipboard_set", "clipboard_get/set") not in readme]
+    check("README: ogni tool dei tre agenti è citato", missing_tools == [], str(missing_tools))
+
+    import flair.tools as _ft
+    modules = sorted(f.name for f in Path(_ft.__file__).resolve().parent.glob("*.py")
+                     if f.name != "__init__.py")
+    missing_mods = [m for m in modules if m not in readme]
+    check("README: l'albero dell'architettura cita ogni modulo di tools/",
+          missing_mods == [], str(missing_mods))
+
+    # Niente numeri di asserzioni cablati: invecchiano a ogni commit.
+    stale = _re.search(r"~\s?\d{3,}\s+assertions", readme)
+    check("README: nessun conteggio di asserzioni cablato (invecchia a ogni commit)",
+          stale is None, stale.group(0) if stale else "")
+
+
 def test_context_counter():
     """Contatore del contesto sempre a schermo e avviso di soglia. Il riferimento è
     la SOGLIA DI COMPATTAZIONE, non la finestra: con ratio 0.82 su 80K la
@@ -5967,6 +6022,7 @@ def main():
     test_think_price_override()
     test_tool_schema_contract()
     test_background_jobs()
+    test_readme_in_sync()
     test_context_counter()
     test_interject_on_interrupt()
     test_budget_abort()

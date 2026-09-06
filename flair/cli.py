@@ -200,6 +200,7 @@ class CLI:
         self._turn_tools: list[dict] = []
         self._always_allow: set[str] = set()
         self._cost_warned = False
+        self._ctx_warned = False
         # "human" (REPL/default), "json" o "quiet": le ultime due sono per l'uso
         # non presidiato (-p) e silenziano l'output decorato su stdout.
         self.output_mode = "human"
@@ -411,6 +412,44 @@ class CLI:
         sys.stdout.flush()
         self._mid_line = not piece.endswith("\n")
 
+    def _ctx_numbers(self) -> tuple[int, int, float] | None:
+        """(token stimati, soglia di compattazione, frazione della soglia) per
+        l'agente attivo. Il riferimento è la SOGLIA, non la finestra: con un
+        rapporto di 0.82 su 80K la compattazione parte a 65K, e mostrare 80K
+        farebbe sembrare lontano un limite che è dietro l'angolo."""
+        if not self.last_agent:
+            return None
+        tokens, _frac = self.agents[self.last_agent].context_fill()
+        threshold = max(1, int(self.cfg.context_window * self.cfg.compact_threshold_ratio))
+        return tokens, threshold, tokens / threshold
+
+    def _ctx_badge(self) -> str:
+        """Contatore compatto da appendere a una riga esistente: «45k/65k»."""
+        nums = self._ctx_numbers()
+        if nums is None:
+            return ""
+        tokens, threshold, _frac = nums
+        return f"{_kfmt(tokens)}/{_kfmt(threshold)}"
+
+    def _maybe_ctx_warn(self) -> None:
+        """Avvisa UNA volta per turno quando il contesto si avvicina alla soglia,
+        così c'è il tempo di interloquire (Ctrl-C) e chiedere un riassunto prima che
+        la compattazione parta da sola — che in locale può costare minuti."""
+        if self._ctx_warned or self.output_mode != "human" or self.cfg.context_warn_ratio <= 0:
+            return
+        nums = self._ctx_numbers()
+        if nums is None:
+            return
+        tokens, threshold, frac = nums
+        if frac < self.cfg.context_warn_ratio:
+            return
+        self._ctx_warned = True
+        self._newline_if_needed()
+        self.console.print(
+            f"[yellow]  ⚠ context at {round(frac * 100)}% of the compaction threshold "
+            f"({_kfmt(tokens)}/{_kfmt(threshold)}): ask for a summary now if you want one "
+            f"before the automatic compaction.[/yellow]")
+
     def _on_tool(self, name: str, args: dict) -> None:
         # Raccogliamo sempre l'evento (serve a logger e a --json); stampiamo solo in human.
         self._turn_tools.append({"name": name, "args": {k: _short(v, 200) for k, v in args.items()}})
@@ -426,7 +465,10 @@ class CLI:
             else:
                 shown[k] = _short(v)
         argstr = "  ".join(f"[cyan]{k}[/cyan]={v}" for k, v in shown.items())
-        self.console.print(f"  {icon} [bold]{name}[/bold]  {argstr}", highlight=False)
+        badge = self._ctx_badge()
+        tail = f"  [dim]· ctx {badge}[/dim]" if badge else ""
+        self.console.print(f"  {icon} [bold]{name}[/bold]  {argstr}{tail}", highlight=False)
+        self._maybe_ctx_warn()
 
     def _on_result(self, name: str, output: str, ok: bool) -> None:
         if self._turn_tools:
@@ -463,7 +505,10 @@ class CLI:
             self._think_status.start()
         self._think_chars += len(piece)
         elapsed = time.monotonic() - self._think_t0
-        self._think_status.update(f"[dim]reasoning… {_fmt_thinking(self._think_chars, elapsed)}[/dim]")
+        nums = self._ctx_numbers()
+        ctx = f" · ctx {round(nums[2] * 100)}%" if nums else ""
+        self._think_status.update(
+            f"[dim]reasoning… {_fmt_thinking(self._think_chars, elapsed)}{ctx}[/dim]")
 
     def _stop_thinking(self) -> None:
         status, self._think_status = self._think_status, None
@@ -683,6 +728,9 @@ class CLI:
             content = [{"type": "text", "text": task}, *attachments]
         self._turn_tools = []
         self._mid_line = False
+        # L'avviso sul contesto è UNA volta per turno: ripeterlo a ogni tool sarebbe
+        # rumore, non informazione.
+        self._ctx_warned = False
         human = self.output_mode == "human"
 
         if human:
@@ -752,10 +800,12 @@ class CLI:
     def _print_session(self) -> None:
         self.console.print(f"[dim]  session   · {self._cost_line(self._session_usage())}[/dim]")
         if self.last_agent:
-            tokens, frac = self.agents[self.last_agent].context_fill()
-            self.console.print(
-                f"[dim]  context   · {self.last_agent}: {round(frac * 100)}% "
-                f"({_kfmt(tokens)}/{_kfmt(self.cfg.context_window)})[/dim]")
+            nums = self._ctx_numbers()
+            if nums is not None:
+                tokens, threshold, frac = nums
+                self.console.print(
+                    f"[dim]  context   · {self.last_agent}: {round(frac * 100)}% of the compaction "
+                    f"threshold ({_kfmt(tokens)}/{_kfmt(threshold)}, window {_kfmt(self.cfg.context_window)})[/dim]")
         self._maybe_cost_warn()
         self.console.print()
 
@@ -1055,7 +1105,9 @@ class CLI:
 
         while True:
             try:
-                line = self.console.input("[bold green]▶[/bold green] ").strip()
+                badge = self._ctx_badge()
+                head = f"[dim]{badge}[/dim] " if badge else ""
+                line = self.console.input(f"{head}[bold green]▶[/bold green] ").strip()
             except (EOFError, KeyboardInterrupt):
                 self.console.print("\n[dim]bye![/dim]")
                 self._shutdown_jobs()

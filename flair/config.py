@@ -274,6 +274,12 @@ class Config:
     bg_max_lifetime: int = 3600       # oltre, il job viene chiuso alla prima interazione utile
     bg_keep_finished: int = 5         # job CONCLUSI trattenuti: oltre, i più vecchi escono dalla lista
 
+    # Avviso quando il contesto si avvicina alla SOGLIA DI COMPATTAZIONE (non alla
+    # finestra): frazione della soglia oltre la quale avvisare una volta per turno.
+    # Serve a poter chiedere all'agente un riassunto PRIMA che la compattazione
+    # scatti da sola — utile soprattutto in locale, dove è lenta. 0 = nessun avviso.
+    context_warn_ratio: float = 0.85
+
     # Isteresi dello stadio 0: la potatura da sola evita il riassunto SOLO se porta
     # il contesto sotto soglia con questo margine (frazione della finestra). La
     # mutazione ha comunque rotto il prefisso in cache: uscire a ridosso della
@@ -451,6 +457,7 @@ def load_config() -> Config:
         bg_stop_grace=_float("FLAIR_BG_STOP_GRACE", 3.0),
         bg_max_lifetime=_int("FLAIR_BG_MAX_LIFETIME", 3600),
         bg_keep_finished=_int("FLAIR_BG_KEEP_FINISHED", 5),
+        context_warn_ratio=_float("FLAIR_CTX_WARN", 0.85),
         root=Path(os.getenv("FLAIR_ROOT", ".")).expanduser().resolve(),
         read_file_max_chars=_int("FLAIR_READ_MAX", 12000),
         grep_max_chars=_int("FLAIR_GREP_MAX", 6000),

@@ -448,14 +448,15 @@ def view_image(ctx: ToolContext, path: str) -> str:
         "type": "object",
         "properties": {
             "command": {"type": "string", "description": "Command to start in the background."},
+            "stdin": {"type": "boolean", "description": "Open an input channel for the command (default false). Only for commands that READ from stdin line by line: with the channel open a program waiting for input keeps waiting, while by default it gets end-of-input immediately and proceeds."},
         },
         "required": ["command"],
     },
     destructive=True,
     background=True,
 )
-def run_background(ctx: ToolContext, command: str) -> str:
-    return jobs.run_background_impl(ctx, command, cwd=str(ctx.cfg.root))
+def run_background(ctx: ToolContext, command: str, stdin: bool = False) -> str:
+    return jobs.run_background_impl(ctx, command, cwd=str(ctx.cfg.root), stdin=stdin)
 
 
 @tool(
@@ -468,16 +469,17 @@ def run_background(ctx: ToolContext, command: str) -> str:
     {
         "type": "object",
         "properties": {
-            "action": {"type": "string", "description": "check (read new output) | list (all jobs) | stop (terminate one)."},
+            "action": {"type": "string", "description": "check (read new output) | list (all jobs) | stop (terminate one) | write (send a line to the command's input) | close_stdin (signal end-of-input)."},
             "id": {"type": "string", "description": "Job id, e.g. 'j1'. Required for check and stop."},
             "wait_seconds": {"type": "integer", "description": "On check: block up to N seconds waiting for new output or for the command to finish. Default 0 (return immediately)."},
+            "text": {"type": "string", "description": "On write: the line to send to the command's input (a newline is added if missing)."},
         },
         "required": ["action"],
     },
     background=True,
 )
-def job(ctx: ToolContext, action: str, id: str = "", wait_seconds: int = 0) -> str:
-    return jobs.job_impl(ctx, action, id, wait_seconds)
+def job(ctx: ToolContext, action: str, id: str = "", wait_seconds: int = 0, text: str = "") -> str:
+    return jobs.job_impl(ctx, action, id, wait_seconds, text)
 
 
 TOOLS = [read_file, list_directory, glob, grep, repo_map, edit_file, multi_edit, write_file, move_path,

@@ -5523,6 +5523,76 @@ def test_background_jobs():
     finally:
         keep.stop_all()
 
+    # ── Canale di INPUT (opt-in): scrittura, risposta, EOF ───────────────────
+    # La PIPE su stdin è opt-in per una ragione precisa: con DEVNULL un programma
+    # che legge riceve subito EOF e prosegue, con la PIPE aperta resterebbe in
+    # attesa per sempre. Aprirla di default trasformerebbe comandi che funzionano
+    # in comandi piantati.
+    stdin_reg = _jobs.BackgroundJobs(max_jobs=2, stop_grace=1.0)
+    ctx_in = ToolContext(cfg=cfg)
+    ctx_in.jobs = stdin_reg
+    try:
+        echoer = child("import sys; [print('echo:', line.strip(), flush=True) for line in sys.stdin]")
+        started_in = _ct.run_background(ctx_in, command=echoer, stdin=True)
+        jin = started_in.split()[2]
+        check("stdin: il canale è annunciato all'avvio",
+              "input channel open" in started_in, started_in[:150])
+        check("stdin: il job dichiara il canale aperto", stdin_reg.get(jin).stdin_enabled)
+
+        sent = _ct.job(ctx_in, action="write", id=jin, text="ciao")
+        check("stdin: scrittura accettata", sent.startswith("✅ Sent to"), sent[:80])
+        delivered = ""
+        for _ in range(6):
+            delivered += _ct.job(ctx_in, action="check", id=jin, wait_seconds=3)
+            if "ciao" in delivered:
+                break
+        check("stdin: il figlio ha letto e risposto", "echo:" in delivered and "ciao" in delivered,
+              delivered[-120:])
+
+        # Seconda riga: il canale resta usabile.
+        _ct.job(ctx_in, action="write", id=jin, text="seconda")
+        delivered2 = ""
+        for _ in range(6):
+            delivered2 += _ct.job(ctx_in, action="check", id=jin, wait_seconds=3)
+            if "seconda" in delivered2:
+                break
+        check("stdin: il canale resta aperto per altre righe", "seconda" in delivered2,
+              delivered2[-120:])
+
+        # EOF: il figlio che legge fino alla fine dello stream può uscire.
+        closed = _ct.job(ctx_in, action="close_stdin", id=jin)
+        check("stdin: EOF segnalato", closed.startswith("✅ End-of-input"), closed)
+        check("stdin: dopo l'EOF il figlio esce da solo",
+              until(lambda: not stdin_reg.get(jin).running, 15.0),
+              stdin_reg.get(jin).status())
+        check("stdin: close_stdin è idempotente",
+              _ct.job(ctx_in, action="close_stdin", id=jin).startswith("✅"))
+
+        # ── Errori azionabili, mai eccezioni e mai blocchi ───────────────────
+        no_chan = _ct.run_background(ctx_in, command=child("import time; time.sleep(20)"))
+        jno = no_chan.split()[2]
+        refused = _ct.job(ctx_in, action="write", id=jno, text="x")
+        check("stdin: job senza canale → errore con il rimedio",
+              refused.startswith("❌") and "stdin=true" in refused, refused)
+        check("stdin: e nulla è stato annunciato all'avvio", "input channel" not in no_chan)
+        check("stdin: write senza testo → errore",
+              _ct.job(ctx_in, action="write", id=jno).startswith("❌ Nothing to write"))
+        _ct.job(ctx_in, action="stop", id=jno)
+        dead_write = _ct.job(ctx_in, action="write", id=jin, text="x")
+        check("stdin: scrittura su job concluso → errore, non eccezione",
+              dead_write.startswith("❌") and "exited" in dead_write, dead_write)
+
+        # Il default resta DEVNULL: un figlio che legge riceve EOF e ESCE da solo,
+        # senza che nessuno gli scriva. È la garanzia di non-regressione.
+        auto = _ct.run_background(ctx_in, command=child(
+            "import sys; data = sys.stdin.read(); print('read', len(data), flush=True)"))
+        jauto = auto.split()[2]
+        check("stdin: senza canale il figlio riceve EOF e termina (nessuna regressione)",
+              until(lambda: not stdin_reg.get(jauto).running, 15.0),
+              stdin_reg.get(jauto).status())
+    finally:
+        stdin_reg.stop_all()
+
     # ── Batch PARALLELO: il registro deve essere visibile ai worker ──────────
     # Regressione trovata sul campo: `job` non è distruttivo, quindi più check nello
     # stesso batch prendono il percorso parallelo, che usa un ToolContext ISOLATO.
@@ -5569,6 +5639,91 @@ def test_background_jobs():
           _ins.getsource(CLI.run_once)[-200:])
     check("job: il registro si registra anche in atexit (ultima rete)",
           "atexit.register" in _ins.getsource(_jobs.BackgroundJobs.__init__))
+
+
+def test_context_counter():
+    """Contatore del contesto sempre a schermo e avviso di soglia. Il riferimento è
+    la SOGLIA DI COMPATTAZIONE, non la finestra: con ratio 0.82 su 80K la
+    compattazione parte a 65K, e mostrare 80K farebbe sembrare lontano un limite
+    che è dietro l'angolo — proprio quando serve fermarsi e chiedere un riassunto."""
+    import io as _io
+    import os as _os
+    import tempfile as _tf
+
+    from rich.console import Console as _Console
+
+    from flair.cli import CLI
+
+    root = Path(_tf.mkdtemp(prefix="flair_ctx_")).resolve()
+    cwd = _os.getcwd()
+    try:
+        cfg = cfg_for(root)
+        cfg.context_window, cfg.compact_threshold_ratio = 100_000, 0.80   # soglia = 80k
+        cli = CLI(cfg)
+        cli.console = _Console(file=_io.StringIO(), width=200)
+
+        def out() -> str:
+            text = cli.console.file.getvalue()
+            cli.console.file.truncate(0)
+            cli.console.file.seek(0)
+            return text
+
+        check("contatore: senza conversazione non mostra nulla",
+              cli._ctx_numbers() is None and cli._ctx_badge() == "")
+
+        cli.last_agent = "coding"
+        agent = cli.agents["coding"]
+        agent.convo.last_prompt_tokens = 40_000
+        tokens, threshold, frac = cli._ctx_numbers()
+        check("contatore: la soglia è quella di compattazione, non la finestra",
+              threshold == 80_000, str(threshold))
+        check("contatore: frazione calcolata sulla soglia",
+              tokens == 40_000 and abs(frac - 0.5) < 1e-9, f"{tokens} {frac}")
+        check("contatore: badge compatto", cli._ctx_badge() == "40k/80k", cli._ctx_badge())
+
+        # Riga di un tool: il contatore viaggia con l'output che c'è già.
+        cli._on_tool("read_file", {"path": "x.py"})
+        line = out()
+        check("contatore: appeso alla riga del tool", "ctx 40k/80k" in line, line)
+
+        # Avviso: una volta sola per turno, oltre la frazione configurata.
+        cli._ctx_warned = False
+        cfg.context_warn_ratio = 0.85
+        agent.convo.last_prompt_tokens = 60_000        # 75% della soglia
+        cli._on_tool("read_file", {"path": "y.py"})
+        check("contatore: sotto la soglia d'avviso non avvisa", "⚠ context at" not in out())
+        agent.convo.last_prompt_tokens = 70_000        # 87,5%
+        cli._on_tool("read_file", {"path": "z.py"})
+        warned = out()
+        check("contatore: avvisa oltre la frazione configurata",
+              "⚠ context at 88% of the compaction threshold" in warned, warned)
+        check("contatore: l'avviso suggerisce cosa fare", "ask for a summary now" in warned)
+        cli._on_tool("read_file", {"path": "w.py"})
+        check("contatore: avvisa UNA sola volta per turno", "⚠ context at" not in out())
+
+        # Knob a zero = nessun avviso (comportamento pre-esistente).
+        cli._ctx_warned = False
+        cfg.context_warn_ratio = 0.0
+        cli._on_tool("read_file", {"path": "v.py"})
+        check("contatore: FLAIR_CTX_WARN=0 disattiva l'avviso", "⚠ context at" not in out())
+
+        # Fuori dalla modalità umana non si stampa nulla (contratto --json).
+        cfg.context_warn_ratio = 0.85
+        cli._ctx_warned = False
+        cli.output_mode = "json"
+        cli._on_tool("read_file", {"path": "u.py"})
+        check("contatore: in --json niente contatore né avviso su stdout", out() == "")
+        cli.output_mode = "human"
+
+        # Riga di fine turno: dichiara soglia E finestra.
+        cli._print_session()
+        session_line = out()
+        check("contatore: la riga di sessione cita la soglia e la finestra",
+              "of the compaction threshold" in session_line and "window 100k" in session_line,
+              session_line)
+    finally:
+        _os.chdir(cwd)
+        shutil.rmtree(root, ignore_errors=True)
 
 
 def test_interject_on_interrupt():
@@ -5812,6 +5967,7 @@ def main():
     test_think_price_override()
     test_tool_schema_contract()
     test_background_jobs()
+    test_context_counter()
     test_interject_on_interrupt()
     test_budget_abort()
     test_read_only_mode()

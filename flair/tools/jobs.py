@@ -35,6 +35,7 @@ from __future__ import annotations
 import atexit
 import logging
 import os
+import queue
 import shutil
 import signal
 import subprocess
@@ -53,15 +54,21 @@ log = logging.getLogger("flair.tools.jobs")
 _IS_WINDOWS = sys.platform == "win32"
 _READ_CHUNK = 4096
 _POLL_SLICE = 0.2      # granularità dell'attesa: piccola per restare reattivi a Ctrl-C
+_WRITE_QUEUE = 64      # righe in attesa di essere scritte sullo stdin del figlio
 
 
-def _popen(command: str, cwd: str | None) -> subprocess.Popen:
+def _popen(command: str, cwd: str | None, stdin_pipe: bool = False) -> subprocess.Popen:
     """Avvia il comando nella shell di sistema con un solo stream di output e in un
-    gruppo di processi PROPRIO, così la terminazione può raggiungere anche i nipoti."""
+    gruppo di processi PROPRIO, così la terminazione può raggiungere anche i nipoti.
+
+    `stdin_pipe` è OPT-IN e non un default per una ragione precisa: con DEVNULL un
+    programma che legge riceve subito EOF e prosegue o esce, mentre con una PIPE
+    aperta resterebbe in attesa per sempre. Aprirla di default trasformerebbe
+    comandi che oggi funzionano in comandi che si piantano."""
     kwargs: dict = {
         "shell": True,
         "cwd": cwd,
-        "stdin": subprocess.DEVNULL,   # fase 1: nessun stdin (v. modulo docstring)
+        "stdin": subprocess.PIPE if stdin_pipe else subprocess.DEVNULL,
         "stdout": subprocess.PIPE,
         "stderr": subprocess.STDOUT,
         "bufsize": 0,                  # byte grezzi: la decodifica è nostra, con errors="replace"
@@ -144,7 +151,8 @@ class Job:
     scartato — invece di ri-consegnare tutto a ogni check (che sarebbe il modo più
     rapido di riempire il contesto)."""
 
-    def __init__(self, job_id: str, command: str, cwd: str | None, buffer_chars: int) -> None:
+    def __init__(self, job_id: str, command: str, cwd: str | None, buffer_chars: int,
+                 stdin_pipe: bool = False) -> None:
         self.id = job_id
         self.command = command
         self.started_at = time.monotonic()
@@ -156,7 +164,19 @@ class Job:
         self._dropped = 0      # caratteri usciti dal ring
         self._event = threading.Event()   # segnala output nuovo o fine del processo
         self.stopped_by_user = False
-        self.proc = _popen(command, cwd)
+        self.stdin_enabled = stdin_pipe
+        self.stdin_closed = False
+        self.stdin_error = ""
+        self.proc = _popen(command, cwd, stdin_pipe)
+        # Scrittura su stdin da un THREAD con coda: una write su una pipe piena
+        # blocca, e Python non offre timeout sulle scritture — farlo nel thread del
+        # turno significherebbe congelare l'agente perché il figlio non legge.
+        self._writes: queue.Queue[str | None] = queue.Queue(maxsize=_WRITE_QUEUE)
+        self._writer: threading.Thread | None = None
+        if stdin_pipe:
+            self._writer = threading.Thread(target=self._pump_stdin,
+                                            name=f"flair-job-{job_id}-in", daemon=True)
+            self._writer.start()
         self._reader = threading.Thread(target=self._pump, name=f"flair-job-{job_id}", daemon=True)
         self._reader.start()
 
@@ -176,6 +196,63 @@ class Job:
         finally:
             self.proc.poll()            # POSIX: raccoglie subito lo zombie se ha finito
             self._event.set()           # sveglia chi era in attesa: non arriverà altro
+
+    def _pump_stdin(self) -> None:
+        """Svuota la coda sullo stdin del figlio. `None` = chiudi (EOF): serve ai
+        programmi che leggono fino alla fine dello stream, non riga per riga."""
+        stream = self.proc.stdin
+        while stream is not None:
+            item = self._writes.get()
+            if item is None:
+                break
+            try:
+                stream.write(item.encode("utf-8"))
+                stream.flush()
+            except (BrokenPipeError, OSError, ValueError) as exc:
+                # Il figlio non legge più (uscito, o ha chiuso il suo stdin).
+                self.stdin_error = f"{type(exc).__name__}: {exc}"
+                break
+        self._close_stdin_stream()
+
+    def _close_stdin_stream(self) -> None:
+        self.stdin_closed = True
+        try:
+            if self.proc.stdin is not None and not self.proc.stdin.closed:
+                self.proc.stdin.close()
+        except (OSError, ValueError):
+            pass
+
+    def write_stdin(self, text: str) -> str:
+        """Accoda `text` per lo stdin del figlio. Ritorna "" se accettato, altrimenti
+        un messaggio azionabile — mai un'eccezione e mai un blocco."""
+        if not self.stdin_enabled:
+            return ('this job was started without an input channel: start it with '
+                    'stdin=true if the command needs to read from stdin')
+        if not self.running:
+            return "the process has already exited, so it cannot read input any more"
+        if self.stdin_closed:
+            return "the input channel of this job is already closed"
+        if self.stdin_error:
+            return f"the process is not reading its input ({self.stdin_error})"
+        payload = text if text.endswith("\n") else text + "\n"
+        try:
+            self._writes.put_nowait(payload)
+        except queue.Full:
+            return ("the input queue is full: the process is not consuming what it "
+                    "was given, so nothing more was queued")
+        return ""
+
+    def close_stdin(self) -> str:
+        """Segnala EOF al figlio. Idempotente."""
+        if not self.stdin_enabled:
+            return "this job has no input channel"
+        if self.stdin_closed:
+            return ""
+        try:
+            self._writes.put_nowait(None)
+        except queue.Full:
+            self._close_stdin_stream()   # coda intasata: si chiude direttamente
+        return ""
 
     def _append(self, text: str) -> None:
         with self._lock:
@@ -252,6 +329,9 @@ class Job:
     def close(self) -> None:
         """Rilascia le risorse di un job concluso: pipe chiusa, thread raccolto,
         zombie reaped. Idempotente."""
+        if self.stdin_enabled and not self.stdin_closed:
+            # Senza EOF un figlio in attesa di input non uscirebbe mai da solo.
+            self.close_stdin()
         try:
             self.proc.poll()
             if self.proc.stdout is not None and not self.proc.stdout.closed:
@@ -260,6 +340,8 @@ class Job:
             pass
         if self._reader.is_alive():
             self._reader.join(timeout=1.0)
+        if self._writer is not None and self._writer.is_alive():
+            self._writer.join(timeout=1.0)
 
 
 class BackgroundJobs:
@@ -325,7 +407,7 @@ class BackgroundJobs:
             return self._jobs.get((job_id or "").strip())
 
     # ── ciclo di vita ───────────────────────────────────────────────────────
-    def start(self, command: str, cwd: str | None) -> Job:
+    def start(self, command: str, cwd: str | None, stdin_pipe: bool = False) -> Job:
         self.reap()
         with self._lock:
             live = sum(1 for j in self._jobs.values() if j.running)
@@ -335,7 +417,7 @@ class BackgroundJobs:
                     "job(action=\"stop\", id=...) or raise FLAIR_BG_MAX_JOBS.")
             self._seq += 1
             job_id = f"j{self._seq}"
-            job = Job(job_id, command, cwd, self.buffer_chars)
+            job = Job(job_id, command, cwd, self.buffer_chars, stdin_pipe)
             self._jobs[job_id] = job
             return job
 
@@ -398,7 +480,7 @@ def _collect_new(job: Job, wait: float) -> tuple[str, int]:
         job.wait_for_activity(min(0.5, remaining))
 
 
-def run_background_impl(ctx, command: str, cwd: str | None) -> str:
+def run_background_impl(ctx, command: str, cwd: str | None, stdin: bool = False) -> str:
     """Avvia il comando e ritorna subito. La finestra di grazia serve a distinguere
     «avviato» da «morto all'istante»: senza, un comando con un typo risponderebbe
     "started" e l'errore si scoprirebbe solo al check successivo."""
@@ -406,7 +488,7 @@ def run_background_impl(ctx, command: str, cwd: str | None) -> str:
     if registry is None:
         return _NO_JOBS
     try:
-        job = registry.start(command, cwd)
+        job = registry.start(command, cwd, stdin_pipe=bool(stdin))
     except RuntimeError as exc:
         return f"❌ {exc}"
     except OSError as exc:
@@ -422,15 +504,21 @@ def run_background_impl(ctx, command: str, cwd: str | None) -> str:
         body += (f"\n[{lost} chars of output were dropped: the buffer keeps the most "
                  f"recent {job.buffer_chars} chars]")
     if job.running:
-        return (f"{head}{body}\n[still running — read new output with "
+        chan = ""
+        if job.stdin_enabled:
+            chan = (f'\n[input channel open: send lines with job(action="write", id="{job.id}", '
+                    f'text=...) and signal end-of-input with job(action="close_stdin", '
+                    f'id="{job.id}")]')
+        return (f"{head}{body}{chan}\n[still running — read new output with "
                 f'job(action="check", id="{job.id}"); add wait_seconds to block up to '
                 f'{getattr(ctx.cfg, "bg_max_wait", 30)}s]')
     return (f"{head}{body}\n[the command already finished with exit code {job.exit_code} "
             f"after {_fmt_duration(job.elapsed)} — it did not need the background]")
 
 
-def job_impl(ctx, action: str, id: str = "", wait_seconds: int = 0) -> str:  # noqa: A002
-    """check / list / stop sui job della sessione."""
+def job_impl(ctx, action: str, id: str = "", wait_seconds: int = 0,  # noqa: A002
+             text: str = "") -> str:
+    """check / list / stop / write / close_stdin sui job della sessione."""
     registry = getattr(ctx, "jobs", None)
     if registry is None:
         return _NO_JOBS
@@ -450,9 +538,10 @@ def job_impl(ctx, action: str, id: str = "", wait_seconds: int = 0) -> str:  # n
         body = "\n".join(f"  {_job_line(j)}" for j in ordered)
         return f"{len(jobs)} job(s), {running} still running:\n{body}{older}"
 
-    if act not in ("check", "stop"):
-        return ('❌ Unknown action: use "check" (read new output), "list" (all jobs) '
-                'or "stop" (terminate one).')
+    if act not in ("check", "stop", "write", "close_stdin"):
+        return ('❌ Unknown action: use "check" (read new output), "list" (all jobs), '
+                '"stop" (terminate one), "write" (send a line to its input) or '
+                '"close_stdin" (signal end-of-input).')
 
     job = registry.get(id)
     if job is None:
@@ -462,6 +551,24 @@ def job_impl(ctx, action: str, id: str = "", wait_seconds: int = 0) -> str:  # n
                     f"the list short (the {registry.keep_finished} most recent finished jobs are "
                     f"kept). Currently tracked: {known}.")
         return f"❌ No job with id '{id}'. Existing jobs: {known}."
+
+    if act == "write":
+        if not text:
+            return '❌ Nothing to write: pass the line in `text`.'
+        problem = job.write_stdin(text)
+        if problem:
+            return f"❌ Could not write to {job.id}: {problem}."
+        # Non si attende qui: la risposta del comando arriverà nel prossimo check,
+        # eventualmente con wait_seconds — bloccare ora vorrebbe dire indovinare
+        # quanto tempo serve al programma per rispondere.
+        return (f"✅ Sent to {job.id}: {text.strip()[:80]}\n"
+                f'[read the reply with job(action="check", id="{job.id}", wait_seconds=…)]')
+
+    if act == "close_stdin":
+        problem = job.close_stdin()
+        if problem:
+            return f"❌ Could not close the input of {job.id}: {problem}."
+        return f"✅ End-of-input signalled to {job.id}."
 
     if act == "stop":
         was_running = job.running

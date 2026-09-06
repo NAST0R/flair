@@ -169,6 +169,11 @@ CATALOG: tuple[Field, ...] = (
     Field("Vision", "FLAIR_IMAGE_TOKENS", "int", "1200",
           "Estimated tokens per image for the context meter (drives proactive "
           "compaction; the real count comes back in the API usage).", min=1),
+    Field("Context", "FLAIR_CTX_WARN", "float", "0.85",
+          "Warn once per turn when the context reaches this fraction of the "
+          "COMPACTION THRESHOLD (not of the window), so there is time to ask for a "
+          "summary before the automatic compaction kicks in — which on a local "
+          "model can take minutes. 0 disables the warning.", min=0.0, max=1.0),
     Field("Context", "FLAIR_CTX_CALIBRATION", "bool", "true",
           "Learn the real chars-to-tokens ratio from the requests and correct the "
           "estimate of the not-yet-sent suffix with it (dense code tokenizes worse "

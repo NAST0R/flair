@@ -4498,6 +4498,42 @@ def test_configurer():
     lf = "FLAIR_PROVIDER=local\nFLAIR_MAX_STEPS=60\n"
     check("configurer: file LF resta LF", "\r" not in conf.render_env(lf, {"FLAIR_MAX_STEPS": "40"}))
 
+    # ── File NUOVO e righe non terminate: il caso che la suite non copriva ────
+    # Bug reale: creando un .env da zero, le righe uscivano tutte incollate su una
+    # sola («FLAIR_PROVIDER=localLOCAL_BASE_URL=…»). Il round-trip su file esistenti
+    # era testato, il percorso «nessun file precedente» no — e su un originale vuoto
+    # il separatore calcolato era la stringa vuota.
+    fresh = conf.render_env("", {"FLAIR_PROVIDER": "local",
+                                 "LOCAL_BASE_URL": "https://192.168.1.63:8001/v1",
+                                 "FLAIR_MAX_TOKENS": "32000"})
+    check("configurer: da file vuoto una riga per parametro",
+          len([ln for ln in fresh.splitlines() if ln.strip()]) == 3, repr(fresh[:80]))
+    check("configurer: nessuna riga incollata",
+          all(ln.count("=") == 1 for ln in fresh.splitlines() if ln.strip()), repr(fresh))
+    check("configurer: il file finisce con un fine-riga", fresh.endswith("\n"))
+    check("configurer: i valori sono quelli attesi",
+          conf.parse_env(fresh)[0]["LOCAL_BASE_URL"] == "https://192.168.1.63:8001/v1")
+
+    # Ultima riga senza newline (comune nei file scritti a mano): la nuova non si
+    # attacca a quella precedente.
+    glued = conf.render_env("FLAIR_PROVIDER=deepseek", {"FLAIR_MAX_STEPS": "40"})
+    check("configurer: ultima riga non terminata → nessun incollamento",
+          conf.parse_env(glued)[0] == {"FLAIR_PROVIDER": "deepseek", "FLAIR_MAX_STEPS": "40"},
+          repr(glued))
+
+    # Fine-riga coerente: un file CRLF non si ritrova righe nuove in LF.
+    crlf_env = conf.render_env("FLAIR_PROVIDER=deepseek\r\nFLAIR_MAX_STEPS=60",
+                               {"FLAIR_MAX_TOKENS": "8000"})
+    check("configurer: fine-riga dominante applicato alle righe nuove",
+          crlf_env.count("\r\n") == 3 and "\n" not in crlf_env.replace("\r\n", ""), repr(crlf_env))
+
+    # E il file nuovo nasce DOCUMENTATO: si parte dal template, non dal nulla.
+    check("configurer: il template di riferimento viene trovato",
+          conf._template_path(Path(__file__).resolve().parent.parent / ".env") is not None)
+    generated = conf.build_default_env()
+    check("configurer: il template generato ha sezioni e commenti",
+          generated.count("# ──") >= 5 and generated.count("\n") > 50, generated[:80])
+
     # ── Validazione: errori bloccanti vs warning ──────────────────────────────
     errs, warns = conf.validate({"FLAIR_PROVIDER": "deepseek", "FLAIR_MAX_STEPS": "abc"}, Path("."))
     check("configurer: valore non numerico → errore", any("not a valid int" in e for e in errs))

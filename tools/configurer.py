@@ -391,11 +391,23 @@ def _write_text(path: Path, text: str) -> None:
     path.write_bytes(text.encode("utf-8"))
 
 
+def _terminate_last(lines: list[str], eol: str) -> None:
+    """Chiude l'ultima riga con un fine-riga se non ce l'ha. Senza questo, una
+    riga nuova aggiunta a un file la cui ultima riga non termina con un newline
+    (caso comune nei file scritti a mano) si incollerebbe a quella precedente."""
+    if lines and not lines[-1].endswith(("\n", "\r")):
+        lines[-1] += eol
+
+
 def render_env(original: str, changes: dict[str, str | None]) -> str:
     """Apply `changes` (key -> new value, or None = unset) to the original text,
     preserving comments, layout and line endings. Keys absent from the file are
     inserted into their section (or appended at the end)."""
     lines = original.splitlines(keepends=True)   # keep endings: CRLF round-trips byte-exact
+    # Fine-riga DOMINANTE dell'originale: è il fallback quando una riga di
+    # riferimento non ne ha (ultima riga senza newline, o file vuoto). Senza,
+    # un file CRLF si ritrovava righe nuove terminate con \n — misto.
+    dominant = "\r\n" if "\r\n" in original else "\n"
     _, entries = parse_env(original)
     headers = [(i, m.group(1).strip()) for i, ln in enumerate(lines)
                if (m := HEADER_RE.match(ln))]
@@ -435,20 +447,38 @@ def render_env(original: str, changes: dict[str, str | None]) -> str:
         if new is None:
             continue
         if field is None:
-            eol = _eol(lines[-1]) if lines else "\n"
+            eol = (_eol(lines[-1]) if lines else "") or dominant
             if lines and lines[-1].strip() == "":
                 lines[-1] = f"{key}={quote_value(new)}" + eol
             else:
+                _terminate_last(lines, eol)
                 lines.append(f"{key}={quote_value(new)}" + eol)
             continue
         inserts.setdefault(field.section, []).append(f"{key}={quote_value(new)}")
     # Insert new keys at the end of their section, in catalog order.
     for section, newlines in inserts.items():
         pos = section_end(section)
-        eol = _eol(lines[pos - 1]) if pos else ""   # match the file's EOL
+        # `or "\n"`: su un file VUOTO pos è 0, e su un file la cui ultima riga non
+        # termina con un newline _eol() ritorna "" — in entrambi i casi le righe
+        # inserite finivano incollate una all'altra su una riga sola (bug reale,
+        # visto creando un .env da zero).
+        eol = (_eol(lines[pos - 1]) if pos else "") or dominant
+        if pos >= len(lines):
+            _terminate_last(lines, eol)
         for i, ln in enumerate(newlines):
             lines.insert(pos + i, ln + eol)
     return "".join(lines)
+
+
+def _template_path(target: Path) -> Path | None:
+    """`.env.example` accanto al file di destinazione, o quello del repo. None se
+    nessuno dei due esiste."""
+    for cand in (target.parent / ".env.example",
+                 Path(__file__).resolve().parent.parent / ".env.example",
+                 Path(__file__).resolve().parent.parent / "flair" / ".env.example"):
+        if cand.is_file():
+            return cand
+    return None
 
 
 def build_default_env() -> str:
@@ -777,13 +807,9 @@ class App:
                 "New from template",
                 f"{target.name} already exists. Replace it with the template?"):
             return
-        example = target.parent / ".env.example"
-        if not example.exists():
-            alt = Path(__file__).resolve().parent.parent / "flair" / ".env.example"
-            if alt.exists():
-                example = alt
+        example = _template_path(target)
         target.parent.mkdir(parents=True, exist_ok=True)
-        if example.exists():
+        if example is not None:
             shutil.copyfile(example, target)
             src = str(example)
         else:
@@ -816,14 +842,25 @@ class App:
             w.insert(0, p)
             self.mark_modified()
 
+    def _base_text(self, target: Path) -> str:
+        """The text to edit. For an EXISTING file it is the file itself (comments and
+        layout are preserved). For a file that does not exist yet, the template —
+        `.env.example` next to it, or the built-in one — so a freshly created .env
+        arrives documented instead of holding a bare handful of assignments."""
+        existing = _read_text(target)
+        if existing.strip():
+            return existing
+        example = _template_path(target)
+        return _read_text(example) if example else build_default_env()
+
     def _rendered_text(self, target: Path) -> str:
         """The .env text as it would be written to `target` right now.
 
         render_env already keeps the original line endings; this only normalizes
         lines that were newly inserted (they carry the file's dominant EOL or
         none) so the whole file uses one consistent EOL — never \r\r\n."""
-        text = render_env(_read_text(target), self.changes())
-        return text.replace("\r\n", "\n").replace("\n", self.eol)
+        text = render_env(self._base_text(target), self.changes())
+        return text.replace("\r\n", "\n").replace("\n", self.eol or "\n")
 
     def preview(self) -> None:
         win = tk.Toplevel(self.root)

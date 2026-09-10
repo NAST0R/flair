@@ -279,6 +279,10 @@ class Config:
     # Serve a poter chiedere all'agente un riassunto PRIMA che la compattazione
     # scatti da sola — utile soprattutto in locale, dove è lenta. 0 = nessun avviso.
     context_warn_ratio: float = 0.85
+    # Far vedere ANCHE AL MODELLO quanto contesto resta (e l'avviso di soglia), così
+    # può decidere da sé quando consolidare ciò che ha scoperto. False = solo a
+    # schermo per l'umano, cioè il comportamento pre-esistente.
+    context_tell_model: bool = False
 
     # Isteresi dello stadio 0: la potatura da sola evita il riassunto SOLO se porta
     # il contesto sotto soglia con questo margine (frazione della finestra). La
@@ -458,6 +462,7 @@ def load_config() -> Config:
         bg_max_lifetime=_int("FLAIR_BG_MAX_LIFETIME", 3600),
         bg_keep_finished=_int("FLAIR_BG_KEEP_FINISHED", 5),
         context_warn_ratio=_float("FLAIR_CTX_WARN", 0.85),
+        context_tell_model=_bool("FLAIR_CTX_TELL_MODEL", False),
         root=Path(os.getenv("FLAIR_ROOT", ".")).expanduser().resolve(),
         read_file_max_chars=_int("FLAIR_READ_MAX", 12000),
         grep_max_chars=_int("FLAIR_GREP_MAX", 6000),

@@ -174,6 +174,12 @@ CATALOG: tuple[Field, ...] = (
           "COMPACTION THRESHOLD (not of the window), so there is time to ask for a "
           "summary before the automatic compaction kicks in — which on a local "
           "model can take minutes. 0 disables the warning.", min=0.0, max=1.0),
+    Field("Context", "FLAIR_CTX_TELL_MODEL", "bool", "false",
+          "Also show the context counter (and the threshold warning) TO THE MODEL, "
+          "appended to the last tool result of each step, so it can decide by itself "
+          "when to consolidate what it found instead of discovering it after the "
+          "compaction. Append-only by design: it never rewrites what was already "
+          "sent, so the prefix cache is untouched. false = counters only on screen."),
     Field("Context", "FLAIR_CTX_CALIBRATION", "bool", "true",
           "Learn the real chars-to-tokens ratio from the requests and correct the "
           "estimate of the not-yet-sent suffix with it (dense code tokenizes worse "

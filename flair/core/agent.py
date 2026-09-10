@@ -82,6 +82,13 @@ _IMAGE_REJECTED_NOTE = "[image removed: the endpoint rejected it]"
 # Messaggio che l'umano inserisce a metà turno (Ctrl-C → "message"): entra come
 # messaggio utente, quindi append-only — nessuna rottura del prefisso in cache.
 _INTERJECT_PREFIX = "[The user interrupted you to say: "
+# Contatore del contesto mostrato AL MODELLO (opt-in, FLAIR_CTX_TELL_MODEL).
+_CTX_NOTE = "[context: {used} of {limit} used before automatic compaction]"
+_CTX_NOTE_WARN = (
+    "[context: {used} of {limit} — automatic compaction is close. It replaces the "
+    "older part of this conversation with a summary, so whatever you want to keep "
+    "(findings, decisions, the file contents that matter) is best written down now: "
+    "in your next message, in the plan, with `remember`, or to a file.]")
 
 # Calibrazione del fattore caratteri→token (v. Conversation.token_ratio):
 # peso del campione più recente, campione minimo per essere informativo, e limiti
@@ -271,6 +278,7 @@ class Agent:
         self.ctx = ToolContext(cfg=cfg, provider=provider)
         self.ctx.delegated_usage = Usage()
         self.ctx.pending_images = []
+        self._ctx_warned_model = False
 
     @property
     def messages(self) -> list[dict]:
@@ -310,6 +318,7 @@ class Agent:
                 )})
 
     def run(self, task: str | list, think: bool = False, max_steps: int | None = None) -> AgentResult:
+        self._ctx_warned_model = False      # l'avviso al modello è uno per turno
         # `task` è normalmente una stringa; con allegati (/img) è una LISTA di parti
         # multimodali OpenAI-style, che viaggia nel content così com'è.
         self.convo.messages.append({"role": "user", "content": task})
@@ -392,6 +401,7 @@ class Agent:
                         return AgentResult("", turn_usage, step, "stopped")
                     continue
                 turn_usage = self._fold_delegated(turn_usage)
+                self._tell_context()
                 self._flush_pending_images()
 
                 if any(c >= 4 for c in recent.values()):
@@ -449,6 +459,42 @@ class Agent:
                                         "content": f"{_INTERJECT_PREFIX}{note}]"})
         self._flush_pending_images()
         return True
+
+    def _tell_context(self) -> None:
+        """Fa vedere al MODELLO quanto contesto resta, se FLAIR_CTX_TELL_MODEL è
+        attivo: così può valutare da sé quando consolidare ciò che ha scoperto,
+        invece di accorgersene quando la compattazione ha già riassunto.
+
+        CACHE — è il vincolo che decide il disegno: la riga viene appesa al
+        contenuto dell'ULTIMO risultato di tool del passo, cioè a un messaggio
+        appena accodato e quindi ancora NON inviato (indice >= convo.sent_upto).
+        Nessun messaggio nuovo, nessuna riscrittura di ciò che il server ha già
+        visto: il prefisso in cache resta intatto. Metterla nel system prompt, o in
+        un messaggio rigenerato a ogni giro, costerebbe un cache-miss INTEGRALE per
+        ogni passo — l'opposto del principio su cui è costruito flair.
+
+        Nei turni senza tool non c'è un risultato a cui appendere e la riga non
+        compare: è un limite accettato, perché il contesto cresce quasi solo
+        attraverso gli output dei tool (ed è meglio di un messaggio in più, che
+        allungherebbe la conversazione a ogni passo)."""
+        if not getattr(self.cfg, "context_tell_model", False):
+            return
+        start = max(0, self.convo.sent_upto)
+        idx = next((i for i in range(len(self.convo.messages) - 1, start - 1, -1)
+                    if self.convo.messages[i].get("role") == "tool"
+                    and isinstance(self.convo.messages[i].get("content"), str)), None)
+        if idx is None:
+            return
+        tokens = self._ctx_estimate()
+        threshold = max(1, int(self.cfg.context_window * self.cfg.compact_threshold_ratio))
+        warn_at = getattr(self.cfg, "context_warn_ratio", 0.0)
+        used, limit = f"{tokens / 1000:.0f}k", f"{threshold / 1000:.0f}k"
+        if warn_at > 0 and tokens / threshold >= warn_at and not self._ctx_warned_model:
+            self._ctx_warned_model = True
+            note = _CTX_NOTE_WARN.format(used=used, limit=limit)
+        else:
+            note = _CTX_NOTE.format(used=used, limit=limit)
+        self.convo.messages[idx]["content"] = f"{self.convo.messages[idx]['content']}\n{note}"
 
     def _flush_pending_images(self) -> None:
         """Consegna al modello le immagini depositate dai tool (view_image). Il canale

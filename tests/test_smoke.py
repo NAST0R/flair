@@ -2898,6 +2898,8 @@ def test_english_surface():
     from flair.core.agent import (
         _ATTACHED_IMAGES_PREFIX,
         _COMPACT_PROMPT,
+        _CTX_NOTE,
+        _CTX_NOTE_WARN,
         _IMAGE_REJECTED_NOTE,
         _SUMMARIZE_ON_PREFIX,
         _SUMMARIZE_PREAMBLE,
@@ -2911,6 +2913,8 @@ def test_english_surface():
         "prompt compaction": _COMPACT_PROMPT,
         "istruzione summarize su prefisso": _SUMMARIZE_ON_PREFIX,
         "header allegati immagine": _ATTACHED_IMAGES_PREFIX,
+        "nota contesto al modello": _CTX_NOTE,
+        "avviso contesto al modello": _CTX_NOTE_WARN,
         "nota immagine rigettata": _IMAGE_REJECTED_NOTE,
         "stub prune": STUB,
         "footer explore (1)": _footer(1),
@@ -5732,6 +5736,119 @@ def test_readme_in_sync():
           stale is None, stale.group(0) if stale else "")
 
 
+def test_context_told_to_model():
+    """Contatore del contesto mostrato AL MODELLO (FLAIR_CTX_TELL_MODEL).
+
+    L'asserzione che conta è quella di CACHE: la riga viene appesa a un messaggio
+    appena prodotto e non ancora inviato, quindi il prefisso già visto dal server
+    resta byte-identico. Metterla nel system prompt o in un messaggio rigenerato a
+    ogni giro costerebbe un cache-miss integrale per passo."""
+    import os as _os
+
+    from flair.core.agent import _CTX_NOTE, _CTX_NOTE_WARN
+
+    def two_step_provider() -> FakeProvider:
+        return FakeProvider([
+            LLMResponse(tool_calls=[tc("read_file", path="a.py")],
+                        usage=Usage(prompt_tokens=30_000, total_tokens=30_000)),
+            LLMResponse(tool_calls=[tc("read_file", path="b.py")],
+                        usage=Usage(prompt_tokens=40_000, total_tokens=40_000)),
+            LLMResponse(content="fatto", usage=Usage(prompt_tokens=50_000, total_tokens=50_000)),
+        ])
+
+    marker = _CTX_NOTE.split("{", 1)[0]          # "[context: "
+    root = Path(tempfile.mkdtemp(prefix="flair_tellctx_")).resolve()
+    cwd = _os.getcwd()
+    try:
+        (root / "a.py").write_text("x\n", encoding="utf-8")
+        (root / "b.py").write_text("y\n", encoding="utf-8")
+
+        # ── Knob SPENTO: conversazione identica a prima ──────────────────────
+        off = cfg_for(root)
+        off.context_tell_model = False
+        agent_off = coding_agent.build(off, two_step_provider())
+        agent_off.run("leggi i file")
+        check("ctx al modello: knob spento → nessuna nota in conversazione",
+              not any(marker in (m.get("content") or "")
+                      for m in agent_off.convo.messages if isinstance(m.get("content"), str)))
+
+        # ── Knob ACCESO ─────────────────────────────────────────────────────
+        on = cfg_for(root)
+        on.context_tell_model = True
+        on.context_window, on.compact_threshold_ratio = 100_000, 0.80   # soglia 80k
+        on.context_warn_ratio = 0.9                                     # avviso a 72k
+        prov = two_step_provider()
+        agent_on = coding_agent.build(on, prov)
+        agent_on.run("leggi i file")
+
+        tools_msgs = [m for m in agent_on.convo.messages if m.get("role") == "tool"]
+        check("ctx al modello: la nota è nei risultati dei tool",
+              all(marker in (m.get("content") or "") for m in tools_msgs), str(len(tools_msgs)))
+        check("ctx al modello: la nota è in CODA al risultato (l'esito resta leggibile)",
+              all((m["content"] or "").index(marker) > 0 for m in tools_msgs))
+        check("ctx al modello: nessun messaggio in più",
+              [m["role"] for m in agent_on.convo.messages] ==
+              [m["role"] for m in agent_off.convo.messages],
+              str([m["role"] for m in agent_on.convo.messages]))
+
+        # ── INVARIANTE DI CACHE: il prefisso già inviato non cambia mai ──────
+        # `prov.seen` conserva le richieste così come sono partite: la seconda deve
+        # contenere la prima come prefisso ESATTO, nota inclusa (già presente quando
+        # è stata inviata) e senza riscritture successive.
+        first, second = prov.seen[0], prov.seen[1]
+        check("ctx al modello: la 2ª richiesta contiene la 1ª come prefisso esatto",
+              second[:len(first)] == first, f"{len(first)} vs {len(second)}")
+        third = prov.seen[2]
+        check("ctx al modello: la 3ª richiesta contiene la 2ª come prefisso esatto",
+              third[:len(second)] == second, f"{len(second)} vs {len(third)}")
+        check("ctx al modello: una sola nota per risultato (nessuna ri-annotazione)",
+              all((m["content"] or "").count(marker) == 1 for m in tools_msgs),
+              str([(m["content"] or "").count(marker) for m in tools_msgs]))
+
+        # ── Avviso di soglia: una volta per turno, col consiglio ─────────────
+        # Frammento DISTINTIVO: le due note iniziano entrambe con "[context: ",
+        # quindi il prefisso non distingue l'avviso dalla nota semplice.
+        warn_marker = "automatic compaction is close"
+        check("ctx al modello: le due note sono distinguibili",
+              warn_marker in _CTX_NOTE_WARN and warn_marker not in _CTX_NOTE)
+        big = cfg_for(root)
+        big.context_tell_model = True
+        big.context_window, big.compact_threshold_ratio = 100_000, 0.80
+        big.context_warn_ratio = 0.5                                    # avviso a 40k
+        prov2 = two_step_provider()
+        agent_big = coding_agent.build(big, prov2)
+        agent_big.run("leggi i file")
+        warned = [m for m in agent_big.convo.messages
+                  if isinstance(m.get("content"), str) and warn_marker in m["content"]]
+        check("ctx al modello: oltre la soglia arriva l'avviso", len(warned) == 1, str(len(warned)))
+        check("ctx al modello: l'avviso spiega cosa fare",
+              "written down now" in warned[0]["content"])
+        plain = [m for m in agent_big.convo.messages
+                 if m.get("role") == "tool" and marker in (m.get("content") or "")
+                 and warn_marker not in m["content"]]
+        check("ctx al modello: gli altri passi hanno la nota semplice", len(plain) >= 1,
+              str(len(plain)))
+
+        # Turno nuovo → l'avviso può ripresentarsi (il flag è per turno).
+        agent_big.provider = two_step_provider()
+        agent_big.run("altro giro")
+        check("ctx al modello: l'avviso è per turno, non per sessione",
+              len([m for m in agent_big.convo.messages
+                   if isinstance(m.get("content"), str) and warn_marker in m["content"]]) == 2)
+
+        # ── Turno senza tool: nessuna nota, nessun messaggio inventato ───────
+        quiet = cfg_for(root)
+        quiet.context_tell_model = True
+        agent_q = coding_agent.build(quiet, FakeProvider([LLMResponse(content="ciao")]))
+        agent_q.run("saluta")
+        check("ctx al modello: senza tool non compare (limite dichiarato)",
+              not any(marker in (m.get("content") or "")
+                      for m in agent_q.convo.messages if isinstance(m.get("content"), str)))
+    finally:
+        _os.chdir(cwd)
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def test_context_counter():
     """Contatore del contesto sempre a schermo e avviso di soglia. Il riferimento è
     la SOGLIA DI COMPATTAZIONE, non la finestra: con ratio 0.82 su 80K la
@@ -6059,6 +6176,7 @@ def main():
     test_tool_schema_contract()
     test_background_jobs()
     test_readme_in_sync()
+    test_context_told_to_model()
     test_context_counter()
     test_interject_on_interrupt()
     test_budget_abort()

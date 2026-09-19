@@ -87,7 +87,7 @@ CATALOG: tuple[Field, ...] = (
     Field("DeepSeek", "DEEPSEEK_BASE_URL", "str", "https://api.deepseek.com",
           "DeepSeek API endpoint — or any OpenAI-compatible host serving DeepSeek "
           "weights (OpenRouter, DeepInfra, ...)."),
-    Field("DeepSeek", "DEEPSEEK_MODEL", "str", "deepseek-v4-flash",
+    Field("DeepSeek", "DEEPSEEK_MODEL", "str", "deepseek-flash",
           "Fast model for the tool loop (non-thinking). V4: flash = the workhorse."),
     Field("DeepSeek", "DEEPSEEK_THINK_MODEL", "str", "deepseek-v4-pro",
           "Thinking model used with --think. V4: pro = the reasoner."),

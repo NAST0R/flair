@@ -38,6 +38,11 @@ from openai import BadRequestError
 from ..config import _model_key, deepseek_first_party
 from .base import LLMResponse, OpenAICompatProvider
 
+# Alias storici che portano la modalità NEL NOME: per loro il thinking non si
+# configura per parametro. Tutto il resto (deepseek-flash, deepseek-v4-pro, …)
+# usa il parametro.
+_LEGACY_ALIASES = ("deepseek-chat", "deepseek-reasoner")
+
 log = logging.getLogger("flair.llm.deepseek")
 
 
@@ -91,12 +96,17 @@ class DeepSeekProvider(OpenAICompatProvider):
             # Host terzi: API standard, niente estensioni proprietarie. Il thinking
             # segue i default dell'host; --think resta lo switch di modello.
             return
-        # V4 (deepseek-v4-flash / deepseek-v4-pro): thinking via parametro. Il nome
-        # è normalizzato (slug vendor con FLAIR_DEEPSEEK_FIRST_PARTY=true). NB: lato
-        # API il thinking è attivo di default anche senza parametro; qui lo rendiamo
-        # esplicito con --think e, se configurato, regoliamo l'effort (high|max —
-        # l'API mappa low/medium→high e xhigh→max per compatibilità).
-        if _model_key(model).startswith("deepseek-v4"):
+        # Modelli moderni (deepseek-flash, deepseek-v4-pro, deepseek-v4-*): thinking
+        # via PARAMETRO. Il criterio è per esclusione — tutto ciò che non è un alias
+        # legacy — invece di elencare i prefissi noti: agganciarsi a "deepseek-v4"
+        # aveva già smesso di funzionare quando il nome canonico del flash è
+        # diventato `deepseek-flash`, e --think sarebbe rimasto silenziosamente
+        # senza effetto. Il nome è normalizzato (slug vendor con
+        # FLAIR_DEEPSEEK_FIRST_PARTY=true). NB: lato API il thinking è attivo di
+        # default anche senza parametro; qui lo rendiamo esplicito con --think e,
+        # se configurato, regoliamo l'effort (high|max — l'API mappa low/medium→high
+        # e xhigh→max per compatibilità).
+        if not _model_key(model).startswith(_LEGACY_ALIASES):
             if think:
                 params["extra_body"] = {"thinking": {"type": "enabled"}}
                 if self.cfg.active.reasoning_effort:
@@ -108,4 +118,5 @@ class DeepSeekProvider(OpenAICompatProvider):
                 # a prima (nessun parametro: default server intatto).
                 params["extra_body"] = {"thinking": {"type": "enabled"}}
                 params["reasoning_effort"] = self.cfg.active.fast_reasoning_effort
-        # Alias legacy: la modalità è già nel nome del modello, niente da aggiungere.
+        # Alias legacy (deepseek-chat / deepseek-reasoner): la modalità è già nel
+        # nome del modello, niente da aggiungere.

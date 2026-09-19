@@ -2820,7 +2820,7 @@ def test_cost_attribution():
     try:
         # ── price_for: listino del modello indicato, non del modello attivo ──
         check("costi: price_for distingue flash e pro",
-              price_for("deepseek", "deepseek-v4-flash") == (0.007, 0.22, 0.66)
+              price_for("deepseek", "deepseek-flash") == (0.003, 0.15, 0.6)
               and price_for("deepseek", "deepseek-v4-pro") == (0.022, 0.66, 1.98))
         _os.environ["FLAIR_PRICE_CACHE_MISS"] = "9.9"
         check("costi: override env vince campo per campo, su ogni modello",
@@ -2841,9 +2841,9 @@ def test_cost_attribution():
         ds = DeepSeekProvider(cfgd)
         u = Usage(prompt_tokens=1_000_000, completion_tokens=1_000_000,
                   cache_hit_tokens=0, cache_miss_tokens=1_000_000)
-        flash = ds._request_cost(u, "deepseek-v4-flash")
+        flash = ds._request_cost(u, "deepseek-flash")
         pro = ds._request_cost(u, "deepseek-v4-pro")
-        check("costi: richiesta prezzata col modello reale (flash)", abs(flash - (0.22 + 0.66)) < 1e-9, flash)
+        check("costi: richiesta prezzata col modello reale (flash)", abs(flash - (0.15 + 0.6)) < 1e-9, flash)
         check("costi: richiesta prezzata col modello reale (pro)", abs(pro - (0.66 + 1.98)) < 1e-9, pro)
 
         # ── estimate_cost: preferisce l'accumulato, ricade sull'aggregato ────
@@ -3765,15 +3765,37 @@ def test_pricing_bands():
 
     # ── resolve_pricing: fascia giusta per la famiglia DeepSeek ──────────────
     off, peak = utc(12), utc(7)
-    check("fasce: flash off-peak", resolve_pricing("deepseek", "deepseek-v4-flash", off) == (0.007, 0.22, 0.66))
-    check("fasce: flash peak = 2x", resolve_pricing("deepseek", "deepseek-v4-flash", peak) == (0.014, 0.44, 1.32))
+    check("fasce: flash off-peak", resolve_pricing("deepseek", "deepseek-flash", off) == (0.003, 0.15, 0.6))
+    check("fasce: flash peak = 2x", resolve_pricing("deepseek", "deepseek-flash", peak) == (0.006, 0.3, 1.2))
+
+    # ── Weekend: interamente off-peak (il listino limita le fasce a lun-ven) ──
+    # 2026-08-17 è un lunedì; 22 e 23 sono sabato e domenica.
+    sat, sun = _dt(2026, 8, 22, 7, 0, tzinfo=_tz.utc), _dt(2026, 8, 23, 2, 0, tzinfo=_tz.utc)
+    check("fasce: sabato in orario alto è off-peak", is_peak_hour(sat) is False)
+    check("fasce: domenica in orario alto è off-peak", is_peak_hour(sun) is False)
+    check("fasce: lunedì stessa ora è peak", is_peak_hour(utc(7)) is True)
+    check("fasce: nel weekend il prezzo è quello basso",
+          resolve_pricing("deepseek", "deepseek-flash", sat) == (0.003, 0.15, 0.6))
+
+    # ── Slug: canonico, legacy e vision-exp condividono il listino Flash ─────
+    # I nomi legacy sono ancora accettati ma i modelli dietro sono ritirati: le
+    # richieste vanno a V4.1-Flash e sono fatturate al prezzo Flash.
+    flash_off = (0.003, 0.15, 0.6)
+    for slug in ("deepseek-flash", "deepseek-v4-flash", "deepseek-v4-flash-vision-exp",
+                 "deepseek-chat", "deepseek-reasoner", "deepseek-ai/DeepSeek-V4.1-Flash-0813"):
+        check(f"slug: «{slug}» prezzato come Flash",
+              resolve_pricing("deepseek", slug, off) == flash_off,
+              str(resolve_pricing("deepseek", slug, off)))
+    check("slug: il Pro resta sul proprio listino (invariato)",
+          resolve_pricing("deepseek", "deepseek-v4-pro", off) == (0.022, 0.66, 1.98)
+          and resolve_pricing("deepseek", "deepseek-v4-pro", peak) == (0.044, 1.32, 3.96))
     check("fasce: pro off-peak", resolve_pricing("deepseek", "deepseek-v4-pro", off) == (0.022, 0.66, 1.98))
     check("fasce: pro peak = 2x", resolve_pricing("deepseek", "deepseek-v4-pro", peak) == (0.044, 1.32, 3.96))
     check("fasce: prefisso più lungo vince anche in peak",
           resolve_pricing("deepseek", "deepseek-v4-pro-0813", peak) == (0.044, 1.32, 3.96))
     check("fasce: fallback provider deepseek segue la fascia",
-          resolve_pricing("deepseek", "sconosciuto", off) == (0.007, 0.22, 0.66)
-          and resolve_pricing("deepseek", "sconosciuto", peak) == (0.014, 0.44, 1.32))
+          resolve_pricing("deepseek", "sconosciuto", off) == (0.003, 0.15, 0.6)
+          and resolve_pricing("deepseek", "sconosciuto", peak) == (0.006, 0.3, 1.2))
 
     # ── I listini senza fasce restano piatti in ogni ora ─────────────────────
     check("fasce: openai piatto a ogni ora",
@@ -3786,7 +3808,7 @@ def test_pricing_bands():
     # banded=False (lo decide il provider dal proprio endpoint) e ottiene il listino
     # base anche in ora peak.
     check("fasce: slug reseller → famiglia giusta, flat con banded=False",
-          resolve_pricing("openai", "deepseek/deepseek-v4-flash", peak, banded=False) == (0.007, 0.22, 0.66)
+          resolve_pricing("openai", "deepseek/deepseek-flash", peak, banded=False) == (0.003, 0.15, 0.6)
           and resolve_pricing("deepseek", "deepseek-ai/DeepSeek-V4-Pro-0813", peak, banded=False) == (0.022, 0.66, 1.98))
 
     # ── Override env: FLAIR_PRICE_* ovunque, *_PEAK vince solo in fascia alta ─
@@ -3818,11 +3840,11 @@ def test_pricing_bands():
         _fc.is_peak_hour = lambda when=None: False
         low = ds._request_cost(u, "deepseek-v4-flash")
         _fc.is_peak_hour = lambda when=None: True
-        high = ds._request_cost(u, "deepseek-v4-flash")
+        high = ds._request_cost(u, "deepseek-flash")
     finally:
         _fc.is_peak_hour = real_peak
     check("fasce: la STESSA richiesta costa 2x in peak (attribuzione a request-time)",
-          abs(low - (0.22 + 0.66)) < 1e-9 and abs(high - (0.44 + 1.32)) < 1e-9 and abs(high - 2 * low) < 1e-9)
+          abs(low - (0.15 + 0.6)) < 1e-9 and abs(high - (0.3 + 1.2)) < 1e-9 and abs(high - 2 * low) < 1e-9)
 
 
 def test_cache_friendly_summary():
@@ -4103,17 +4125,36 @@ def test_deepseek_endpoint_profiles():
     try:
         u = Usage(prompt_tokens=1_000_000, completion_tokens=1_000_000, cache_miss_tokens=1_000_000)
         check("profili: richiesta sui terzi prezzata flat anche in peak",
-              abs(dc._request_cost(u, "deepseek-ai/DeepSeek-V4-Flash-0731") - (0.22 + 0.66)) < 1e-9)
+              abs(dc._request_cost(u, "deepseek-ai/DeepSeek-V4.1-Flash-0813") - (0.15 + 0.6)) < 1e-9)
         check("profili: richiesta first-party prezzata in fascia (2x)",
-              abs(ds._request_cost(u, "deepseek-v4-flash") - (0.44 + 1.32)) < 1e-9)
+              abs(ds._request_cost(u, "deepseek-flash") - (0.3 + 1.2)) < 1e-9)
         cfg2.refresh_pricing()
         check("profili: snapshot prezzi flat sui terzi (peak ignorato)",
-              (cfg2.price_cache_hit, cfg2.price_cache_miss, cfg2.price_output) == (0.007, 0.22, 0.66))
+              (cfg2.price_cache_hit, cfg2.price_cache_miss, cfg2.price_output) == (0.003, 0.15, 0.6))
         cfg.refresh_pricing()
         check("profili: snapshot prezzi a fasce sull'ufficiale",
-              (cfg.price_cache_hit, cfg.price_cache_miss, cfg.price_output) == (0.014, 0.44, 1.32))
+              (cfg.price_cache_hit, cfg.price_cache_miss, cfg.price_output) == (0.006, 0.3, 1.2))
     finally:
         _fc.is_peak_hour = real_peak
+
+    # ── Il thinking si configura per ESCLUSIONE, non per prefisso noto ───────
+    # Regressione reale: il criterio era `startswith("deepseek-v4")`, e quando il
+    # nome canonico del flash è diventato `deepseek-flash` il parametro ha smesso
+    # di partire — `--think` sarebbe rimasto senza effetto, in silenzio.
+    cfg_th = cfg_for(Path("."))
+    cfg_th.provider = "deepseek"
+    ds_th = DeepSeekProvider(cfg_th)
+    for slug in ("deepseek-flash", "deepseek-v4-pro", "deepseek-v4-flash",
+                 "deepseek-ai/DeepSeek-V4.1-Flash-0813"):
+        cfg_th.deepseek.think_model = slug
+        params = ds_th._build_params([], None, think=True, max_tokens=64)
+        check(f"thinking: «{slug}» riceve il parametro",
+              params.get("extra_body") == {"thinking": {"type": "enabled"}}, str(params))
+    for alias in ("deepseek-chat", "deepseek-reasoner"):
+        cfg_th.deepseek.think_model = alias
+        params = ds_th._build_params([], None, think=True, max_tokens=64)
+        check(f"thinking: l'alias legacy «{alias}» porta la modalità nel nome",
+              "extra_body" not in params, str(params))
 
     # ── Cintura: endpoint che rigetta il passback → retry compat una-tantum ───
     cfg3 = cfg_for(Path("."))

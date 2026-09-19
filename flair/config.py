@@ -80,14 +80,20 @@ def _model_key(model: str) -> str:
 # in MODEL_PRICING_PEAK e vengono selezionate da resolve_pricing in base all'ora
 # UTC della richiesta. I listini senza fasce (OpenAI, local) restano piatti.
 MODEL_PRICING: dict[str, tuple[float, float, float]] = {
-    # DeepSeek (USD/1M: cache-hit, input, output), listino OFF-PEAK. V4-flash è
-    # il workhorse; V4-pro il reasoner di punta. Gli alias legacy mappano su flash.
-    # Fonte: api-docs.deepseek.com/quick_start/pricing (verificati 2026-08-17).
-    "deepseek-v4-flash": (0.007, 0.22, 0.66),
+    # DeepSeek (USD/1M: cache-hit, input, output), listino OFF-PEAK.
+    # Fonte: api-docs.deepseek.com/quick_start/pricing (verificati 2026-09-20).
+    # `deepseek-flash` è il nome canonico, servito da DeepSeek-V4.1-Flash (l'unico
+    # dei due che vede le immagini); `deepseek-v4-pro` è il reasoner, prezzo
+    # invariato. I nomi legacy — deepseek-v4-flash, la variante vision-exp e i due
+    # alias storici — sono ancora accettati ma i modelli dietro sono RITIRATI: le
+    # richieste vengono servite da V4.1-Flash e fatturate al prezzo Flash, quindi
+    # qui condividono lo stesso listino invece di conservare i numeri vecchi.
+    "deepseek-flash": (0.003, 0.15, 0.6),
     "deepseek-v4-pro": (0.022, 0.66, 1.98),
-    "deepseek-chat": (0.007, 0.22, 0.66),
-    "deepseek-reasoner": (0.007, 0.22, 0.66),
-    "deepseek-v4": (0.007, 0.22, 0.66),
+    "deepseek-v4-flash": (0.003, 0.15, 0.6),
+    "deepseek-chat": (0.003, 0.15, 0.6),
+    "deepseek-reasoner": (0.003, 0.15, 0.6),
+    "deepseek-v4": (0.003, 0.15, 0.6),
     # OpenAI (approssimati, USD/1M; verificati 2026-07, sovrascrivibili via env)
     "gpt-4.1-nano": (0.025, 0.10, 0.40),
     "gpt-4.1-mini": (0.10, 0.40, 1.60),
@@ -112,33 +118,43 @@ MODEL_PRICING: dict[str, tuple[float, float, float]] = {
 # con prefisso vendor che non matchano queste chiavi, e correttamente ricadono
 # sul fallback piatto del provider.
 MODEL_PRICING_PEAK: dict[str, tuple[float, float, float]] = {
-    "deepseek-v4-flash": (0.014, 0.44, 1.32),
+    "deepseek-flash": (0.006, 0.3, 1.2),
     "deepseek-v4-pro": (0.044, 1.32, 3.96),
-    "deepseek-chat": (0.014, 0.44, 1.32),
-    "deepseek-reasoner": (0.014, 0.44, 1.32),
-    "deepseek-v4": (0.014, 0.44, 1.32),
+    "deepseek-v4-flash": (0.006, 0.3, 1.2),
+    "deepseek-chat": (0.006, 0.3, 1.2),
+    "deepseek-reasoner": (0.006, 0.3, 1.2),
+    "deepseek-v4": (0.006, 0.3, 1.2),
 }
 _PROVIDER_FALLBACK = {
-    "deepseek": (0.007, 0.22, 0.66),      # off-peak flash
+    "deepseek": (0.003, 0.15, 0.6),       # off-peak flash
     "openai": (0.075, 0.15, 0.60),
     "local": (0.0, 0.0, 0.0),   # inference locale: il costo vero è la bolletta
 }
 _PROVIDER_FALLBACK_PEAK = {
-    "deepseek": (0.014, 0.44, 1.32),
+    "deepseek": (0.006, 0.3, 1.2),
 }
 
 # Fasce peak del listino DeepSeek, [inizio, fine) in ore UTC. Definite in UTC
 # dal listino ufficiale — quindi immuni all'ora legale per costruzione (in
-# Italia: 03-06 e 08-12 col DST estivo, un'ora prima in inverno).
+# Italia: 03-06 e 08-12 col DST estivo, un'ora prima in inverno). Valgono dal
+# LUNEDÌ al VENERDÌ: weekend interamente off-peak.
 _PEAK_RANGES_UTC: tuple[tuple[int, int], ...] = ((1, 4), (6, 10))
+# Il listino esclude dalle fasce alte anche i festivi cinesi. NON sono modellati
+# di proposito: servirebbe una tabella di date che invecchia ogni anno, e l'errore
+# che resta è sempre per ECCESSO (si stima il doppio del vero in quei pochi
+# giorni), mai per difetto — preferibile a un calendario silenziosamente scaduto.
 
 
 def is_peak_hour(when: datetime | None = None) -> bool:
-    """True se `when` (default: adesso) cade nelle fasce peak DeepSeek.
-    I datetime naive sono interpretati come UTC; quelli aware vengono convertiti."""
+    """True se `when` (default: adesso) cade nelle fasce peak DeepSeek: orario UTC
+    nelle finestre alte E giorno feriale. I datetime naive sono interpretati come
+    UTC; quelli aware vengono convertiti. Nel weekend è sempre off-peak — prima si
+    guardava la sola ora, e il sabato mattina la stima raddoppiava a torto."""
     now = when if when is not None else datetime.now(timezone.utc)
     if now.tzinfo is not None:
         now = now.astimezone(timezone.utc)
+    if now.weekday() >= 5:            # 5 = sabato, 6 = domenica
+        return False
     return any(a <= now.hour < b for a, b in _PEAK_RANGES_UTC)
 
 
@@ -399,7 +415,7 @@ def load_config() -> Config:
     deepseek = ProviderConfig(
         api_key=os.getenv("DEEPSEEK_API_KEY", ""),
         base_url=os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
-        model=os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash"),
+        model=os.getenv("DEEPSEEK_MODEL", "deepseek-flash"),
         think_model=os.getenv("DEEPSEEK_THINK_MODEL", "deepseek-v4-pro"),
         temperature=_float("DEEPSEEK_TEMPERATURE", 0.0),
         reasoning_effort=os.getenv("DEEPSEEK_REASONING_EFFORT") or None,

@@ -2895,6 +2895,7 @@ def test_english_surface():
     # sfuggiti i residui di bcfef91^ (header di compaction, overflow di list_dir,
     # suffisso di explore). Si asseriscono le costanti/funzioni che li generano
     # e un output prodotto davvero, così la classe di bug resta chiusa.
+    from flair.cli import _REMEMBER_PREFIX as _REMEMBER_PREFIX_CLI
     from flair.core.agent import (
         _ATTACHED_IMAGES_PREFIX,
         _COMPACT_PROMPT,
@@ -2914,6 +2915,7 @@ def test_english_surface():
         "istruzione summarize su prefisso": _SUMMARIZE_ON_PREFIX,
         "header allegati immagine": _ATTACHED_IMAGES_PREFIX,
         "nota contesto al modello": _CTX_NOTE,
+        "nota di /remember al modello": _REMEMBER_PREFIX_CLI,
         "avviso contesto al modello": _CTX_NOTE_WARN,
         "nota immagine rigettata": _IMAGE_REJECTED_NOTE,
         "stub prune": STUB,
@@ -3133,7 +3135,12 @@ def test_remember_command():
 
     out = run("build with make -j4")
     check("/remember: nota inserita", "build with make -j4" in cli.memory.notes, cli.memory.notes)
-    check("/remember: conferma con conteggio", "✓ noted." in out and "1 in memory" in out, out)
+    check("/remember: conferma con conteggio", "✓ noted" in out and "1 in memory" in out, out)
+    # Spazi normalizzati: rich va a capo alla larghezza della console, e la frase
+    # può spezzarsi proprio dentro l'espressione cercata.
+    flat = " ".join(out.split())
+    check("/remember: in sessione non salvata dice che la nota vale fino all'uscita",
+          "lasts until you exit" in flat and "/save" in flat, flat)
     check("/remember: prompt intatto a metà sessione (prefisso in cache preservato)",
           "build with make -j4" not in cli.agents["coding"].system_prompt)
     cli._refresh_memory_prompts()   # simula il confine di sessione
@@ -5777,6 +5784,110 @@ def test_readme_in_sync():
           stale is None, stale.group(0) if stale else "")
 
 
+def test_remember_reaches_model():
+    """/remember deve arrivare AL MODELLO nella stessa sessione, senza MAI rompere la
+    cache. Prima la nota restava solo in memoria: il system prompt non si tocca a
+    metà sessione e nella conversazione non entrava nulla, quindi il modello non
+    aveva alcun canale per saperlo — e alla domanda «hai qualcosa da ricordare?»
+    rispondeva, onestamente, di no."""
+    import io as _io
+    import os as _os
+    import tempfile as _tf
+
+    from rich.console import Console as _Console
+
+    from flair.cli import _REMEMBER_PREFIX, CLI
+
+    root = Path(_tf.mkdtemp(prefix="flair_remvis_")).resolve()
+    cwd = _os.getcwd()
+    try:
+        cfg = cfg_for(root)
+        cli = CLI(cfg)
+        cli.console = _Console(file=_io.StringIO(), width=200)
+        prov = FakeProvider([LLMResponse(content="primo"), LLMResponse(content="secondo"),
+                             LLMResponse(content="terzo")])
+        for ag in cli.agents.values():
+            ag.provider = prov
+        cli.provider = prov
+
+        cli.run_task("ciao", agent_key="coding")
+        first = [dict(m) for m in prov.seen[0]]
+        prompt_before = cli.agents["coding"].system_prompt
+
+        cli._dispatch("/remember il server di staging è 10.0.0.42")
+        check("remember→modello: la nota è in coda per il prossimo messaggio",
+              cli._pending_notes == ["il server di staging è 10.0.0.42"], str(cli._pending_notes))
+
+        cli.run_task("hai qualcosa da ricordare?", agent_key="coding")
+        second = prov.seen[1]
+        last_user = [m for m in second if m.get("role") == "user"][-1]["content"]
+
+        # ── La nota ARRIVA al modello ────────────────────────────────────────
+        check("remember→modello: la nota è nel messaggio che il modello riceve",
+              "il server di staging è 10.0.0.42" in last_user, last_user[:120])
+        check("remember→modello: è marcata come richiesta di memoria",
+              last_user.startswith(_REMEMBER_PREFIX), last_user[:80])
+        check("remember→modello: segue il testo originale del turno",
+              last_user.endswith("hai qualcosa da ricordare?"), last_user[-60:])
+
+        # ── La cache NON si rompe ────────────────────────────────────────────
+        check("remember→modello: il system prompt NON è cambiato a metà sessione",
+              cli.agents["coding"].system_prompt == prompt_before)
+        check("remember→modello: la 2ª richiesta contiene la 1ª come prefisso esatto",
+              second[:len(first)] == first, f"{len(first)} vs {len(second)}")
+        check("remember→modello: nessun messaggio utente consecutivo (template locali)",
+              all(not (a.get("role") == b.get("role") == "user")
+                  for a, b in zip(second, second[1:], strict=False)))
+
+        # ── Consegnata UNA volta sola ────────────────────────────────────────
+        check("remember→modello: la coda si svuota dopo la consegna", cli._pending_notes == [])
+        cli.run_task("e adesso?", agent_key="coding")
+        third_user = [m for m in prov.seen[2] if m.get("role") == "user"][-1]["content"]
+        check("remember→modello: il turno successivo non la ripete",
+              _REMEMBER_PREFIX not in third_user, third_user[:80])
+        check("remember→modello: la 3ª richiesta contiene la 2ª come prefisso esatto",
+              prov.seen[2][:len(second)] == second)
+
+        # ── Ai confini entra nel prompt e la coda non la duplica ─────────────
+        cli._dispatch("/remember seconda nota")
+        cli._refresh_memory_prompts()                 # confine (/load, /root, …)
+        check("remember→modello: al confine la coda si svuota (niente doppioni)",
+              cli._pending_notes == [])
+        check("remember→modello: e la nota è nel system prompt",
+              "seconda nota" in cli.agents["coding"].system_prompt)
+
+        # ── /memory clear: le note in coda non vanno più consegnate ──────────
+        cli._dispatch("/remember da cancellare")
+        cli.console.input = lambda _p: "y"   # type: ignore[method-assign]
+        cli._dispatch("/memory clear")
+        check("remember→modello: dopo /memory clear nulla resta in coda",
+              cli._pending_notes == [], str(cli._pending_notes))
+
+        # ── Più note prima del turno: tutte, in ordine ───────────────────────
+        cli._dispatch("/remember prima")
+        cli._dispatch("/remember seconda")
+        delivered = cli._deliver_notes("task")
+        check("remember→modello: più note consegnate tutte e in ordine",
+              delivered.index("prima") < delivered.index("seconda") < delivered.index("task"),
+              delivered)
+
+        # ── Il router classifica sul testo ORIGINALE ─────────────────────────
+        seen_route: list[str] = []
+        from flair.core import router as _router
+        real_classify = _router.classify
+        _router.classify = lambda text, *a, **k: (seen_route.append(text), "coding")[1]
+        try:
+            cli._dispatch("/remember nota non per il router")
+            cli.run_task("apri il browser")
+        finally:
+            _router.classify = real_classify
+        check("remember→modello: il router vede solo il testo dell'utente",
+              seen_route == ["apri il browser"], str(seen_route))
+    finally:
+        _os.chdir(cwd)
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def test_context_told_to_model():
     """Contatore del contesto mostrato AL MODELLO (FLAIR_CTX_TELL_MODEL).
 
@@ -6217,6 +6328,7 @@ def main():
     test_tool_schema_contract()
     test_background_jobs()
     test_readme_in_sync()
+    test_remember_reaches_model()
     test_context_told_to_model()
     test_context_counter()
     test_interject_on_interrupt()

@@ -184,6 +184,8 @@ _COMMANDS: tuple[tuple[str, str, str, str], ...] = (
     ("help", "/help", "this help", "_cmd_help"),
 )
 _QUIT_WORDS = ("exit", "quit", "q")
+# Una nota di /remember viaggia nel PROSSIMO messaggio dell'utente, come prefisso.
+_REMEMBER_PREFIX = "[The user asked you to remember this (it is now in the session memory): "
 
 
 class CLI:
@@ -201,6 +203,8 @@ class CLI:
         self._always_allow: set[str] = set()
         self._cost_warned = False
         self._ctx_warned = False
+        # Note di /remember non ancora viste dal modello (v. _deliver_notes).
+        self._pending_notes: list[str] = []
         # "human" (REPL/default), "json" o "quiet": le ultime due sono per l'uso
         # non presidiato (-p) e silenziano l'output decorato su stdout.
         self.output_mode = "human"
@@ -331,6 +335,10 @@ class CLI:
         block = self.memory.block() if self.cfg.memory_enabled else ""
         for key, ag in self.agents.items():
             ag.system_prompt = self._base_prompts[key] + block
+        # Da qui le note stanno nel system prompt: consegnarle anche nel prossimo
+        # messaggio le duplicherebbe. Vale anche per /memory clear, dove le note
+        # in coda sono state cancellate e non vanno più consegnate.
+        self._pending_notes.clear()
 
     # ── sessioni (persistenza) ────────────────────────────────────────────────
 
@@ -354,12 +362,24 @@ class CLI:
             return
         ok, msg = self.memory.add(note)
         if ok:
-            # NIENTE _refresh_memory_prompts qui: stesso contratto del tool
-            # `remember` dell'agente — toccare il system prompt a metà sessione
-            # romperebbe il prefisso in cache. La nota entra nel prompt al
-            # prossimo confine di sessione (avvio, /load, /root, /memory clear).
+            # NIENTE _refresh_memory_prompts qui: toccare il system prompt a metà
+            # sessione romperebbe il prefisso in cache. Ma lasciare la nota solo in
+            # memoria la rendeva INVISIBILE al modello fino al prossimo confine —
+            # nessun canale da cui saperlo, e alla domanda «hai qualcosa da
+            # ricordare?» rispondeva onestamente di no. La nota viene quindi accodata
+            # e consegnata nel PROSSIMO messaggio dell'utente (v. _deliver_notes):
+            # append-only, cache intatta, visibile subito.
+            self._pending_notes.append(self.memory.notes[-1])
             self._save_session()             # sessione salvata → sidecar aggiornato
-            self.console.print(f"[green]✓ noted.[/green] [dim]({len(self.memory.notes)} in memory)[/dim]\n")
+            count = f"[dim]({len(self.memory.notes)} in memory)[/dim]"
+            if self.session_name:
+                self.console.print(f"[green]✓ noted.[/green] {count}\n")
+            else:
+                # «Nota durevole» sarebbe una promessa falsa: senza sessione salvata
+                # la memoria vive nel processo e finisce con lui.
+                self.console.print(
+                    f"[green]✓ noted[/green] {count} [dim]— this session is not saved, so the "
+                    f"note lasts until you exit: /save <name> keeps it.[/dim]\n")
         else:
             self.console.print(f"[yellow]⚠ {msg}[/yellow]\n")
 
@@ -715,6 +735,22 @@ class CLI:
         finally:
             self._shutdown_jobs()
 
+    def _deliver_notes(self, task: str) -> str:
+        """Il testo del turno con, in testa, le note di /remember non ancora viste
+        dal modello — che poi escono dalla coda.
+
+        CACHE: la nota entra come parte di un messaggio NUOVO, quindi è
+        append-only e il prefisso già inviato resta byte-identico. È un prefisso
+        del messaggio dell'utente e non un messaggio a sé: due messaggi utente
+        consecutivi sono rifiutati da alcuni template di chat dei server locali.
+        Il router classifica sul testo originale (v. run_task): le note non devono
+        spostare la scelta dell'agente."""
+        if not self._pending_notes:
+            return task
+        head = "\n".join(f"{_REMEMBER_PREFIX}{n}]" for n in self._pending_notes)
+        self._pending_notes.clear()
+        return f"{head}\n\n{task}"
+
     def run_task(self, task: str, agent_key: str | None = None, think: bool = False,
                  attachments: list[dict] | None = None):
         if agent_key is None:
@@ -723,9 +759,10 @@ class CLI:
         agent = self.agents[agent_key]
         # Allegati (/img, --image): il content del turno diventa multipart, ma il
         # router classifica sul TESTO e il JSONL logga il testo — mai i blob base64.
-        content: str | list = task
+        delivered = self._deliver_notes(task)
+        content: str | list = delivered
         if attachments:
-            content = [{"type": "text", "text": task}, *attachments]
+            content = [{"type": "text", "text": delivered}, *attachments]
         self._turn_tools = []
         self._mid_line = False
         # L'avviso sul contesto è UNA volta per turno: ripeterlo a ogni tool sarebbe

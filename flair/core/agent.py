@@ -455,10 +455,36 @@ class Agent:
         if decision != "continue":
             return False
         if note:
-            self.convo.messages.append({"role": "user",
-                                        "content": f"{_INTERJECT_PREFIX}{note}]"})
+            self._append_user_note(f"{_INTERJECT_PREFIX}{note}]")
         self._flush_pending_images()
         return True
+
+    def _append_user_note(self, text: str) -> None:
+        """Consegna al modello un testo dell'utente arrivato a turno in corso.
+
+        Di norma è un messaggio utente nuovo, dopo i risultati dei tool. Ma se
+        l'ultimo messaggio è GIÀ un messaggio utente — succede interrompendo la
+        primissima chiamata del turno, quando in coda c'è ancora la richiesta — un
+        secondo messaggio utente consecutivo verrebbe rifiutato da alcuni template
+        di chat locali (quelli che impongono l'alternanza dei ruoli, come Gemma),
+        cioè il turno fallirebbe proprio mentre lo si sta correggendo. In quel caso
+        il testo si ACCODA al contenuto di quel messaggio.
+
+        CACHE: quel messaggio non è stato confermato (indice >= sent_upto: la
+        chiamata è stata interrotta), e comunque si aggiunge in CODA al suo
+        contenuto senza riscriverlo — il testo originale resta prefisso, quindi
+        anche un server che ne avesse già messo in cache una parte la riutilizza."""
+        last_idx = len(self.convo.messages) - 1
+        last = self.convo.messages[last_idx] if last_idx >= 0 else None
+        if last is not None and last.get("role") == "user" and last_idx >= self.convo.sent_upto:
+            content = last.get("content")
+            if isinstance(content, str):
+                last["content"] = f"{content}\n\n{text}"
+                return
+            if isinstance(content, list):
+                last["content"] = [*content, {"type": "text", "text": text}]
+                return
+        self.convo.messages.append({"role": "user", "content": text})
 
     def _tell_context(self) -> None:
         """Fa vedere al MODELLO quanto contesto resta, se FLAIR_CTX_TELL_MODEL è
@@ -486,7 +512,7 @@ class Agent:
         if idx is None:
             return
         tokens = self._ctx_estimate()
-        threshold = max(1, int(self.cfg.context_window * self.cfg.compact_threshold_ratio))
+        threshold = self.cfg.compact_threshold
         warn_at = getattr(self.cfg, "context_warn_ratio", 0.0)
         used, limit = f"{tokens / 1000:.0f}k", f"{threshold / 1000:.0f}k"
         if warn_at > 0 and tokens / threshold >= warn_at and not self._ctx_warned_model:

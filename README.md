@@ -133,7 +133,7 @@ FLAIR_AUTO_APPROVE=false           # confirmation for destructive tools
 ```
 
 All parameters are in `.env.example`, commented one by one — that file is the exhaustive
-reference (76 variables), this is only the minimum to get started. The families it covers:
+reference, this is only the minimum to get started. The families it covers:
 generation and loop caps, context management (window, compaction ratio, stage-0 pruning
 hysteresis, estimate calibration, `FLAIR_CTX_WARN`), **vision** (per-slot flags, image
 downscaling, token estimate), **background jobs** (`FLAIR_BG_*`: concurrency, output buffer,

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import logging
 import re
+import weakref
 
 log = logging.getLogger(__name__)
 
@@ -128,6 +129,24 @@ def _classify_heuristic(text: str, last_agent: str | None) -> str:
     return "general"
 
 
+# Provider il cui modello spende i pochi token del router in RAGIONAMENTO e non
+# arriva mai a scrivere l'etichetta (modelli thinking con il ragionamento attivo
+# lato server, tipicamente in locale). Per loro la chiamata non può decidere
+# nulla: tenerla vorrebbe dire pagarla — in latenza o in denaro — a ogni turno per
+# ricadere comunque sull'euristica, e in silenzio. Insieme di riferimenti DEBOLI:
+# cambiando provider (/provider) l'istanza nuova viene ri-provata da capo, quella
+# vecchia esce da sola dal registro.
+_ROUTER_CANNOT_ANSWER: weakref.WeakSet = weakref.WeakSet()
+
+
+def _reasoned_instead_of_answering(resp) -> bool:
+    """La risposta è vuota perché il budget è finito nel ragionamento — non per
+    un'etichetta inattesa, che è un caso diverso e occasionale."""
+    if (resp.content or "").strip():
+        return False
+    return bool(getattr(resp, "reasoning", "")) or getattr(resp, "finish_reason", None) == "length"
+
+
 def classify(text: str, provider, last_agent: str | None = None, convo=None) -> str:
     """Decide l'agente del turno. Le continuazioni nude ("procedi", "ok", "vai"…)
     restano deterministicamente sull'agente corrente, senza chiamata LLM (vedi
@@ -138,6 +157,8 @@ def classify(text: str, provider, last_agent: str | None = None, convo=None) -> 
     è costo reale e va contato."""
     if last_agent in ("coding", "general") and _is_bare_continuation(text):
         return last_agent
+    if provider in _ROUTER_CANNOT_ANSWER:
+        return _classify_heuristic(text, last_agent)
     hint = ""
     if last_agent in ("coding", "general"):
         hint = f"\n\n(Current mode: {last_agent}. Keep it if the request is consistent.)"
@@ -151,6 +172,14 @@ def classify(text: str, provider, last_agent: str | None = None, convo=None) -> 
         )
         if convo is not None:
             convo.total_usage = convo.total_usage + resp.usage
+        if _reasoned_instead_of_answering(resp):
+            # Detto UNA volta, e da qui in poi niente più chiamata: era il caso più
+            # costoso proprio perché invisibile.
+            _ROUTER_CANNOT_ANSWER.add(provider)
+            log.warning("LLM router: the model spent its tiny answer budget reasoning and "
+                        "returned no label; using the heuristic router for the rest of "
+                        "this session.")
+            return _classify_heuristic(text, last_agent)
         ans = (resp.content or "").strip().lower()
         if "cod" in ans:
             return "coding"

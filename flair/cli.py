@@ -440,7 +440,7 @@ class CLI:
         if not self.last_agent:
             return None
         tokens, _frac = self.agents[self.last_agent].context_fill()
-        threshold = max(1, int(self.cfg.context_window * self.cfg.compact_threshold_ratio))
+        threshold = self.cfg.compact_threshold
         return tokens, threshold, tokens / threshold
 
     def _ctx_badge(self) -> str:

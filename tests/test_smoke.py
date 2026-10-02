@@ -5782,6 +5782,125 @@ def test_readme_in_sync():
     stale = _re.search(r"~\s?\d{3,}\s+assertions", readme)
     check("README: nessun conteggio di asserzioni cablato (invecchia a ogni commit)",
           stale is None, stale.group(0) if stale else "")
+    # Stessa classe per le variabili d'ambiente: «(76 variables)» era già falso
+    # quando la 77ª è stata aggiunta. Un minimo arrotondato («1300+ assertions»)
+    # resta vero crescendo; un numero esatto no.
+    exact = _re.search(r"\(\s*\d+\s+variables?\s*\)", readme)
+    check("README: nessun conteggio esatto di variabili cablato",
+          exact is None, exact.group(0) if exact else "")
+
+
+def test_audit_fixes():
+    """Correzioni dall'audit: interlocuzione al primo passo senza messaggi utente
+    consecutivi, router che smette di sprecare la chiamata sui modelli che
+    ragionano invece di rispondere, soglia di compattazione da UNA sola fonte."""
+    import tempfile as _tf
+
+    from flair.core import router as _router
+    from flair.core.agent import _INTERJECT_PREFIX
+
+    root = Path(_tf.mkdtemp(prefix="flair_audit_")).resolve()
+    try:
+        # ── Interlocuzione al passo 0: nessun messaggio utente consecutivo ────
+        class InterruptFirst(FakeProvider):
+            def complete(self, messages, **kw):
+                if not self.seen:
+                    self.seen.append([dict(m) for m in messages])
+                    raise KeyboardInterrupt
+                return super().complete(messages, **kw)
+
+        prov = InterruptFirst([LLMResponse(content="ripreso")])
+        ag = coding_agent.build(cfg_for(root), prov, on_interrupt=lambda: ("continue", "sii breve"))
+        res = ag.run("spiegami il modulo X")
+        roles = [m["role"] for m in ag.convo.messages]
+        check("audit: Ctrl-C al primo passo → nessun messaggio utente consecutivo",
+              not any(a == b == "user" for a, b in zip(roles, roles[1:], strict=False)), str(roles))
+        first = ag.convo.messages[0]["content"]
+        check("audit: il task originale resta PREFISSO del messaggio (cache)",
+              first.startswith("spiegami il modulo X"), first[:60])
+        check("audit: e la nota è arrivata al modello",
+              _INTERJECT_PREFIX in first and "sii breve" in first, first)
+        check("audit: il turno si conclude", res.stopped_reason == "done", res.stopped_reason)
+        # Il modello ha ricevuto UN messaggio utente, che contiene entrambe le cose.
+        sent = prov.seen[-1]
+        check("audit: la richiesta successiva alterna correttamente i ruoli",
+              [m["role"] for m in sent if m["role"] != "system"] == ["user"],
+              str([m["role"] for m in sent]))
+
+        # Con un allegato (contenuto multipart) la nota diventa una parte di testo in coda.
+        prov_mm = InterruptFirst([LLMResponse(content="ok")])
+        ag_mm = coding_agent.build(cfg_for(root), prov_mm, on_interrupt=lambda: ("continue", "guarda in basso"))
+        ag_mm.run([{"type": "text", "text": "cosa vedi?"},
+                   {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}])
+        mm = ag_mm.convo.messages[0]["content"]
+        check("audit: con allegato la nota è una parte di testo IN CODA",
+              isinstance(mm, list) and mm[0]["text"] == "cosa vedi?" and "guarda in basso" in mm[-1]["text"],
+              str(mm)[:120])
+
+        # Dopo i tool il comportamento resta quello di prima: messaggio nuovo.
+        calls: list[int] = []
+
+        def gate(name, args):
+            calls.append(1)
+            if len(calls) == 1:
+                raise KeyboardInterrupt
+            return True
+
+        cfg_g = cfg_for(root)
+        cfg_g.auto_approve = False
+        prov_t = FakeProvider([LLMResponse(tool_calls=[tc("write_file", path="z.py", content="1")]),
+                               LLMResponse(content="ok")])
+        ag_t = coding_agent.build(cfg_g, prov_t, approve=gate, on_interrupt=lambda: ("continue", "nota"))
+        ag_t.run("scrivi")
+        roles_t = [m["role"] for m in ag_t.convo.messages]
+        check("audit: dopo i risultati di tool la nota è un messaggio nuovo (come prima)",
+              roles_t[:4] == ["user", "assistant", "tool", "user"], str(roles_t))
+
+        # ── Router: un modello che ragiona invece di rispondere ──────────────
+        class Reasoner(FakeProvider):
+            def complete(self, messages, **kw):
+                self.calls.append(kw)
+                return LLMResponse(content="", reasoning="hmm, let me think about this…",
+                                   finish_reason="length")
+
+        thinker = Reasoner([])
+        first_pick = _router.classify("sistema questo bug nel file main.py", thinker)
+        check("audit: router — il primo tentativo ricade sull'euristica",
+              first_pick in ("coding", "general"), first_pick)
+        check("audit: router — il provider è riconosciuto come incapace di rispondere",
+              thinker in _router._ROUTER_CANNOT_ANSWER)
+        _router.classify("apri il browser", thinker)
+        _router.classify("leggi il file", thinker)
+        check("audit: router — dopo il riconoscimento NESSUNA chiamata in più",
+              len(thinker.calls) == 1, str(len(thinker.calls)))
+
+        # Un modello che risponde normalmente NON viene marcato.
+        class Answers(FakeProvider):
+            def complete(self, messages, **kw):
+                return LLMResponse(content="coding")
+        normal = Answers([])
+        check("audit: router — un modello che risponde decide come prima",
+              _router.classify("x", normal) == "coding" and normal not in _router._ROUTER_CANNOT_ANSWER)
+        # Una risposta inattesa NON spegne il router: è un caso occasionale.
+        class Odd(FakeProvider):
+            def complete(self, messages, **kw):
+                return LLMResponse(content="banana")
+        odd = Odd([])
+        _router.classify("x", odd)
+        check("audit: router — un'etichetta inattesa non lo spegne", odd not in _router._ROUTER_CANNOT_ANSWER)
+
+        # ── Soglia: una sola fonte, mai zero ─────────────────────────────────
+        c = cfg_for(root)
+        c.context_window, c.compact_threshold_ratio = 80_000, 0.82
+        check("audit: soglia dalla property di Config", c.compact_threshold == 65_600, str(c.compact_threshold))
+        c.context_window, c.compact_threshold_ratio = 1, 0.5
+        check("audit: la soglia non è mai zero (chi ci divide è protetto)", c.compact_threshold == 1)
+        for path in ("flair/cli.py", "flair/core/agent.py"):
+            src = (Path(__file__).resolve().parent.parent / path).read_text(encoding="utf-8")
+            check(f"audit: {path} non ricalcola la soglia a mano",
+                  "context_window * self.cfg.compact_threshold_ratio" not in src)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
 
 
 def test_remember_reaches_model():
@@ -6328,6 +6447,7 @@ def main():
     test_tool_schema_contract()
     test_background_jobs()
     test_readme_in_sync()
+    test_audit_fixes()
     test_remember_reaches_model()
     test_context_told_to_model()
     test_context_counter()

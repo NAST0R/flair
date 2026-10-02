@@ -349,7 +349,11 @@ class Config:
 
     @property
     def compact_threshold(self) -> int:
-        return int(self.context_window * self.compact_threshold_ratio)
+        """Token oltre i quali scatta la compattazione automatica. UNICA fonte di
+        questo numero: compattazione, contatore a schermo e nota al modello lo
+        leggono da qui (prima i due contatori lo ricalcolavano a mano, con un
+        arrotondamento diverso). `max(1, …)` protegge chi ci divide sopra."""
+        return max(1, int(self.context_window * self.compact_threshold_ratio))
 
     def refresh_pricing(self) -> None:
         """Riallinea i prezzi al modello attivo; gli override via env (anche di un

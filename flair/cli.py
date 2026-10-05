@@ -10,8 +10,10 @@ from __future__ import annotations
 import argparse
 import difflib
 import json
+import locale
 import logging
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -28,6 +30,7 @@ from rich.text import Text
 from . import __version__
 from .agents import coding as coding_agent
 from .agents import general as general_agent
+from .checkpoints import Checkpoints
 from .config import Config, load_config
 from .core import router
 from .core.agent import _SUMMARY_HEADER, Approval, Conversation, content_text
@@ -155,6 +158,23 @@ def build_result_json(agent_key: str | None, task: str, result, tool_events: lis
     }
 
 
+def _read_template(path: Path) -> str:
+    """Il testo di un comando personalizzato, in qualunque codifica: UTF-8, poi la
+    codifica di sistema (il Blocco note di Windows salva in ANSI, e basta una «è»
+    perché non sia UTF-8), poi sostituzione dei byte illeggibili. Un template
+    malformato non deve MAI far cadere il REPL — prima lo faceva."""
+    raw = path.read_bytes()
+    # cp1252 esplicito dopo la codifica di sistema: un file ANSI scritto su Windows
+    # e letto su Linux (dove il sistema è UTF-8) avrebbe gli accenti illeggibili —
+    # così il risultato è lo stesso su entrambi i sistemi.
+    for enc in ("utf-8-sig", locale.getpreferredencoding(False) or "utf-8", "cp1252"):
+        try:
+            return raw.decode(enc)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return raw.decode("utf-8", errors="replace")
+
+
 # Comandi del REPL: (nome, come si scrive nell'help, cosa fa, metodo che lo esegue).
 # UNICA fonte: da qui nascono sia il dispatch sia la tabella di /help, quindi un
 # comando non documentato o una voce di help senza handler sono impossibili (c'è un
@@ -171,6 +191,9 @@ _COMMANDS: tuple[tuple[str, str, str, str], ...] = (
     ("model", "/model <name>", "switch the fast model at runtime", "_cmd_model"),
     ("think-model", "/think-model <name>", "switch the thinking model at runtime", "_cmd_think_model"),
     ("compact", "/compact", "compact the active agent's context now", "_cmd_compact"),
+    ("context", "/context", "what is filling the context, by category", "_cmd_context"),
+    ("rewind", "/rewind [n|files]", "undo the file edits of the last n turns (and the conversation)", "_cmd_rewind"),
+    ("diff", "/diff", "everything flair changed on disk in this session", "_cmd_diff"),
     ("cost", "/cost", "token/cost summary for the session", "_cmd_cost"),
     ("save", "/save [name]", "save the session (default: current name)", "_cmd_save"),
     ("load", "/load <name>", "resume a saved session", "_cmd_load"),
@@ -247,9 +270,12 @@ class CLI:
         self.jobs = BackgroundJobs(max_jobs=cfg.bg_max_jobs, buffer_chars=cfg.bg_buffer_chars,
                                    max_lifetime=cfg.bg_max_lifetime, stop_grace=cfg.bg_stop_grace,
                                    keep_finished=cfg.bg_keep_finished)
+        # Checkpoint dei file per /rewind e /diff: uno per sessione, come i job.
+        self.checkpoints = Checkpoints()
         for ag in self.agents.values():
             ag.ctx.memory = self.memory
             ag.ctx.jobs = self.jobs
+            ag.ctx.checkpoints = self.checkpoints
         self._refresh_memory_prompts()
 
     def _shutdown_jobs(self) -> None:
@@ -403,6 +429,7 @@ class CLI:
                        key=lambda a: len(a.get("messages") or []), default=None)
             convo_state = best or {}
         self.convo.load(convo_state)
+        self.checkpoints.clear()   # i checkpoint riguardano la conversazione di prima
         self.last_agent = state.get("last_agent")
         self.session_name = name
         # Ripristina la memoria della sessione (sidecar assente/illeggibile → vuota:
@@ -759,6 +786,7 @@ class CLI:
         agent = self.agents[agent_key]
         # Allegati (/img, --image): il content del turno diventa multipart, ma il
         # router classifica sul TESTO e il JSONL logga il testo — mai i blob base64.
+        self.checkpoints.begin_turn(self.convo.messages)
         delivered = self._deliver_notes(task)
         content: str | list = delivered
         if attachments:
@@ -881,6 +909,9 @@ class CLI:
         # uscita, che non sono comandi con handler.
         rows = [(disp, desc) for _n, disp, desc, _m in _COMMANDS]
         rows.append(("exit | quit", "leave the REPL"))
+        for name, path in self._custom_commands():
+            where = "personal" if path.is_relative_to(Path.home() / ".flair") else "project"
+            rows.append((f"/{name}", f"[dim]custom command · {where}[/dim]"))
         for cmd, desc in rows:
             table.add_row(Text(cmd), desc)
         self.console.print(table)
@@ -922,6 +953,7 @@ class CLI:
 
     def _cmd_reset(self, arg: str) -> None:
         self.convo.reset()
+        self.checkpoints.clear()
         self.last_agent = None
         self.console.print("[yellow]conversation cleared.[/yellow]\n")
 
@@ -1081,6 +1113,134 @@ class CLI:
         running = sum(1 for j in rows if j.running)
         self.console.print(f"[dim]{len(rows)} job(s), {running} running:[/dim]\n{body}\n")
 
+    def _cmd_rewind(self, arg: str) -> None:
+        """Riporta i file — e, se possibile, la conversazione — a prima degli ultimi
+        turni che hanno modificato file. `files` lascia intatta la conversazione."""
+        parts = arg.split()
+        files_only = "files" in parts
+        nums = [p for p in parts if p.isdigit()]
+        turns = int(nums[0]) if nums else 1
+        if not self.checkpoints.rewindable:
+            self.console.print("[dim]nothing to rewind: no file was changed by flair "
+                               "in the turns kept for this session.[/dim]\n")
+            return
+        messages = [] if files_only else self.convo.messages
+        report = self.checkpoints.rewind(messages, turns)
+        if not files_only and report.conversation_rewound:
+            # La storia è stata accorciata: ciò che resta è un prefisso di quanto già
+            # inviato, quindi la cache vale ancora; il conteggio esatto si riparte
+            # dalla prossima risposta.
+            self.convo.last_prompt_tokens = 0
+            self.convo.sent_upto = 0
+        lines = [f"[yellow]rewound {report.turns} turn(s).[/yellow]"]
+        for label, items in (("restored", report.restored), ("removed (created by flair)", report.removed),
+                             ("moved back", report.unmoved), ("not restored", report.failed)):
+            if items:
+                lines.append(f"[dim]  {label}: {', '.join(items)}[/dim]")
+        if report.skipped:
+            lines.append(f"[yellow]  too large to snapshot, left as they are: "
+                         f"{', '.join(report.skipped)}[/yellow]")
+        if files_only:
+            lines.append("[dim]  conversation left as it is (files only).[/dim]")
+        elif report.conversation_rewound:
+            lines.append("[dim]  conversation rewound to before those turns.[/dim]")
+        else:
+            lines.append("[yellow]  conversation NOT rewound: it was compacted in the meantime, "
+                         "so cutting it there would be wrong — tell the agent what you undid.[/yellow]")
+        self.console.print("\n".join(lines) + "\n")
+
+    def _cmd_diff(self, arg: str) -> None:
+        text = self.checkpoints.session_diff()
+        if not text:
+            self.console.print("[dim]no changes on disk made by flair in this session.[/dim]\n")
+            return
+        from rich.syntax import Syntax
+        self.console.print(Syntax(text, "diff", word_wrap=False, theme="ansi_dark"))
+        self.console.print()
+
+    def _cmd_context(self, arg: str) -> None:
+        """Cosa occupa il contesto dell'agente attivo, per categoria. Stima con lo
+        stesso stimatore della compattazione, così i numeri sono confrontabili con
+        il contatore e con la soglia."""
+        key = self.last_agent or "coding"
+        agent = self.agents[key]
+        est = agent._estimate_tokens
+        img = getattr(self.cfg, "image_token_estimate", 1200)
+        msgs = self.convo.messages
+        schema_chars = len(json.dumps(agent.toolset.schemas()))
+        rows = [("system prompt", len(agent.system_prompt) // 4),
+                ("tool schemas", schema_chars // 4)]
+        for role in ("user", "assistant", "tool"):
+            rows.append((f"{role} messages",
+                         est([m for m in msgs if m.get("role") == role], image_tokens=img)))
+        # La ripartizione per categoria è necessariamente una STIMA (chars/4), mentre
+        # il totale del contatore viene dall'ultima risposta del server. Mostrati
+        # accanto, divergevano anche del 40% sul codice denso — e non si capiva
+        # quale numero fosse vero. Si tiene il totale misurato e lo si ripartisce
+        # nelle proporzioni stimate: le quote sono ciò che serve per decidere cosa
+        # liberare, e la somma torna col contatore.
+        estimated = sum(n for _l, n in rows) or 1
+        measured = agent.context_fill()[0] or estimated
+        threshold = self.cfg.compact_threshold
+        table = Table(box=box.SIMPLE, show_header=True, header_style="bold")
+        table.add_column(f"context · {key}")
+        table.add_column("≈ tokens", justify="right")
+        table.add_column("share", justify="right")
+        for label, n in rows:
+            table.add_row(label, f"{round(measured * n / estimated):,}", f"{round(n / estimated * 100)}%")
+        table.add_row("[bold]total[/bold]", f"[bold]{measured:,}[/bold]",
+                      f"{round(measured / threshold * 100)}% of the threshold")
+        self.console.print(table)
+        # I risultati di tool più pesanti: è lì che di solito si recupera spazio.
+        heavy = sorted(((len(content_text(m.get("content"), "")) // 4, i) for i, m in enumerate(msgs)
+                        if m.get("role") == "tool"), reverse=True)[:5]
+        if heavy and heavy[0][0] > 0:
+            names = self._tool_names_by_call_id()
+            self.console.print("[dim]  largest tool results:[/dim]")
+            for n, i in heavy:
+                label = names.get(msgs[i].get("tool_call_id", ""), "tool")
+                self.console.print(f"[dim]    {n:>7,} · {label}[/dim]")
+        self.console.print(f"[dim]  total measured from the last request; the split is "
+                           f"estimated · compaction at {_kfmt(threshold)} · window "
+                           f"{_kfmt(self.cfg.context_window)}[/dim]\n")
+
+    def _tool_names_by_call_id(self) -> dict[str, str]:
+        """id della tool call → «nome  argomento principale», per etichettare i
+        risultati nella tabella di /context."""
+        names: dict[str, str] = {}
+        for m in self.convo.messages:
+            for call in m.get("tool_calls") or []:
+                fn = call.get("function", {}) if isinstance(call, dict) else {}
+                try:
+                    args = json.loads(fn.get("arguments") or "{}")
+                except (ValueError, TypeError):
+                    args = {}
+                hint = next((str(args[k]) for k in ("path", "command", "pattern", "url", "query")
+                             if isinstance(args, dict) and k in args), "")
+                names[call.get("id", "")] = f"{fn.get('name', 'tool')}  {hint[:60]}".rstrip()
+        return names
+
+    def _custom_command(self, name: str) -> Path | None:
+        """Template di un comando personalizzato: `.flair/commands/<nome>.md` nella
+        cartella di lavoro (vince) o in ~/.flair/commands. I comandi incorporati
+        hanno sempre la precedenza: non si possono ridefinire."""
+        if not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", name):
+            return None
+        for base in (Path(self.cfg.root) / ".flair" / "commands", Path.home() / ".flair" / "commands"):
+            cand = base / f"{name}.md"
+            if cand.is_file():
+                return cand
+        return None
+
+    def _custom_commands(self) -> list[tuple[str, Path]]:
+        found: dict[str, Path] = {}
+        for base in (Path.home() / ".flair" / "commands", Path(self.cfg.root) / ".flair" / "commands"):
+            if base.is_dir():
+                for f in sorted(base.glob("*.md")):
+                    found[f.stem] = f        # la cartella di lavoro, letta dopo, vince
+        builtin = {n for n, *_ in _COMMANDS}
+        return sorted((n, p) for n, p in found.items() if n not in builtin)
+
     def _cmd_code(self, arg: str) -> None:
         if arg:
             self._safe_run_task(arg, agent_key="coding", think=self.default_think)
@@ -1113,6 +1273,14 @@ class CLI:
         name = parts[0][1:].lower()
         arg = parts[1].strip() if len(parts) == 2 else ""
         handler = {n: getattr(self, m) for n, _d, _h, m in _COMMANDS}.get(name)
+        if handler is None and (template := self._custom_command(name)) is not None:
+            # `$ARGUMENTS` (la convenzione più diffusa) riceve il resto della riga;
+            # un template senza segnaposto riceve gli argomenti in coda, se ci sono.
+            body = _read_template(template).strip()
+            prompt = body.replace("$ARGUMENTS", arg) if "$ARGUMENTS" in body else (
+                f"{body}\n\n{arg}" if arg else body)
+            self._safe_run_task(prompt, think=self.default_think)
+            return True
         if handler is None:
             close = difflib.get_close_matches(name, [n for n, *_ in _COMMANDS], n=1)
             hint = f" Did you mean /{close[0]}?" if close else " Type /help for the list of commands."

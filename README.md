@@ -51,6 +51,7 @@ flair/
 │   ├── repomap.py       Codebase outline across ~two dozen languages
 │   ├── documents.py     Text extraction from DOCX/XLSX/PPTX/ODT/PDF
 │   ├── images.py        Image validation/encoding for vision endpoints
+│   ├── post_edit.py     Optional check run on every edited file (FLAIR_POST_EDIT_CMD)
 │   ├── jobs.py          Background commands: registry, incremental output,
 │   │                    optional stdin channel, process-tree termination
 │   ├── subagent.py      `explore`: read-only sub-agent with an isolated context
@@ -63,6 +64,7 @@ flair/
 │   └── explorer.py      Builds the read-only sub-agent used by `explore`
 ├── prompts/             System prompts (.md) + project-instructions loader
 ├── memory.py            Session memory (dedup, secret filtering, hard cap, sidecar)
+├── checkpoints.py       Per-turn file snapshots behind /rewind and /diff
 ├── session_log.py       JSONL session log (per-turn usage, cost, provider/model)
 ├── session_store.py     Save/resume conversation state across runs
 └── cli.py               CLI + REPL (rich): streaming, diff preview, cost, sessions,
@@ -178,6 +180,9 @@ REPL commands:
 | `/model <name>` | switch the fast model at runtime |
 | `/think-model <name>` | switch the thinking model at runtime |
 | `/compact` | compact the active agent's context now |
+| `/context` | what is filling the context, by category |
+| `/rewind [n|files]` | undo the file edits of the last n turns (and the conversation) |
+| `/diff` | everything flair changed on disk in this session |
 | `/cost` | token/cost summary for the session |
 | `/save [name]` | save the session (default: current name) |
 | `/load <name>` | resume a saved session |
@@ -281,6 +286,12 @@ For unattended runs prefer **stateless** invocations (no `--session`): two sched
 **`.env` configurator (optional GUI).** `python tools/configurer.py` opens a standalone editor for the `.env` file — every parameter with its help text, type-aware widgets, validation (bounds, unknown providers, cross-field checks) and a preview of the exact text that will be written; comments, layout and line endings are preserved byte for byte, and unknown keys are never touched. `python tools/configurer.py --check [path]` runs the same validation headless (non-zero exit on errors) and needs no Tkinter. Stdlib only.
 
 **A context counter you can act on.** The estimated context travels with the output you already see — appended to each tool line, in the reasoning spinner and in the REPL prompt — measured against the **compaction threshold**, not the window (with a 0.82 ratio on 80K, compaction starts at 65K, and showing 80K would make an imminent limit look far away). Past `FLAIR_CTX_WARN` (85% of the threshold by default) flair says so once per turn, in time to interrupt and ask for a summary yourself — which matters on local models, where automatic compaction can take minutes.
+
+**Undo, review, and know what fills the context.** Before every write made by its own tools, Flair snapshots the previous content of the file — once per file per turn — so `/rewind` puts the files back as they were before the last turn (`/rewind 3` for the last three, `/rewind files` to leave the conversation alone), and `/diff` shows everything Flair changed on disk in this session. Rewinding the conversation *shortens* it rather than rewriting it, so what remains is a prefix of what was sent and the prefix cache still holds; if a compaction happened in between, only the files are rewound, and Flair says so. The limits are stated, not hidden: only files written through Flair's tools are tracked (not what a `run_command` changes), and checkpoints live in the process. `/context` breaks the context down — system prompt, tool schemas, messages by role, and the heaviest tool results — against the compaction threshold, so you can see *what* to free, not only how much.
+
+**Check every edit.** Set `FLAIR_POST_EDIT_CMD` (for example `ruff check --quiet {path}`) and the coding agent runs it on every file it edits; the output reaches the model **only when the command fails**, appended to the tool result, so a syntax or lint error is seen in the same step it was introduced — and a clean file costs nothing.
+
+**Your own commands.** A Markdown file in `.flair/commands/` (project) or `~/.flair/commands/` (personal) becomes a REPL command: `review.md` is `/review`, and `$ARGUMENTS` in the file receives the rest of the line. Built-in commands always win, and `/help` lists the custom ones it finds.
 
 **`/remember` reaches the model at once.** A note you add with `/remember` is stored in the session memory *and* delivered to the model in your **next message**, prefixed to what you type — so it is visible in the same session, not only after a reload. The system prompt is never rewritten mid-session and the note travels inside a new message, so the **prefix cache is untouched**; it is a prefix rather than a separate message because two consecutive user messages are rejected by some local chat templates. At the next session boundary (start, `/load`, `/root`) the note moves into the system prompt as before, without being delivered twice. In a session that was never saved, the confirmation says plainly that the note lasts until you exit — `/save <name>` keeps it.
 

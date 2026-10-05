@@ -5790,6 +5790,238 @@ def test_readme_in_sync():
           exact is None, exact.group(0) if exact else "")
 
 
+def test_quality_of_life():
+    """Checkpoint con /rewind e /diff, controllo dopo l'edit, /context e comandi
+    personalizzati — esercitati attraverso il CLI e i tool veri."""
+    import io as _io
+    import os as _os
+    import sys as _sys
+    import tempfile as _tf
+
+    from rich.console import Console as _Console
+
+    from flair.cli import CLI
+    from flair.core.agent import _COMPACT_PROMPT  # noqa: F401 — import di controllo
+    from flair.tools import coding as _ct
+    from flair.tools import system as _st
+
+    root = Path(_tf.mkdtemp(prefix="flair_qol_")).resolve()
+    cwd = _os.getcwd()
+    try:
+        (root / "app.py").write_text("x = 1\n", encoding="utf-8")
+        (root / "lib.py").write_text("y = 2\n", encoding="utf-8")
+        cli = CLI(cfg_for(root))
+        cli.console = _Console(file=_io.StringIO(), width=200)
+
+        def out() -> str:
+            text = cli.console.file.getvalue()
+            cli.console.file.truncate(0)
+            cli.console.file.seek(0)
+            return " ".join(text.split())
+
+        def turn(*calls):
+            prov = FakeProvider([LLMResponse(tool_calls=list(calls)), LLMResponse(content="fatto")])
+            for ag in cli.agents.values():
+                ag.provider = prov
+            cli.provider = prov
+            cli.run_task("modifica", agent_key="coding")
+
+        # ── Checkpoint: un turno che crea, modifica e tocca due file ─────────
+        # Prima un turno senza scritture: senza, il turno riavvolto sarebbe il
+        # PRIMO della conversazione, il prefisso da conservare sarebbe vuoto e
+        # l'asserzione sulla cache qui sotto risulterebbe vera per vacuità.
+        turn(tc("read_file", path="app.py"))
+        before_len = len(cli.convo.messages)
+        check("checkpoint: c'è un prefisso reale da conservare", before_len >= 3, str(before_len))
+        turn(tc("edit_file", path="app.py", old_string="x = 1", new_string="x = 99"),
+             tc("write_file", path="new.py", content="z = 3\n"))
+        check("checkpoint: il turno ha modificato i file",
+              (root / "app.py").read_text(encoding="utf-8") == "x = 99\n" and (root / "new.py").exists())
+        check("checkpoint: un turno da riavvolgere", cli.checkpoints.rewindable == 1)
+
+        # /diff mostra cosa è cambiato in sessione
+        cli._dispatch("/diff")
+        diff = out()
+        check("diff: mostra la modifica e il file nuovo",
+              "x = 99" in diff and "new.py" in diff and "/dev/null" in diff, diff[:200])
+
+        kept = list(cli.convo.messages[:before_len])
+        cli._dispatch("/rewind")
+        report = out()
+        check("rewind: file modificato riportato com'era",
+              (root / "app.py").read_text(encoding="utf-8") == "x = 1\n")
+        check("rewind: file creato da flair rimosso", not (root / "new.py").exists())
+        check("rewind: la conversazione torna a prima del turno",
+              len(cli.convo.messages) == before_len, f"{len(cli.convo.messages)} vs {before_len}")
+        check("rewind: ciò che resta è lo STESSO prefisso (cache intatta)",
+              all(a is b for a, b in zip(cli.convo.messages, kept, strict=True)))
+        check("rewind: il rapporto lo dice", "rewound 1 turn" in report and "conversation rewound" in report,
+              report)
+        check("rewind: dopo, /diff non ha nulla", (cli._dispatch("/diff"), "no changes" in out())[1])
+        check("rewind: senza altro da riavvolgere lo dice",
+              (cli._dispatch("/rewind"), "nothing to rewind" in out())[1])
+
+        # ── Un edit FALLITO non lascia checkpoint ────────────────────────────
+        turn(tc("edit_file", path="app.py", old_string="non esiste", new_string="z"))
+        check("checkpoint: un edit fallito non crea checkpoint", cli.checkpoints.rewindable == 0)
+
+        # ── /rewind files: la conversazione resta ────────────────────────────
+        turn(tc("edit_file", path="lib.py", old_string="y = 2", new_string="y = 7"))
+        n = len(cli.convo.messages)
+        cli._dispatch("/rewind files")
+        out()
+        check("rewind files: file ripristinato, conversazione intatta",
+              (root / "lib.py").read_text(encoding="utf-8") == "y = 2\n" and len(cli.convo.messages) == n)
+
+        # ── Più turni insieme ────────────────────────────────────────────────
+        turn(tc("edit_file", path="app.py", old_string="x = 1", new_string="x = 2"))
+        turn(tc("edit_file", path="app.py", old_string="x = 2", new_string="x = 3"))
+        cli._dispatch("/rewind 2")
+        out()
+        check("rewind 2: torna allo stato di due turni fa",
+              (root / "app.py").read_text(encoding="utf-8") == "x = 1\n")
+
+        # ── Compattazione in mezzo: solo i file, e detto chiaramente ─────────
+        turn(tc("edit_file", path="app.py", old_string="x = 1", new_string="x = 5"))
+        cli.convo.messages[:] = [{"role": "user", "content": "[riassunto]"}, *cli.convo.messages[-2:]]
+        cli._dispatch("/rewind")
+        warn = out()
+        check("rewind dopo compattazione: i file tornano comunque",
+              (root / "app.py").read_text(encoding="utf-8") == "x = 1\n")
+        check("rewind dopo compattazione: la conversazione NON viene tagliata, e lo dice",
+              "NOT rewound" in warn and len(cli.convo.messages) == 3, warn)
+
+        # ── move_path annullato ──────────────────────────────────────────────
+        turn(tc("move_path", src="lib.py", dst="sub/lib2.py"))
+        check("move: eseguito", (root / "sub" / "lib2.py").exists() and not (root / "lib.py").exists())
+        cli._dispatch("/rewind")
+        out()
+        check("rewind: lo spostamento è annullato",
+              (root / "lib.py").exists() and not (root / "sub" / "lib2.py").exists())
+
+        # ── File troppo grande: non fotografato, e dichiarato ────────────────
+        cli.checkpoints.max_file_bytes = 10
+        (root / "big.txt").write_text("a" * 100, encoding="utf-8")
+        turn(tc("write_file", path="big.txt", content="b"))
+        cli._dispatch("/rewind")
+        big = out()
+        check("rewind: i file troppo grandi sono dichiarati e lasciati com'erano",
+              "too large to snapshot" in big and (root / "big.txt").read_text(encoding="utf-8") == "b", big)
+        cli.checkpoints.max_file_bytes = 2_000_000
+
+        # /reset azzera i checkpoint
+        turn(tc("write_file", path="r.py", content="1"))
+        cli._dispatch("/reset")
+        out()
+        check("checkpoint: /reset li azzera", cli.checkpoints.rewindable == 0)
+
+        # ── Controllo dopo l'edit ────────────────────────────────────────────
+        ctx = ToolContext(cfg=cfg_for(root))
+        ok_out = _ct.write_file(ctx, path="good.py", content="a = 1\n")
+        check("post-edit: senza comando nessuna aggiunta", "post-edit" not in ok_out)
+        py = f'"{_sys.executable}"'
+        ctx.cfg.post_edit_cmd = f"{py} -m py_compile {{path}}"
+        clean = _ct.write_file(ctx, path="good.py", content="a = 2\n")
+        check("post-edit: file pulito → zero token aggiunti", "post-edit" not in clean, clean)
+        broken = _ct.write_file(ctx, path="bad.py", content="def f(:\n")
+        check("post-edit: errore di sintassi visto nello stesso passo",
+              "post-edit check failed" in broken and "SyntaxError" in broken, broken[-200:])
+        check("post-edit: in CODA, l'esito del tool resta leggibile", broken.startswith("✓"))
+        ctx.cfg.post_edit_glob = "*.py"
+        other = _ct.write_file(ctx, path="notes.md", content="def f(:\n")
+        check("post-edit: il filtro esclude i file non corrispondenti", "post-edit" not in other)
+        spaced = _ct.write_file(ctx, path="dir con spazi/x y.py", content="def f(:\n")
+        check("post-edit: path con spazi correttamente quotato",
+              "SyntaxError" in spaced, spaced[-160:])
+        edited = _ct.edit_file(ctx, path="good.py", old_string="a = 2", new_string="a = (")
+        check("post-edit: vale anche per edit_file", "post-edit check failed" in edited)
+        gen = _st.write_file(ctx, path=str(root / "gen.py"), content="def f(:\n")
+        check("post-edit: l'agente generico non esegue controlli", "post-edit" not in gen)
+        ctx.cfg.post_edit_cmd = ""
+
+        # ── /context ─────────────────────────────────────────────────────────
+        turn(tc("read_file", path="app.py"))
+        cli._dispatch("/context")
+        ctx_view = out()
+        for label in ("system prompt", "tool schemas", "tool messages", "of the threshold",
+                      "largest tool results", "read_file app.py", "compaction at"):
+            check(f"context: mostra «{label}»", label in ctx_view, ctx_view[:300])
+
+        # ── Comandi personalizzati ───────────────────────────────────────────
+        cmds = root / ".flair" / "commands"
+        cmds.mkdir(parents=True)
+        (cmds / "review.md").write_text("Review $ARGUMENTS carefully.", encoding="utf-8")
+        (cmds / "tests.md").write_text("Run the test suite.", encoding="utf-8")
+        (cmds / "help.md").write_text("hijack", encoding="utf-8")
+        seen: list[str] = []
+        cli._safe_run_task = lambda task, agent_key=None, think=False: seen.append(task)  # type: ignore[method-assign]
+        cli._dispatch("/review app.py")
+        check("comandi: $ARGUMENTS riceve il resto della riga", seen == ["Review app.py carefully."], str(seen))
+        seen.clear()
+        cli._dispatch("/tests unit only")
+        check("comandi: senza segnaposto gli argomenti vanno in coda",
+              seen == ["Run the test suite.\n\nunit only"], str(seen))
+        seen.clear()
+        cli._dispatch("/help")
+        help_text = out()
+        check("comandi: un built-in non è ridefinibile", seen == [] and "hijack" not in help_text)
+        check("comandi: /help elenca i comandi personalizzati",
+              "/review" in help_text and "/tests" in help_text and "custom" in help_text, help_text[-300:])
+        cli._dispatch("/nonesiste")
+        check("comandi: uno sconosciuto resta sconosciuto", "unknown command" in out() and seen == [])
+
+        # ── Verifica finale: template in codifica di sistema (Blocco note → ANSI) ──
+        # Prima un template non UTF-8 faceva cadere l'intero REPL con
+        # UnicodeDecodeError, perché _dispatch non è protetto.
+        (cmds / "ansi.md").write_bytes("Spiega perché è così".encode("cp1252"))
+        seen.clear()
+        cli._dispatch("/ansi")
+        check("comandi: template non UTF-8 non fa cadere il REPL", len(seen) == 1, str(seen))
+        check("comandi: e le lettere accentate si leggono, su ogni sistema",
+              seen[0] == "Spiega perché è così", repr(seen[0]))
+        (cmds / "bom.md").write_bytes("\ufeffCon BOM".encode("utf-8"))
+        seen.clear()
+        cli._dispatch("/bom")
+        check("comandi: il BOM UTF-8 non finisce nel prompt", seen == ["Con BOM"], str(seen))
+
+        # ── Verifica finale: etichetta in /help ──────────────────────────────
+        cli._dispatch("/help")
+        labels = out()
+        check("comandi: /help distingue i comandi di progetto",
+              "custom command · project" in labels, labels[-200:])
+
+        # ── Verifica finale: /context concorda col contatore ─────────────────
+        # Prima il totale di /context era una stima chars/4 e divergeva anche del
+        # 40% dal contatore (misurato): due numeri diversi per la stessa cosa.
+        agent = cli.agents["coding"]
+        agent.convo.last_prompt_tokens = 25_000
+        agent.convo.sent_upto = len(agent.convo.messages)
+        cli.last_agent = "coding"
+        cli._dispatch("/context")
+        view = out()
+        measured = agent.context_fill()[0]
+        check("context: il totale è quello MISURATO, come il contatore",
+              f"total {measured:,}" in view, f"{measured} · {view[:200]}")
+        check("context: dichiara che la ripartizione è stimata",
+              "measured from the last request" in view and "estimated" in view)
+
+        # ── Verifica finale: i checkpoint hanno un tetto TOTALE ──────────────
+        from flair.checkpoints import Checkpoints
+        ck = Checkpoints(max_turns=20, max_file_bytes=10_000, max_total_bytes=25_000)
+        msgs: list = []
+        for i in range(5):
+            ck.begin_turn(msgs)
+            f = root / f"budget{i}.bin"
+            f.write_bytes(b"x" * 9_000)
+            ck.commit(ck.prepare_write(f))
+        check("checkpoint: il tetto totale scarta i turni più vecchi",
+              ck._bytes() <= 25_000 and ck.rewindable < 5, f"{ck._bytes()} · {ck.rewindable}")
+        check("checkpoint: il turno in corso non viene mai scartato", ck.rewindable >= 1)
+    finally:
+        _os.chdir(cwd)
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def test_audit_fixes():
     """Correzioni dall'audit: interlocuzione al primo passo senza messaggi utente
     consecutivi, router che smette di sprecare la chiamata sui modelli che
@@ -6447,6 +6679,7 @@ def main():
     test_tool_schema_contract()
     test_background_jobs()
     test_readme_in_sync()
+    test_quality_of_life()
     test_audit_fixes()
     test_remember_reaches_model()
     test_context_told_to_model()

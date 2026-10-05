@@ -17,6 +17,7 @@ import webbrowser
 from datetime import datetime
 from pathlib import Path
 
+from ..checkpoints import tracked_write
 from ..core.tool import ToolContext, tool
 from . import fs, images, jobs, shell
 
@@ -250,7 +251,8 @@ def read_file(ctx: ToolContext, path: str, offset: int = 1, limit: int | None = 
     destructive=True,
 )
 def write_file(ctx: ToolContext, path: str, content: str, append: bool = False) -> str:
-    return fs.write_file_impl(None, path, content, append)
+    return tracked_write(ctx, None, path,
+                         write=lambda: fs.write_file_impl(None, path, content, append))
 
 
 @tool(
@@ -271,7 +273,8 @@ def write_file(ctx: ToolContext, path: str, content: str, append: bool = False) 
     destructive=True,
 )
 def edit_file(ctx: ToolContext, path: str, old_string: str, new_string: str, replace_all: bool = False) -> str:
-    return fs.edit_file_impl(None, path, old_string, new_string, replace_all)
+    return tracked_write(ctx, None, path, write=lambda: fs.edit_file_impl(
+        None, path, old_string, new_string, replace_all))
 
 
 # ── run_command ──────────────────────────────────────────────────────────────

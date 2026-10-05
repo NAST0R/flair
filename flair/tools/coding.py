@@ -13,6 +13,7 @@ import os
 import re
 from pathlib import Path
 
+from ..checkpoints import tracked_move, tracked_write
 from ..core.tool import ToolContext, ToolError, tool
 from . import fs, images, jobs, repomap, shell
 
@@ -274,7 +275,8 @@ def grep(ctx: ToolContext, pattern: str, path: str = ".", glob_filter: str = "",
     destructive=True,
 )
 def edit_file(ctx: ToolContext, path: str, old_string: str, new_string: str, replace_all: bool = False) -> str:
-    return fs.edit_file_impl(ctx.cfg.root, path, old_string, new_string, replace_all)
+    return tracked_write(ctx, ctx.cfg.root, path, check=True, write=lambda: fs.edit_file_impl(
+        ctx.cfg.root, path, old_string, new_string, replace_all))
 
 
 # ── write_file ───────────────────────────────────────────────────────────────
@@ -296,7 +298,8 @@ def edit_file(ctx: ToolContext, path: str, old_string: str, new_string: str, rep
     destructive=True,
 )
 def write_file(ctx: ToolContext, path: str, content: str, append: bool = False) -> str:
-    return fs.write_file_impl(ctx.cfg.root, path, content, append)
+    return tracked_write(ctx, ctx.cfg.root, path, check=True,
+                         write=lambda: fs.write_file_impl(ctx.cfg.root, path, content, append))
 
 
 # ── run_command ──────────────────────────────────────────────────────────────
@@ -347,6 +350,11 @@ def run_command(ctx: ToolContext, command: str, timeout: int = 120) -> str:
     destructive=True,
 )
 def multi_edit(ctx: ToolContext, path: str, edits: list) -> str:
+    return tracked_write(ctx, ctx.cfg.root, path, check=True,
+                         write=lambda: _multi_edit(ctx, path, edits))
+
+
+def _multi_edit(ctx: ToolContext, path: str, edits: list) -> str:
     p = fs.resolve(ctx.cfg.root, path)
     if not p.exists():
         return f"❌ File does not exist: {fs.display(ctx.cfg.root, p)} (use write_file to create it)"
@@ -415,7 +423,8 @@ def repo_map(ctx: ToolContext, path: str = ".") -> str:
     destructive=True,
 )
 def move_path(ctx: ToolContext, src: str, dst: str) -> str:
-    return fs.move_path_impl(ctx.cfg.root, src, dst)
+    return tracked_move(ctx, ctx.cfg.root, src, dst,
+                        move=lambda: fs.move_path_impl(ctx.cfg.root, src, dst))
 
 
 @tool(

@@ -180,6 +180,14 @@ CATALOG: tuple[Field, ...] = (
           "when to consolidate what it found instead of discovering it after the "
           "compaction. Append-only by design: it never rewrites what was already "
           "sent, so the prefix cache is untouched. false = counters only on screen."),
+    Field("Coding", "FLAIR_POST_EDIT_CMD", "str", None,
+          "Command run on every file the coding agent edits, e.g. "
+          "`ruff check {path}` or `python -m py_compile {path}` ({path} is the "
+          "edited file; without it the path is appended). Its output reaches the "
+          "model ONLY if the command fails, so a clean file costs no tokens."),
+    Field("Coding", "FLAIR_POST_EDIT_GLOB", "str", "*",
+          "Which edited files the check runs on: one or more patterns separated by "
+          "commas, e.g. `*.py,*.pyi`."),
     Field("Context", "FLAIR_CTX_CALIBRATION", "bool", "true",
           "Learn the real chars-to-tokens ratio from the requests and correct the "
           "estimate of the not-yet-sent suffix with it (dense code tokenizes worse "

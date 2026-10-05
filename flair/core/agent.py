@@ -936,6 +936,7 @@ class Agent:
         # mentre i job stanno girando. È sicuro: BackgroundJobs ha il suo lock, e
         # ogni Job protegge il proprio buffer.
         ctx.jobs = self.ctx.jobs
+        ctx.checkpoints = self.ctx.checkpoints   # stesso principio: uno per sessione
         try:
             out = t(ctx, **args)
             ok = not out.startswith("❌")

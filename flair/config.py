@@ -300,6 +300,12 @@ class Config:
     # schermo per l'umano, cioè il comportamento pre-esistente.
     context_tell_model: bool = False
 
+    # Controllo dopo ogni edit del coding agent (v. tools/post_edit.py): comando con
+    # `{path}` (o il path in coda), eseguito sul file appena modificato; l'output
+    # entra nel risultato del tool SOLO se fallisce. Vuoto = nessun controllo.
+    post_edit_cmd: str = ""
+    post_edit_glob: str = "*"         # uno o più pattern separati da virgola (es. "*.py,*.pyi")
+
     # Isteresi dello stadio 0: la potatura da sola evita il riassunto SOLO se porta
     # il contesto sotto soglia con questo margine (frazione della finestra). La
     # mutazione ha comunque rotto il prefisso in cache: uscire a ridosso della
@@ -483,6 +489,8 @@ def load_config() -> Config:
         bg_keep_finished=_int("FLAIR_BG_KEEP_FINISHED", 5),
         context_warn_ratio=_float("FLAIR_CTX_WARN", 0.85),
         context_tell_model=_bool("FLAIR_CTX_TELL_MODEL", False),
+        post_edit_cmd=os.getenv("FLAIR_POST_EDIT_CMD", ""),
+        post_edit_glob=os.getenv("FLAIR_POST_EDIT_GLOB", "*"),
         root=Path(os.getenv("FLAIR_ROOT", ".")).expanduser().resolve(),
         read_file_max_chars=_int("FLAIR_READ_MAX", 12000),
         grep_max_chars=_int("FLAIR_GREP_MAX", 6000),

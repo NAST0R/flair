@@ -121,6 +121,8 @@ class ToolContext:
     # Registro dei job in background (BackgroundJobs), condiviso per riferimento
     # con i worker paralleli e con gli altri agenti. None = feature non disponibile.
     jobs: Any = None
+    # Checkpoint dei file per /rewind e /diff (Checkpoints). None = non tracciati.
+    checkpoints: Any = None
 
 
 @dataclass

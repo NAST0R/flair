@@ -2895,6 +2895,7 @@ def test_english_surface():
     # sfuggiti i residui di bcfef91^ (header di compaction, overflow di list_dir,
     # suffisso di explore). Si asseriscono le costanti/funzioni che li generano
     # e un output prodotto davvero, così la classe di bug resta chiusa.
+    from flair.cli import _FORGET_PREFIX as _FORGET_PREFIX_CLI
     from flair.cli import _REMEMBER_PREFIX as _REMEMBER_PREFIX_CLI
     from flair.core.agent import (
         _ATTACHED_IMAGES_PREFIX,
@@ -2916,6 +2917,7 @@ def test_english_surface():
         "header allegati immagine": _ATTACHED_IMAGES_PREFIX,
         "nota contesto al modello": _CTX_NOTE,
         "nota di /remember al modello": _REMEMBER_PREFIX_CLI,
+        "rimozione di /memory forget al modello": _FORGET_PREFIX_CLI,
         "avviso contesto al modello": _CTX_NOTE_WARN,
         "nota immagine rigettata": _IMAGE_REJECTED_NOTE,
         "stub prune": STUB,
@@ -5790,6 +5792,168 @@ def test_readme_in_sync():
           exact is None, exact.group(0) if exact else "")
 
 
+def test_memory_forget():
+    """Rimozione GRANULARE dalla memoria — dall'umano (/memory forget) e dall'agente
+    (tool `forget`) — con lo stesso contratto di /remember sulla cache: il system
+    prompt non si riscrive mai a metà sessione, e la rimozione arriva al modello
+    nel prossimo messaggio o nel risultato del tool."""
+    import io as _io
+    import os as _os
+    import tempfile as _tf
+
+    from rich.console import Console as _Console
+
+    from flair.cli import _FORGET_PREFIX, _REMEMBER_PREFIX, CLI
+    from flair.memory import SessionMemory
+    from flair.tools import memory as _mt
+
+    # ── SessionMemory.remove: una nota, mai a caso ───────────────────────────
+    m = SessionMemory()
+    for n in ("porta API 8443", "build con make -j4", "server staging 10.0.0.42", "porta debug 9229"):
+        m.add(n)
+    ok, msg, gone = m.remove("porta")
+    check("forget: frammento ambiguo rifiutato con le candidate",
+          not ok and "8443" in msg and "9229" in msg and len(m.notes) == 4, msg)
+    ok, _msg, gone = m.remove("staging")
+    check("forget: frammento univoco rimuove quella nota",
+          ok and gone == "server staging 10.0.0.42" and len(m.notes) == 3)
+    ok, _msg, gone = m.remove("  BUILD CON  make -j4 ")
+    check("forget: testo esatto a meno di maiuscole e spazi", ok and gone == "build con make -j4")
+    ok, msg, _ = m.remove("99")
+    check("forget: indice fuori range → errore, nulla rimosso", not ok and len(m.notes) == 2, msg)
+    ok, msg, _ = m.remove("1", by_index=False)
+    check("forget: per il modello un numero è TESTO, non un indice",
+          not ok and len(m.notes) == 2, msg)
+    ok, _msg, gone = m.remove("1")
+    check("forget: per l'umano l'indice è quello di /memory", ok and gone == "porta API 8443")
+    check("forget: richiesta vuota → errore", not m.remove("")[0])
+    check("forget: memoria vuota → errore", not SessionMemory().remove("x")[0])
+
+    root = Path(_tf.mkdtemp(prefix="flair_forget_")).resolve()
+    sess = Path(_tf.mkdtemp(prefix="flair_forget_s_")).resolve()
+    cwd = _os.getcwd()
+    try:
+        cfg = cfg_for(root)
+        cfg.session_dir = sess
+        cli = CLI(cfg)
+        cli.console = _Console(file=_io.StringIO(), width=200)
+
+        def wire(*responses):
+            prov = FakeProvider(list(responses))
+            for ag in cli.agents.values():
+                ag.provider = prov
+            cli.provider = prov
+            return prov
+
+        # Una nota già NEL PROMPT (confine): quella che il modello vede.
+        cli._dispatch("/remember usa la porta 8080")
+        cli._refresh_memory_prompts()
+        prompt_before = cli.agents["coding"].system_prompt
+        check("forget: precondizione, la nota è nel system prompt", "usa la porta 8080" in prompt_before)
+
+        prov = wire(LLMResponse(content="uno"), LLMResponse(content="due"))
+        cli.run_task("ciao", agent_key="coding")
+        first = [dict(x) for x in prov.seen[0]]
+
+        # ── /memory forget dall'umano ───────────────────────────────────────
+        cli._dispatch("/memory forget 1")
+        check("forget umano: la nota esce dalla memoria", cli.memory.notes == [])
+        check("forget umano: il system prompt NON si riscrive a metà sessione",
+              cli.agents["coding"].system_prompt == prompt_before)
+        cli.run_task("quale porta uso?", agent_key="coding")
+        second = prov.seen[1]
+        last_user = [x for x in second if x.get("role") == "user"][-1]["content"]
+        check("forget umano: la rimozione ARRIVA al modello nel prossimo messaggio",
+              last_user.startswith(_FORGET_PREFIX) and "usa la porta 8080" in last_user, last_user[:120])
+        check("forget umano: la 2ª richiesta contiene la 1ª come prefisso esatto (cache)",
+              second[:len(first)] == first)
+        check("forget umano: consegnata una volta sola", cli._pending_forgets == [])
+
+        # Al confine il prompt riflette la memoria reale e non c'è più nulla da disdire.
+        cli._refresh_memory_prompts()
+        check("forget umano: al confine la nota sparisce dal prompt",
+              "usa la porta 8080" not in cli.agents["coding"].system_prompt)
+
+        # ── Nota mai consegnata e poi rimossa: nulla da disdire, nulla da dire ─
+        cli._dispatch("/remember nota effimera")
+        cli._dispatch("/memory forget effimera")
+        check("forget umano: una nota mai consegnata non genera una disdetta",
+              cli._pending_notes == [] and cli._pending_forgets == [])
+        check("forget umano: e la consegna del prossimo messaggio è pulita",
+              cli._deliver_notes("task") == "task")
+
+        # ── Errori azionabili ────────────────────────────────────────────────
+        out_buf = cli.console.file
+        cli._dispatch("/memory forget")
+        check("forget umano: senza argomento mostra l'uso", "usage: /memory forget" in out_buf.getvalue())
+        cli._dispatch("/memory forget qualcosa")
+        check("forget umano: memoria vuota → lo dice", "memory is empty" in out_buf.getvalue())
+        cli._dispatch("/remember una nota qualsiasi")
+        cli._dispatch("/memory forget inesistente")
+        check("forget umano: nessuna corrispondenza → avviso, nulla rimosso",
+              "no note matches" in out_buf.getvalue() and cli.memory.notes == ["una nota qualsiasi"])
+        cli._dispatch("/memory forget qualsiasi")
+
+        # ── Il sidecar si aggiorna ───────────────────────────────────────────
+        cli._dispatch("/save mem")
+        cli._dispatch("/remember da tenere")
+        cli._dispatch("/remember da buttare")
+        cli._dispatch("/memory forget buttare")
+        sidecar = "\n".join(f.read_text(encoding="utf-8") for f in sess.iterdir() if "memory" in f.name)
+        check("forget umano: il sidecar su disco perde la nota",
+              "da tenere" in sidecar and "da buttare" not in sidecar, sidecar[:200])
+
+        # ── Il tool dell'agente ──────────────────────────────────────────────
+        cli._refresh_memory_prompts()
+        prov2 = wire(LLMResponse(tool_calls=[tc("forget", note="da tenere")]),
+                     LLMResponse(content="rimossa"))
+        cli.run_task("quella nota è obsoleta, toglila", agent_key="coding")
+        results = [x["content"] for x in cli.convo.messages if x.get("role") == "tool"]
+        check("forget agente: la nota esce dalla memoria", "da tenere" not in cli.memory.notes)
+        check("forget agente: il risultato dice al modello di ignorarla",
+              any("Forgotten" in r and "disregard it" in r for r in results), str(results[-1:]))
+        check("forget agente: prompt non riscritto a metà sessione",
+              "da tenere" in cli.agents["coding"].system_prompt)
+        later = prov2.seen[1]
+        check("forget agente: la richiesta successiva estende la precedente (cache)",
+              later[:len(prov2.seen[0])] == prov2.seen[0])
+
+        # Una nota rimossa dall'agente mentre era in coda per la consegna non parte.
+        cli._dispatch("/remember in coda")
+        _ctx = cli.agents["coding"].ctx
+        _mt.forget(_ctx, note="in coda")
+        check("forget agente: una nota rimossa non viene più consegnata",
+              _REMEMBER_PREFIX not in cli._deliver_notes("task"))
+
+        # ── Il modello NON può cancellare per indice, attraverso il TOOL ─────
+        # Verificarlo solo su SessionMemory.remove non basta: deve essere il tool a
+        # passare by_index=False. Nel prompt le note non sono numerate e dopo una
+        # rimozione a metà sessione la lista vista non coincide con quella reale.
+        mem_ctx = ToolContext(cfg=cfg)
+        mem_ctx.memory = SessionMemory()
+        mem_ctx.memory.add("prima nota")
+        mem_ctx.memory.add("seconda nota")
+        by_number = _mt.forget(mem_ctx, note="1")
+        check("forget agente: un numero NON cancella per indice",
+              mem_ctx.memory.notes == ["prima nota", "seconda nota"] and by_number.startswith("⚠️"),
+              by_number)
+
+        # ── Contratto del tool ───────────────────────────────────────────────
+        check("forget: non distruttivo, come remember", not _mt.forget.destructive)
+        names = [t["function"]["name"] for t in cli.agents["general"].toolset.schemas()]
+        check("forget: disponibile anche all'agente generico", "forget" in names)
+        no_mem = cfg_for(root)
+        no_mem.memory_enabled = False
+        check("forget: memoria disattivata → tool assente",
+              "forget" not in [t["function"]["name"] for t in coding_agent.build(no_mem, None).toolset.schemas()])
+        check("forget: senza memoria nel contesto → errore pulito",
+              _mt.forget(ToolContext(cfg=cfg), note="x").startswith("❌"))
+    finally:
+        _os.chdir(cwd)
+        shutil.rmtree(root, ignore_errors=True)
+        shutil.rmtree(sess, ignore_errors=True)
+
+
 def test_quality_of_life():
     """Checkpoint con /rewind e /diff, controllo dopo l'edit, /context e comandi
     personalizzati — esercitati attraverso il CLI e i tool veri."""
@@ -6679,6 +6843,7 @@ def main():
     test_tool_schema_contract()
     test_background_jobs()
     test_readme_in_sync()
+    test_memory_forget()
     test_quality_of_life()
     test_audit_fixes()
     test_remember_reaches_model()

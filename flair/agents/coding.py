@@ -21,7 +21,7 @@ def build(cfg, provider, conversation=None, **callbacks) -> Agent:
     if getattr(cfg, "memory_enabled", True):
         # Memoria di sessione: fatti durevoli che sopravvivono a compaction e riavvii.
         # A flag spento il tool NON esiste (niente schema inviato al modello).
-        tools = [*tools, memory_tools.remember]
+        tools = [*tools, memory_tools.remember, memory_tools.forget]
     if getattr(cfg, "read_only", False):
         # Esecuzione non presidiata: nessuna modifica al filesystem né comandi. Cade
         # anche la famiglia dei job in background: senza poter AVVIARE un processo,

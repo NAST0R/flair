@@ -14,7 +14,7 @@ def build(cfg, provider, conversation=None, **callbacks) -> Agent:
     tools = system_tools.TOOLS + web_tools.TOOLS
     if getattr(cfg, "memory_enabled", True):
         # Stessa memoria di sessione dell'agente coding (condivisa via ToolContext).
-        tools = [*tools, memory_tools.remember]
+        tools = [*tools, memory_tools.remember, memory_tools.forget]
     if getattr(cfg, "read_only", False):
         # Esecuzione non presidiata: niente write/edit/comandi sull'intera macchina.
         # Cade anche la famiglia dei job in background: senza poter AVVIARE un

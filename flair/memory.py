@@ -83,6 +83,40 @@ class SessionMemory:
         self.notes.append(note)
         return True, f"stored ({len(self.notes)} notes in memory)."
 
+    def remove(self, selector: str, by_index: bool = True) -> tuple[bool, str, str | None]:
+        """Rimuove UNA nota. Ritorna (ok, messaggio, nota rimossa).
+
+        `selector` è il numero mostrato da /memory (1-based, solo se `by_index`)
+        oppure un testo: la nota esatta — a meno di maiuscole e spazi — o un
+        frammento che ne identifichi UNA sola. Mai più di una nota per chiamata e
+        mai a caso: un frammento ambiguo viene rifiutato elencando le candidate,
+        così chi chiede restringe invece di cancellare la nota sbagliata.
+
+        `by_index=False` è per il modello: nel system prompt le note non sono
+        numerate, e dopo una rimozione a metà sessione la lista che vede non
+        coincide più con quella reale — un indice cancellerebbe la nota sbagliata.
+        Il testo, invece, resta un riferimento stabile."""
+        sel = (selector or "").strip()
+        if not sel:
+            return False, "say which note to forget (its number or its text).", None
+        if not self.notes:
+            return False, "memory is empty: nothing to forget.", None
+        if by_index and sel.isdigit():
+            i = int(sel)
+            if not 1 <= i <= len(self.notes):
+                return False, f"there is no note number {i}: memory holds {len(self.notes)}.", None
+            return True, f"forgotten ({len(self.notes) - 1} left).", self.notes.pop(i - 1)
+        key = self._norm(sel)
+        exact = [n for n in self.notes if self._norm(n) == key]
+        matches = exact or [n for n in self.notes if key in self._norm(n)]
+        if not matches:
+            return False, "no note matches that text.", None
+        if len(matches) > 1:
+            listed = "; ".join(f"«{m}»" for m in matches[:5])
+            return False, f"{len(matches)} notes match, be more specific: {listed}", None
+        self.notes.remove(matches[0])
+        return True, f"forgotten ({len(self.notes)} left).", matches[0]
+
     def clear(self) -> None:
         self.notes = []
 

@@ -77,8 +77,8 @@ tests/                   Offline suite, eval harness, shared output helper
 
 **One engine, two agents.** `core/agent.py` is generic: it takes a *toolset* and a *prompt*. The two agents differ only in those — no duplicated logic.
 
-- **Coding agent** — `read_file`, `list_directory`, `glob`, `grep` (with optional context lines and a files-only mode), `repo_map`, `edit_file`, `multi_edit`, `write_file`, `move_path`, `run_command`, `run_background` / `job` (long commands that must not block the turn), `view_image` (on vision-capable endpoints), `explore`, `plan`, `remember`, plus read-only `web_search` / `web_fetch` for information that lives online (library docs, API signatures, error messages). File tools are **sandboxed** to the project root (`--root`): it cannot escape it.
-- **General agent** — `open_url`, `open_path`, `open_application`, `search_files`, `list_directory`, `read_file`, `write_file`, `edit_file`, `run_command`, `run_powershell`, `run_background` / `job`, `view_image`, `system_info`, `get_datetime`, `clipboard_get/set`, `remember`, `web_search`, `web_fetch`. Operates on the **whole machine** (that is its purpose: "open the browser", "find a song", "write a report to disk"). It can also **converse**: if no tool is needed, it just answers.
+- **Coding agent** — `read_file`, `list_directory`, `glob`, `grep` (with optional context lines and a files-only mode), `repo_map`, `edit_file`, `multi_edit`, `write_file`, `move_path`, `run_command`, `run_background` / `job` (long commands that must not block the turn), `view_image` (on vision-capable endpoints), `explore`, `plan`, `remember` / `forget`, plus read-only `web_search` / `web_fetch` for information that lives online (library docs, API signatures, error messages). File tools are **sandboxed** to the project root (`--root`): it cannot escape it.
+- **General agent** — `open_url`, `open_path`, `open_application`, `search_files`, `list_directory`, `read_file`, `write_file`, `edit_file`, `run_command`, `run_powershell`, `run_background` / `job`, `view_image`, `system_info`, `get_datetime`, `clipboard_get/set`, `remember` / `forget`, `web_search`, `web_fetch`. Operates on the **whole machine** (that is its purpose: "open the browser", "find a song", "write a report to disk"). It can also **converse**: if no tool is needed, it just answers.
 
 For complex/multi-line PowerShell on Windows, the agent uses `run_powershell`: the script is written to a temporary file, executed with `-File`, and the temp file is **always removed** (success, error, or timeout) — no escaping headaches, no leftovers. Multi-line commands sent through `run_command` are routed the same way internally, instead of through cmd.exe (which breaks on embedded newlines).
 
@@ -187,7 +187,7 @@ REPL commands:
 | `/save [name]` | save the session (default: current name) |
 | `/load <name>` | resume a saved session |
 | `/sessions` | list saved sessions |
-| `/memory [clear]` | show (or clear) the session memory |
+| `/memory [clear|forget <n>]` | show the session memory, clear it, or forget one note |
 | `/remember <note>` | jot a durable note into session memory yourself |
 | `/reset` | reset the shared conversation |
 | `/root <path>` | change the working folder (coding + general; reloads instructions) |
@@ -292,6 +292,8 @@ For unattended runs prefer **stateless** invocations (no `--session`): two sched
 **Check every edit.** Set `FLAIR_POST_EDIT_CMD` (for example `ruff check --quiet {path}`) and the coding agent runs it on every file it edits; the output reaches the model **only when the command fails**, appended to the tool result, so a syntax or lint error is seen in the same step it was introduced — and a clean file costs nothing.
 
 **Your own commands.** A Markdown file in `.flair/commands/` (project) or `~/.flair/commands/` (personal) becomes a REPL command: `review.md` is `/review`, and `$ARGUMENTS` in the file receives the rest of the line. Built-in commands always win, and `/help` lists the custom ones it finds.
+
+**Forget one note, not all of them.** `/memory forget 3` (the number shown by `/memory`) or `/memory forget staging` (a fragment matching a single note) removes one note; an ambiguous fragment is refused with the candidates listed, never resolved by guessing. The agent can do the same with the `forget` tool when a note turns out to be obsolete or wrong — by text only, because the notes in its instructions are not numbered and, after a removal mid-session, no longer match the real list. As with `/remember`, the system prompt is never rewritten mid-session (the **prefix cache is untouched**): the removal reaches the model in your next message or in the tool result, telling it to disregard the note until the next session boundary refreshes its instructions.
 
 **`/remember` reaches the model at once.** A note you add with `/remember` is stored in the session memory *and* delivered to the model in your **next message**, prefixed to what you type — so it is visible in the same session, not only after a reload. The system prompt is never rewritten mid-session and the note travels inside a new message, so the **prefix cache is untouched**; it is a prefix rather than a separate message because two consecutive user messages are rejected by some local chat templates. At the next session boundary (start, `/load`, `/root`) the note moves into the system prompt as before, without being delivered twice. In a session that was never saved, the confirmation says plainly that the note lasts until you exit — `/save <name>` keeps it.
 

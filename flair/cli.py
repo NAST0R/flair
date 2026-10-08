@@ -198,7 +198,7 @@ _COMMANDS: tuple[tuple[str, str, str, str], ...] = (
     ("save", "/save [name]", "save the session (default: current name)", "_cmd_save"),
     ("load", "/load <name>", "resume a saved session", "_cmd_load"),
     ("sessions", "/sessions", "list saved sessions", "_cmd_sessions"),
-    ("memory", "/memory [clear]", "show (or clear) the session memory", "_cmd_memory"),
+    ("memory", "/memory [clear|forget <n>]", "show the session memory, clear it, or forget one note", "_cmd_memory"),
     ("remember", "/remember <note>", "jot a durable note into session memory yourself", "_cmd_remember"),
     ("reset", "/reset", "reset the shared conversation", "_cmd_reset"),
     ("root", "/root <path>", "change the working folder (coding + general; reloads instructions)", "_cmd_root"),
@@ -209,6 +209,9 @@ _COMMANDS: tuple[tuple[str, str, str, str], ...] = (
 _QUIT_WORDS = ("exit", "quit", "q")
 # Una nota di /remember viaggia nel PROSSIMO messaggio dell'utente, come prefisso.
 _REMEMBER_PREFIX = "[The user asked you to remember this (it is now in the session memory): "
+# …e una rimozione con /memory forget, consegnata allo stesso modo.
+_FORGET_PREFIX = ("[The user removed this note from the session memory — disregard it, even "
+                  "if it still appears in your instructions: ")
 
 
 class CLI:
@@ -226,8 +229,10 @@ class CLI:
         self._always_allow: set[str] = set()
         self._cost_warned = False
         self._ctx_warned = False
-        # Note di /remember non ancora viste dal modello (v. _deliver_notes).
+        # Note di /remember e rimozioni di /memory forget non ancora viste dal
+        # modello (v. _deliver_notes).
         self._pending_notes: list[str] = []
+        self._pending_forgets: list[str] = []
         # "human" (REPL/default), "json" o "quiet": le ultime due sono per l'uso
         # non presidiato (-p) e silenziano l'output decorato su stdout.
         self.output_mode = "human"
@@ -365,6 +370,7 @@ class CLI:
         # messaggio le duplicherebbe. Vale anche per /memory clear, dove le note
         # in coda sono state cancellate e non vanno più consegnate.
         self._pending_notes.clear()
+        self._pending_forgets.clear()
 
     # ── sessioni (persistenza) ────────────────────────────────────────────────
 
@@ -762,6 +768,28 @@ class CLI:
         finally:
             self._shutdown_jobs()
 
+    def _forget_note(self, selector: str) -> None:
+        """/memory forget <numero|testo>: rimuove UNA nota. Stesso contratto di
+        /remember sulla cache: il system prompt NON si riscrive a metà sessione;
+        la rimozione arriva al modello nel prossimo messaggio, così smette di agire
+        su una nota che vede ancora nelle istruzioni fino al prossimo confine."""
+        if not selector:
+            self.console.print("[dim]usage: /memory forget <number|text> "
+                               "(the number is the one shown by /memory)[/dim]\n")
+            return
+        ok, msg, removed = self.memory.remove(selector)
+        if not ok or removed is None:
+            self.console.print(f"[yellow]⚠ {msg}[/yellow]\n")
+            return
+        if removed in self._pending_notes:
+            # Mai consegnata: il modello non l'ha vista, quindi non c'è nulla da
+            # disdire — basta che non parta.
+            self._pending_notes.remove(removed)
+        else:
+            self._pending_forgets.append(removed)
+        self._save_session()                 # sessione salvata → sidecar aggiornato
+        self.console.print(f"[green]✓ forgotten:[/green] [dim]{removed} — {msg}[/dim]\n")
+
     def _deliver_notes(self, task: str) -> str:
         """Il testo del turno con, in testa, le note di /remember non ancora viste
         dal modello — che poi escono dalla coda.
@@ -772,11 +800,16 @@ class CLI:
         consecutivi sono rifiutati da alcuni template di chat dei server locali.
         Il router classifica sul testo originale (v. run_task): le note non devono
         spostare la scelta dell'agente."""
-        if not self._pending_notes:
-            return task
-        head = "\n".join(f"{_REMEMBER_PREFIX}{n}]" for n in self._pending_notes)
+        # Una nota rimossa nel frattempo (dall'agente con `forget`) non va più
+        # consegnata: si consegna solo ciò che è ancora in memoria.
+        notes = [n for n in self._pending_notes if n in self.memory.notes]
+        lines = ([f"{_FORGET_PREFIX}{n}]" for n in self._pending_forgets]
+                 + [f"{_REMEMBER_PREFIX}{n}]" for n in notes])
         self._pending_notes.clear()
-        return f"{head}\n\n{task}"
+        self._pending_forgets.clear()
+        if not lines:
+            return task
+        return "\n".join(lines) + f"\n\n{task}"
 
     def run_task(self, task: str, agent_key: str | None = None, think: bool = False,
                  attachments: list[dict] | None = None):
@@ -977,6 +1010,9 @@ class CLI:
             self.console.print("[dim]memory disabled (FLAIR_MEMORY=false).[/dim]\n")
             return
         sub = arg.strip().lower()
+        if sub == "forget" or sub.startswith("forget "):
+            self._forget_note(arg.strip()[len("forget"):].strip())
+            return
         if sub == "clear":
             if not self.memory.notes:
                 self.console.print("[dim]memory already empty.[/dim]\n")
@@ -993,7 +1029,7 @@ class CLI:
                 self.console.print("[yellow]memory cleared.[/yellow]\n")
             return
         if sub:
-            self.console.print("[dim]usage: /memory  or  /memory clear[/dim]\n")
+            self.console.print("[dim]usage: /memory  ·  /memory clear  ·  /memory forget <number|text>[/dim]\n")
             return
         if not self.memory.notes:
             self.console.print("[dim]memory is empty. The agent jots durable facts here with the "
